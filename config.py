@@ -1,0 +1,257 @@
+"""
+config.py — 所有超參數集中管理
+
+使用方式
+--------
+    from config import MCTS_CFG, TRAINING_CFG, GATE_CFG, NETWORK_CFG, ...
+    
+    # 可在執行前修改
+    MCTS_CFG.simulations = 800
+    TRAINING_CFG.games_per_update = 200
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 基本設定
+# ══════════════════════════════════════════════════════════════════════
+
+TITLE = "mcts_cnn"
+GUARD_TITLE = f"{TITLE}_guard"
+LOG_DIR = "logs"
+SEED = 42
+DEVICE = "auto"          # auto / cpu / cuda / cuda:N
+INFERENCE_DEVICE = "cuda:0"  # MCTS 推論裝置（大 batch 用 GPU）
+CHECKPOINT_DIR = "checkpoints"
+MAX_HEIGHT_NORM = 8.0
+HEAD_ACTION = "action"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 狀態後端設定
+# ══════════════════════════════════════════════════════════════════════
+
+STATE_BACKEND = "cpp"          # python / cpp
+CPP_BACKEND_REQUIRED = True
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 神經網路架構
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class NetworkConfig:
+    """PolicyNetCNNMin17 的超參數"""
+    global_feature_dim: int = 12
+    dropout: float = 0.3
+    channels: int = 64
+    num_res_blocks: int = 4
+    fc_hidden: int = 512
+    fc_hidden_2: int = 256
+
+
+NETWORK_CFG = NetworkConfig()
+
+# ══════════════════════════════════════════════════════════════════════
+# MCTS 搜尋
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class MCTSConfig:
+    """MCTS 搜尋引擎的超參數"""
+    simulations: int = 600
+    puct_c: float = 1.5
+    leaf_batch_size: int = 16
+
+    # Root Dirichlet noise（訓練時啟用）
+    use_root_dirichlet_noise: bool = True
+    root_dirichlet_eps: float = 0.25
+    root_dirichlet_alpha: float = 0.05
+
+    # 啟發式先驗（設為 0 則停用）
+    heuristic_prior_weight: float = 0.0
+    heuristic_softmax_temperature: float = 1.0
+
+    # 啟發式評分權重
+    material_base_tzaar: float = 100.0
+    material_base_tzarra: float = 40.0
+    material_base_tott: float = 15.0
+    mobility_capture_weight: float = 10.0
+    scarcity_bonus_two_or_less: float = 200.0
+    scarcity_bonus_one_or_less: float = 500.0
+
+
+MCTS_CFG = MCTSConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 非同步 MCTS Pipeline
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class AsyncMCTSConfig:
+    """多 CPU worker + 共享 GPU worker 的非同步 pipeline"""
+    enabled: bool = True
+    parallel_games: int = 15
+    infer_max_batch: int = 480
+    infer_max_wait_ms: float = 2.0
+    request_queue_size: int = 30
+    response_timeout_s: float = 30.0
+
+
+ASYNC_MCTS_CFG = AsyncMCTSConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 自我對弈（溫度排程）
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SelfPlayConfig:
+    """自我對弈的動作採樣溫度排程"""
+    temp_high: float = 1.0     # 前期探索溫度
+    temp_low: float = 0.1      # 後期利用溫度
+    temp_switch_decision: int = 6  # 第幾步之後切換到低溫
+
+
+SELFPLAY_CFG = SelfPlayConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 訓練主迴圈
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TrainingConfig:
+    """訓練主迴圈的超參數"""
+    total_updates: int = 500
+    games_per_update: int = 150
+    selfplay_model_game_ratio: float = 1.0  # 純自我對弈比例 (0~1)
+    train_epochs_per_update: int = 10
+    optimization_passes_per_update: int = 1
+    batch_size: int = 128
+    checkpoint_every_updates: int = 20
+    log_every: int = 10
+    selfplay_progress_log_interval: int = 0  # <=0 停用進度log
+
+    # Resume 行為
+    require_resume: bool = False
+    resume_any_title: bool = True
+
+
+TRAINING_CFG = TrainingConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 優化器 / 損失函數
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class OptimizerConfig:
+    """Adam 優化器與損失加權"""
+    learning_rate_start: float = 0.0007
+    learning_rate_end: float = 0.0007   # = start 表示固定學習率
+    weight_decay: float = 1e-4
+    grad_clip: float = 1.0
+    policy_loss_weight: float = 1.0
+    value_loss_weight: float = 1.0
+    entropy_weight: float = 0.0
+
+
+OPTIMIZER_CFG = OptimizerConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Gatekeeper
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class GatekeeperConfig:
+    """Gatekeeper 評估的超參數"""
+    eval_games: int = 150
+    winrate_threshold: float = 0.55
+    temperature: float = 0.1           # 評估時的採樣溫度
+    simulations_per_decision: int = 600  # 評估時的 MCTS 模擬數
+    eval_every_updates: int = 2        # 每 N 次更新執行一次
+    keep_optimizer_on_reject: bool = False
+    keep_replay_on_reject: bool = True
+
+
+GATE_CFG = GatekeeperConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Replay Buffer
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ReplayConfig:
+    """Replay Buffer 設定"""
+    enabled: bool = True
+    max_samples: int = 50000
+    train_samples_per_update: int = 8192
+    min_train_samples: int = 256
+    snapshot_version: int = 1
+    snapshot_tag: str = "latest"
+
+
+REPLAY_CFG = ReplayConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 運行時狀態（由 training.loop 或 update_cnn_mcts_no_heuristic.py 設定）
+# ══════════════════════════════════════════════════════════════════════
+
+from typing import Any, Optional
+
+# 活躍的狀態後端名稱（"python" 或 "cpp"）
+_ACTIVE_STATE_BACKEND: str = "python"
+# 已載入的 C++ 模組（若無則為 None）
+_ACTIVE_CPP_MODULE: Optional[Any] = None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 驗證函式（確保設定值合理）
+# ══════════════════════════════════════════════════════════════════════
+
+def validate_configs() -> None:
+    """在訓練開始前檢查所有設定值是否合理。"""
+    if TRAINING_CFG.total_updates <= 0:
+        raise ValueError("TOTAL_UPDATES must be >= 1")
+    if TRAINING_CFG.games_per_update <= 0:
+        raise ValueError("GAMES_PER_UPDATE must be >= 1")
+    if not (0.0 <= TRAINING_CFG.selfplay_model_game_ratio <= 1.0):
+        raise ValueError("SELFPLAY_MODEL_GAME_RATIO must be in [0, 1]")
+    if TRAINING_CFG.train_epochs_per_update <= 0:
+        raise ValueError("TRAIN_EPOCHS_PER_UPDATE must be >= 1")
+    if TRAINING_CFG.batch_size <= 0:
+        raise ValueError("BATCH_SIZE must be >= 1")
+    if MCTS_CFG.simulations <= 0:
+        raise ValueError("SIMULATIONS_PER_DECISION must be >= 1")
+    if TRAINING_CFG.checkpoint_every_updates <= 0:
+        raise ValueError("CHECKPOINT_EVERY_UPDATES must be >= 1")
+    if GATE_CFG.eval_every_updates <= 0:
+        raise ValueError("GATE_EVERY_UPDATES must be >= 1")
+    if TRAINING_CFG.log_every <= 0:
+        raise ValueError("LOG_EVERY must be >= 1")
+    if TRAINING_CFG.optimization_passes_per_update <= 0:
+        raise ValueError("OPTIMIZATION_PASSES_PER_UPDATE must be >= 1")
+    if GATE_CFG.eval_games <= 0:
+        raise ValueError("GATE_EVAL_GAMES must be >= 1")
+    if not (0.0 < GATE_CFG.winrate_threshold < 1.0):
+        raise ValueError("GATE_WINRATE_THRESHOLD must be in (0, 1)")
+    if MCTS_CFG.heuristic_softmax_temperature <= 0:
+        raise ValueError("HEURISTIC_SOFTMAX_TEMPERATURE must be > 0")
+    if not (0.0 <= MCTS_CFG.heuristic_prior_weight <= 1.0):
+        raise ValueError("HEURISTIC_PRIOR_WEIGHT must be in [0, 1]")
+    if REPLAY_CFG.enabled:
+        if REPLAY_CFG.max_samples <= 0:
+            raise ValueError("REPLAY_BUFFER_MAX_SAMPLES must be >= 1")
+        if REPLAY_CFG.train_samples_per_update <= 0:
+            raise ValueError("REPLAY_TRAIN_SAMPLES_PER_UPDATE must be >= 1")
+        if REPLAY_CFG.min_train_samples <= 0:
+            raise ValueError("REPLAY_MIN_TRAIN_SAMPLES must be >= 1")
+        if REPLAY_CFG.min_train_samples > REPLAY_CFG.max_samples:
+            raise ValueError("REPLAY_MIN_TRAIN_SAMPLES must be <= REPLAY_BUFFER_MAX_SAMPLES")

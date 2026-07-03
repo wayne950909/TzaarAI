@@ -1563,13 +1563,20 @@ def save_checkpoint(
     title:      str,
     checkpoint_index: int,
     update_idx: int,
-    in_opponent_pool: bool,
-    reason: str,
-) -> None:
-    """將網路權重與優化器狀態存至檔案。"""
+    in_opponent_pool: bool = True,
+    reason: str = "training",
+    **kwargs,
+) -> Path:
+    """將網路權重與優化器狀態存至檔案。
+
+    支援額外關鍵字參數（如 samples_in_update, inference_temperature）
+    會被儲存在 payload 中。
+
+    回傳儲存的 checkpoint 路徑。
+    """
     architecture = _policy_arch_from_instance(policy)
 
-    payload = {
+    payload: Dict[str, object] = {
         "update_idx": update_idx,
         "title": title,
         "checkpoint_index": checkpoint_index,
@@ -1579,6 +1586,11 @@ def save_checkpoint(
         "in_opponent_pool": in_opponent_pool,
         "checkpoint_reason": reason,
     }
+
+    # 加入額外資訊
+    for extra_key in ("samples_in_update", "inference_temperature"):
+        if extra_key in kwargs:
+            payload[extra_key] = kwargs[extra_key]
 
     if architecture == ARCH_FC:
         payload["hidden_size_1"] = HIDDEN_SIZE_1
@@ -1596,6 +1608,7 @@ def save_checkpoint(
         f"  [checkpoint saved → {path}]"
         f" [pool={'yes' if in_opponent_pool else 'no'} reason={reason}]"
     )
+    return path
 
 
 def load_latest_checkpoint(
