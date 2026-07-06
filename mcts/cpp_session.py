@@ -2,6 +2,15 @@
 mcts/cpp_session.py — C++ SearchSession 包裝
 
 封裝 C++ 模組的 SearchSession，提供同步的 Python 呼叫介面。
+
+這條路徑代表：
+- 一次只處理一棵搜尋樹
+- 由 Python 主動 pull pending leaves
+- 由 Python 做模型 forward
+- 再把 priors/value push 回 C++ SearchSession
+
+它是目前最穩定、最直觀的 C++ 搜尋整合方式，
+也是 async path fallback 後最終會回到的路徑。
 """
 
 from __future__ import annotations
@@ -67,6 +76,10 @@ def run_mcts_cpp_session(
         and hasattr(session, "submit_leaf_eval_batch")
     )
 
+    # SearchSession 的工作方式是：
+    # 1. 由 C++ 往外吐 pending leaves
+    # 2. Python 端做 NN forward
+    # 3. 把結果送回去，直到 session.finish()
     while True:
         if use_packed_api:
             packed = session.collect_pending_leaves_packed(

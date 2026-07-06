@@ -31,8 +31,8 @@ print("C++ 重構測試 — 小參數訓練驗證")
 print("=" * 60)
 
 # 訓練配置
-TRAINING_CFG.total_updates = 3          # 只做 3 個 update
-TRAINING_CFG.games_per_update = 2       # 每輪 2 場遊戲
+TRAINING_CFG.total_updates = 2          # 只做 2 個 update
+TRAINING_CFG.games_per_update = 15       # 每輪 5 場遊戲
 TRAINING_CFG.log_every = 1
 TRAINING_CFG.checkpoint_every_updates = 10  # 測試時不存
 
@@ -42,17 +42,10 @@ SELFPLAY_CFG.temp_low = 0.5
 SELFPLAY_CFG.temp_switch_decision = 5
 
 # MCTS
-MCTS_CFG.simulations = 1000              # 極少模擬
-MCTS_CFG.leaf_batch_size = 4
+MCTS_CFG.simulations = 500              # 極少模擬
+MCTS_CFG.leaf_batch_size = 16
 MCTS_CFG.puct_c = 1.5
 MCTS_CFG.use_root_dirichlet_noise = False
-
-# 網路 — 使用正常的 CNN 架構（只是訓練步數極少）
-NETWORK_CFG.blocks = 3
-NETWORK_CFG.channels = 32
-
-# Replay
-REPLAY_CFG.enabled = False             # 測試時關閉 replay
 
 # Gate — 測試時跳過（設為極大值）
 GATE_CFG.eval_every_updates = 999

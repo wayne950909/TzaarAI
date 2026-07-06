@@ -2,50 +2,46 @@
 training/loop.py — 訓練主循環
 
 提供 run() 和 main() 的實現，包含 self-play、MCTS、訓練、gate 等流程。
+
+目前的設計原則：
+- loop.py 只做 orchestration，不再承擔太多 self-play 細節。
+- self-play 排程已抽到 training/selfplay_engine.py。
+- MCTS 路徑的真正決策（sync / async / cpp / python）由 mcts/mcts_api.py 決定。
+
+如果之後要手動改訓練流程，建議把 loop.py 當成「總控台」來看：
+它負責決定每個 update 要先產生資料、再訓練、再 gate、最後存檔。
 """
 
 from __future__ import annotations
 
 import io
-import math
 import os
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
-import numpy as np
 import torch
 
 import TzaarTrain as train_module
 from config import (
     TITLE,
-    GUARD_TITLE,
     TRAINING_CFG,
     SELFPLAY_CFG,
     MCTS_CFG,
     GATE_CFG,
-    OPTIMIZER_CFG,
     REPLAY_CFG,
-    NETWORK_CFG,
-    ASYNC_MCTS_CFG,
     _ACTIVE_STATE_BACKEND,
     _ACTIVE_CPP_MODULE,
 )
-from core.action import N_ACTIONS, PASS_ACTION_IDX
-from core.board import TRAINING_GAME_STEPS, MAX_HEIGHT_NORM
-from core.constants import WHITE, BLACK, PHASE_STEP_2, TRAINING_PHASE_TO_IDX
+from core.board import TRAINING_GAME_STEPS
 from core.env import TzaarEnv, EnvConfig
-from core.types import GameResult
 from gate.gate import gate_keeper
 from heuristics import HeuristicPlayoutPolicy as HP
-from network import PolicyNetCNNMin17
-from training.sample import PolicySample
 from training.metrics import (
     accumulate_kind_stats,
     format_exploration_stats,
-    record_exploration_stats,
 )
 from training.replay import (
     replay_extend,
@@ -58,6 +54,11 @@ from training.resume import (
     optimizer_to,
 )
 from training.train_step import train_on_samples
+from training.selfplay_engine import (
+    build_phase_state_from_env as _build_phase_state_from_env,
+    collect_selfplay_samples as _collect_selfplay_samples,
+    log_runtime_mode as _log_runtime_mode,
+)
 from training.validation import validate_constants
 
 import debugpy  # type: ignore[import-untyped]
@@ -169,6 +170,10 @@ def _run_mcts(
     """在當前環境狀態上執行 MCTS 搜尋。
 
     回傳 (visits, legal_mask)，兩者皆在 CPU 上。
+
+這個 helper 只負責「單局面」搜尋。
+批次 self-play 時，不直接透過這個函式做並行，而是由
+training/selfplay_engine.py 決定是否走 run_mcts_batch。
     """
     from mcts import run_mcts as _mcts_search
 
@@ -182,75 +187,6 @@ def _run_mcts(
             simulations=simulations,
         )
     return visits, legal_mask
-
-
-def _build_phase_state_from_env(env: TzaarEnv) -> object:
-    """從 TzaarEnv 建立 PhaseGameState（供 MCTS 搜尋使用）。
-
-    當使用 C++ 後端時，直接 clone env.cpp_state（已有正確的遊戲狀態）；
-    當使用 Python 後端時，建立 PythonPhaseGameState。
-    """
-    if _ACTIVE_STATE_BACKEND == "cpp" and _ACTIVE_CPP_MODULE is not None:
-        cpp = env.cpp_state
-        if cpp is None:
-            raise RuntimeError(
-                "C++ backend active but env.cpp_state is None. "
-                "Ensure config.STATE_BACKEND matches the loaded backend."
-            )
-        return cpp.clone()
-
-    from state.phase_state import PythonPhaseGameState, Stage
-    from TzaarAI import TzaarAIInterface
-
-    game = env.game
-    if game is None:
-        raise RuntimeError("Environment not reset")
-
-    ai = TzaarAIInterface(game)
-    if game.is_waiting_second_step():
-        stage = Stage.NEED_STEP2
-    elif game.is_game_over():
-        stage = Stage.DONE
-    else:
-        stage = Stage.NEED_STEP1
-    return PythonPhaseGameState(game=game, stage=stage, ai=ai)
-
-
-def _sample_action_and_target(
-    visits: torch.Tensor,
-    legal_mask: torch.Tensor,
-    temperature: float,
-) -> tuple[int, torch.Tensor]:
-    """從 MCTS 訪問次數採樣動作並回傳目標策略。"""
-    legal = legal_mask[:visits.shape[0]]
-    legal_visits = visits.clone()
-    legal_visits[~legal] = 0.0
-
-    n_legal = int(legal.sum().item())
-    if n_legal <= 0:
-        raise ValueError("No legal actions available")
-
-    if legal_visits.sum().item() <= 0:
-        # 均勻分布（fallback）
-        probs = torch.zeros_like(legal_visits)
-        probs[legal] = 1.0 / float(n_legal)
-    elif temperature <= 1e-6:
-        # 貪婪採樣
-        probs = torch.zeros_like(legal_visits)
-        best_action = int(torch.argmax(legal_visits).item())
-        probs[best_action] = 1.0
-    else:
-        # 溫度調整採樣
-        adjusted = torch.pow(legal_visits, 1.0 / temperature)
-        adjusted[~legal] = 0.0
-        if adjusted.sum().item() > 1e-12:
-            probs = adjusted / adjusted.sum()
-        else:
-            probs = torch.zeros_like(legal_visits)
-            probs[legal] = 1.0 / float(n_legal)
-
-    action = int(torch.multinomial(probs, num_samples=1).item())
-    return action, probs
 
 
 def run(title: str) -> None:
@@ -280,8 +216,11 @@ def run(title: str) -> None:
     global _ACTIVE_STATE_BACKEND, _ACTIVE_CPP_MODULE
     _ACTIVE_STATE_BACKEND = state_backend
     _ACTIVE_CPP_MODULE = cpp_module
+    _log_runtime_mode()
 
     # ── 載入/初始化政策網路 ────────────────────────────
+    # 這裡開始進入正式訓練 lifecycle：
+    # backend 已決定、裝置已準備好，接下來所有流程都使用同一組 policy / optimizer。
     start_time = time.perf_counter()
     policy, optimizer, start_update, next_ckpt_idx, replay_buffer, replay_write_idx = (
         load_or_init_policy(device)
@@ -318,104 +257,30 @@ def run(title: str) -> None:
     # ── 主訓練循環 ──────────────────────────────────────
     for update_idx in range(start_update, total_updates):
         update_start = time.perf_counter()
-        games_played = 0
-        fresh_samples: List[PolicySample] = []
+        inference_temperature = float(SELFPLAY_CFG.temp_low)
 
         # ── Self‑play ────────────────────────────────────
+        # 這裡只負責呼叫 self-play engine 產生 fresh samples。
+        # engine 內部會自行決定：
+        # - 是否採用 async-batch
+        # - 是否因錯誤而 fallback 到 sync-single
         policy.eval()
         with torch.no_grad():
-            for game_i in range(TRAINING_CFG.games_per_update):
-                rand_seed = _rng_seed_offset(
-                    update_idx * TRAINING_CFG.games_per_update + game_i,
-                    total_updates * TRAINING_CFG.games_per_update,
-                    0,
-                    2**31 - 1,
-                )
-                _ = rand_seed  # 可選用於 RNG 種子
-
-                env = TzaarEnv(env_cfg)
-                env.reset()
-                game_sample_count = 0
-                temperature = float(SELFPLAY_CFG.temp_high)
-                decision_step = 0
-
-                while env.game_in_progress:
-                    current_player = env.current_player
-
-                    # 溫度排程
-                    if decision_step >= SELFPLAY_CFG.temp_switch_decision:
-                        temperature = float(SELFPLAY_CFG.temp_low)
-
-                    # 觀測
-                    obs = env.observe()
-                    obs_tensor = obs.to_tensor(device=device).unsqueeze(0)
-                    global_f = obs.to_global_tensor().unsqueeze(0)
-                    legal_mask_t = obs.to_legal_mask_tensor(device=device)
-
-                    # MCTS 搜尋
-                    visits, legal_mask = _run_mcts(
-                        policy,
-                        env,
-                        device,
-                        simulations=int(MCTS_CFG.simulations),
-                        temperature=temperature,
-                        apply_dirichlet_noise=(update_idx > 0),
-                    )
-
-                    # 探索統計
-                    record_exploration_stats(
-                        stats, visits / visits.sum().clamp_min(1e-12),
-                        legal_mask_t.cpu(), temperature,
-                    )
-
-                    # 採樣動作
-                    action, target_pi = _sample_action_and_target(
-                        visits, legal_mask, temperature,
-                    )
-                    target_pi_cpu = target_pi.detach().to("cpu", dtype=torch.float32).clone()
-                    legal_mask_cpu = legal_mask.to(device="cpu", dtype=torch.bool).clone() if legal_mask.device.type != "cpu" else legal_mask.clone()
-
-                    env.step(action)
-
-                    # 收集樣本
-                    sample_state = obs_tensor.squeeze(0).detach().to("cpu", dtype=torch.float32)
-                    sample_global = global_f.squeeze(0).detach().to("cpu", dtype=torch.float32)
-                    fresh_samples.append(
-                        PolicySample(
-                            state=sample_state,
-                            global_features=sample_global,
-                            action_dim=N_ACTIONS,
-                            legal_mask_padded=legal_mask_cpu,
-                            target_pi_padded=target_pi_cpu,
-                            player=int(current_player),
-                        )
-                    )
-                    game_sample_count += 1
-                    decision_step += 1
-
-                # 遊戲結束 → 賦予價值目標
-                gr = env.last_game_result
-                if gr is not None:
-                    winner_sign = 0
-                    if gr == GameResult.WHITE_WIN:
-                        winner_sign = 1
-                    elif gr == GameResult.BLACK_WIN:
-                        winner_sign = -1
-
-                    for sample in fresh_samples[-game_sample_count:]:
-                        sample.winner_sign = int(winner_sign)
-                        player = sample.player
-                        if winner_sign == 0:
-                            sample.value_target = 0.0
-                        elif winner_sign == player:
-                            sample.value_target = 1.0
-                        else:
-                            sample.value_target = -1.0
-
-                    total_fresh_samples += game_sample_count
-                    games_played += 1
+            fresh_samples, games_played, n_new_samples, inference_temperature = _collect_selfplay_samples(
+                policy,
+                device,
+                env_cfg,
+                update_idx,
+                stats,
+                total_updates,
+                _rng_seed_offset,
+            )
+            total_fresh_samples += n_new_samples
 
         # ── 訓練 ────────────────────────────────────────────
+        # 資料來源可能是：
+        # - 當前 update 的 fresh_samples
+        # - replay buffer 抽樣
         policy.train()
 
         if REPLAY_CFG.enabled and fresh_samples:
@@ -504,7 +369,7 @@ def run(title: str) -> None:
                 optimizer=optimizer,
                 update_idx=update_idx,
                 samples_in_update=samples_in_update,
-                inference_temperature=temperature,
+                inference_temperature=inference_temperature,
                 checkpoint_index=int(next_ckpt_idx),
             )
             next_ckpt_idx += 1

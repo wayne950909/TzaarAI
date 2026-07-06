@@ -7,6 +7,8 @@
 #include "state/phase_state.h"
 #include "mcts/config.h"
 #include "mcts/search.h"
+#include "mcts/search_manager.h"
+#include "mcts/bench.h"
 
 namespace py = pybind11;
 namespace tz = tzaar;
@@ -223,4 +225,107 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("finish", &tz::SearchSession::finish,
          py::call_guard<py::gil_scoped_release>())
     .def("root_snapshot", &tz::SearchSession::root_snapshot);
+
+  // ─── SearchManager ─────────────────────────────────────
+  py::class_<tz::SearchManager>(m, "SearchManager")
+    .def(py::init<const std::vector<tz::PhaseGameState>&, tz::SearchConfig, int, int>(),
+         py::arg("root_states"), py::arg("config"),
+         py::arg("num_threads") = 10, py::arg("max_batch") = 480)
+
+    .def("has_ready_batch", &tz::SearchManager::has_ready_batch)
+
+    // get_ready_batch: 回傳 dict 包含 numpy views（零拷貝）
+    .def("get_ready_batch",
+         [](tz::SearchManager& mgr) {
+           auto packed = mgr.get_ready_batch();
+           py::dict out;
+
+           if (packed.batch_size == 0 || packed.buffer_id < 0) {
+             out["buffer_id"] = py::int_(-1);
+             out["batch_size"] = py::int_(0);
+             return out;
+           }
+
+           const py::ssize_t bsz = static_cast<py::ssize_t>(packed.batch_size);
+
+           // Capsules with no-op destructors
+           py::capsule ids_cap  (packed.node_ids,         [](void*) {});
+           py::capsule mask_cap (packed.legal_masks,       [](void*) {});
+           py::capsule board_cap(packed.board_state_flat,  [](void*) {});
+           py::capsule glob_cap (packed.global_features,   [](void*) {});
+           py::capsule tree_cap (packed.tree_ids,          [](void*) {});
+
+           out["buffer_id"] = py::int_(packed.buffer_id);
+           out["batch_size"] = py::int_(packed.batch_size);
+           out["node_ids"] = py::array_t<int32_t>({bsz}, packed.node_ids, ids_cap);
+           out["tree_ids"] = py::array_t<int32_t>({bsz}, packed.tree_ids, tree_cap);
+           out["legal_masks"] = py::array_t<uint8_t>(
+               {bsz, static_cast<py::ssize_t>(tz::kActionCount)},
+               packed.legal_masks, mask_cap);
+           out["board_state_flat"] = py::array_t<float>(
+               {bsz, static_cast<py::ssize_t>(tz::kBoardFlatSize)},
+               packed.board_state_flat, board_cap);
+           out["global_features"] = py::array_t<float>(
+               {bsz, static_cast<py::ssize_t>(tz::kGlobalFeatureDim)},
+               packed.global_features, glob_cap);
+           return out;
+         })
+
+    // submit_eval_batch
+    .def("submit_eval_batch",
+         [](tz::SearchManager& mgr, int buffer_id,
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_ids,
+            py::array_t<float, py::array::c_style | py::array::forcecast> priors,
+            py::array_t<float, py::array::c_style | py::array::forcecast> values) {
+
+           if (node_ids.ndim() != 1)
+             throw std::invalid_argument("node_ids must be a 1D array");
+           if (priors.ndim() != 2)
+             throw std::invalid_argument("priors must be a 2D array [B, N_ACTIONS]");
+           if (values.ndim() != 1)
+             throw std::invalid_argument("values must be a 1D array [B]");
+
+           const py::ssize_t bsz = node_ids.shape(0);
+           if (priors.shape(0) != bsz || values.shape(0) != bsz)
+             throw std::invalid_argument("batch size mismatch among node_ids/priors/values");
+           if (priors.shape(1) != static_cast<py::ssize_t>(tz::kActionCount))
+             throw std::invalid_argument("priors second dim must equal N_ACTIONS");
+
+           mgr.submit_eval_batch(
+               buffer_id,
+               static_cast<const int32_t*>(node_ids.request().ptr),
+               static_cast<const float*>(priors.request().ptr),
+               static_cast<const float*>(values.request().ptr),
+               static_cast<int>(bsz));
+         },
+         py::arg("buffer_id"), py::arg("node_ids"),
+         py::arg("priors"), py::arg("values"))
+
+    .def("is_complete", &tz::SearchManager::is_complete)
+    .def("run", &tz::SearchManager::run)
+    .def("start_workers", &tz::SearchManager::start_workers)
+    .def("wait_for_completion", &tz::SearchManager::wait_for_completion)
+    .def("finish_all", &tz::SearchManager::finish_all);
+
+  // ─── CpuBench（純 CPU MCTS 效能測試） ────────────────
+  py::class_<tz::CpuBenchResult>(m, "CpuBenchResult")
+    .def(py::init<>())
+    .def_readwrite("elapsed_seconds",      &tz::CpuBenchResult::elapsed_seconds)
+    .def_readwrite("num_trees",            &tz::CpuBenchResult::num_trees)
+    .def_readwrite("num_threads",          &tz::CpuBenchResult::num_threads)
+    .def_readwrite("simulations_per_tree", &tz::CpuBenchResult::simulations_per_tree)
+    .def_readwrite("total_simulations",    &tz::CpuBenchResult::total_simulations)
+    .def_readwrite("total_simulations_done", &tz::CpuBenchResult::total_simulations_done)
+    .def_readwrite("total_nodes_created",  &tz::CpuBenchResult::total_nodes_created)
+    .def_readwrite("sims_per_second",      &tz::CpuBenchResult::sims_per_second)
+    .def_readwrite("tree_simulations_done", &tz::CpuBenchResult::tree_simulations_done)
+    .def_readwrite("tree_node_counts",     &tz::CpuBenchResult::tree_node_counts);
+
+  m.def("run_cpu_bench", &tz::CpuBench::run,
+        py::arg("num_trees"), py::arg("num_threads"),
+        py::arg("simulations"), py::arg("leaf_batch_size") = 8,
+        "Run CPU-only MCTS benchmark. "
+        "Creates num_trees trees, uses num_threads workers, "
+        "each tree runs simulations times. "
+        "Returns CpuBenchResult with timing and stats.");
 }

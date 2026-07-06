@@ -12,10 +12,6 @@
 - 每當在葉節點需要state去做推論時，會先從根節點的state複製一份到batch的記憶空間，根據根節點到葉節點的動作序列將這個state製作成目前的state。
 - 要注意的是，最後要根據目前是誰的回合去做state的轉換。
 
-# batch的製作
-- 因為我會累積一定量的葉節點states，再一次進行神經網路推論，所以一開始需要推論的狀態就生成在**batch的連續記憶體**中，之後就直接零拷貝到神經網路
-- 採用**雙buffer**的方式，當神經網路在推論時，CPU則在另一個buffer填入資料
-
 # 模擬過程
 會從根節點一路選擇**分數最高**的向下，直到到達葉節點(尚未展開)或是最底部的節點(遊戲結束):
 ## 到達尚未展開的節點
@@ -37,17 +33,19 @@
 ## value network
 在所有的根節點，如果是獲勝者，分數用+1，輸家則用-1
 
+# 目前程式呼叫路徑（2026-07）
+- 訓練入口：`start_training.py` -> `training.loop.main()` -> `training.loop.run(TITLE)`
+- Self-play 由 `training.loop._collect_selfplay_samples()` 調度：
+	- 若條件成立（cpp backend + async 開啟 + parallel_games > 1），走 `mcts.run_mcts_batch()`
+	- 否則回退到單局 `mcts.run_mcts()`
+- `mcts.run_mcts_batch()` 在可用時會進入 `mcts.async_worker.run_mcts_cpp_batch_async()`：
+	- 多個 CPU worker 負責 SearchSession 收集葉節點
+	- 單一 GPU worker 進行批次網路推論並回傳 priors/value
+- Python / C++ 邊界：
+	- Python：訓練主循環、資料收集、網路前向與反向
+	- C++：PhaseGameState、SearchSession、葉節點打包與樹內模擬
 
-# 多執行緒
-預設建立10個c++的CPU執行緒和1個python的GPU執行緒，目的是讓**CPU和GPU同時運行**
-**執行緒不會反覆被創立並刪除**
-## CPU執行緒模擬
-- 每個MCTS遇到固定數量的待推論的子節點就會停止模擬，直到推論完才會繼續模擬，這邊預設為16
-- 預設一次就會模擬200場遊戲，也就是說會同時創建200棵MCTS樹
-- 每個CPU執行緒，會同時去尋找停止模擬的搜尋樹，然後霸佔並模擬，模擬完再去尋找另一棵樹，重複動作
-- 每個執行緒在模擬前，先在連續的batch記憶體配置長度16筆資料的空間
-- 每個大batch會裝固定數量的樹，預設為20，也就是說有20*16筆資料一次送進GPU
-- 在GPU推論的時候，在另一個batch空間，CPU會同時的去模擬並填入資料
+
 
 
 

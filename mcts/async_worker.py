@@ -4,6 +4,13 @@ mcts/async_worker.py — 非同步 MCTS 批次推論
 提供 InferenceRequest / InferenceResponse 資料結構，
 以及 run_mcts_cpp_batch_async 函式，用於多 CPU worker +
 共享 GPU worker 的非同步 MCTS 批次搜尋。
+
+注意目前這個模組的角色：
+- 它讓多棵 SearchSession 可以共用一個 Python GPU worker
+- 但它不是文件最終目標中的 C++ SearchManager 雙 buffer 正式路徑
+- 它仍然是在每次 batch search 呼叫時臨時建立 Python threads
+
+因此這裡比較像「正式訓練目前使用的過渡版 async path」。
 """
 
 from __future__ import annotations
@@ -59,7 +66,11 @@ def _run_model_forward(
     reqs: List[InferenceRequest],
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """對一批請求執行模型 forward 並回傳 priors + values。"""
+    """對一批請求執行模型 forward 並回傳 priors + values。
+
+輸入資料已經由 C++ SearchSession 打平成連續記憶體，
+這裡只需要 reshape 成 tensor，就能用單次 forward 處理整批葉節點。
+"""
     boards_np = np.concatenate([r.board_state_flat for r in reqs], axis=0)
     globals_np = np.concatenate([r.global_features for r in reqs], axis=0)
     masks_np = np.concatenate([r.legal_masks for r in reqs], axis=0)
@@ -109,6 +120,8 @@ def _gpu_worker_main(
     從請求佇列收集批次，執行模型推論，將結果送回對應的回應佇列。
     若 request.model_id 為 0 使用 primary policy，為 1 使用 secondary_policy。
     """
+    # GPU worker 的職責非常單純：
+    # 從 request_queue 聚批，依 model_id 分流，然後把結果送回各 session response queue。
     try:
         while not stop_event.is_set():
             try:
@@ -211,6 +224,11 @@ def _cpu_worker_main(
 
     建立 SearchSession，收集葉節點、發送推論請求、接收回應。
     """
+    # CPU worker 綁定一棵 SearchSession，負責：
+    # 1. 向 C++ 取出 pending leaves
+    # 2. 送到共享 GPU worker
+    # 3. 等待結果
+    # 4. 回填到該 SearchSession
     try:
         cfg = module.SearchConfig()
         cfg.simulations = int(simulations)
@@ -247,15 +265,38 @@ def _cpu_worker_main(
                     packed["legal_masks"], dtype=np.uint8
                 ).copy(),
             )
-            request_queue.put(req)
+
+            # queue 滿時不直接永久阻塞，而是短等待 + stop_event 檢查。
+            enqueue_start = time.perf_counter()
+            while not stop_event.is_set():
+                try:
+                    request_queue.put(req, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            if stop_event.is_set():
+                raise RuntimeError(
+                    f"session {session_id} cancelled before request enqueue "
+                    f"(batch_id={batch_id})"
+                )
 
             try:
+                wait_start = time.perf_counter()
                 resp = response_queues[session_id].get(
                     timeout=response_timeout_s
                 )
             except queue.Empty as exc:
+                wait_elapsed = time.perf_counter() - wait_start
+                queue_wait_elapsed = time.perf_counter() - enqueue_start
+                try:
+                    pending_req = int(request_queue.qsize())
+                except Exception:
+                    pending_req = -1
                 raise TimeoutError(
-                    f"async inference timeout for session {session_id}"
+                    "async inference timeout "
+                    f"session={session_id} batch={batch_id} "
+                    f"wait={wait_elapsed:.3f}s enqueue_to_timeout={queue_wait_elapsed:.3f}s "
+                    f"request_qsize={pending_req}"
                 ) from exc
 
             if resp.error is not None:
@@ -381,6 +422,8 @@ def run_mcts_cpp_batch_async(
     stop_event = threading.Event()
     results: List[Optional[Tuple]] = [None] * n_sessions
 
+    # 目前每次 run_mcts_cpp_batch_async() 呼叫都會建立一組 thread。
+    # 這就是它與 SearchManager 常駐 worker 模式的最大差異。
     gpu_thread = threading.Thread(
         target=_gpu_worker_main,
         args=(

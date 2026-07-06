@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Python 3.12 EXACT REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 
 # ─── 源碼檔案 ─────────────────────────────────────────────
@@ -17,7 +17,9 @@ set(TZAAR_SOURCES
     src/core/action.cpp
     src/state/phase_state.cpp
     src/features/cnn_builder.cpp
-    src/mcts/search.cpp
+        src/mcts/search.cpp
+    src/mcts/search_manager.cpp
+    src/mcts/bench.cpp
 )
 
 set(TZAAR_INCLUDE_DIRS

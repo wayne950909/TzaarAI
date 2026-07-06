@@ -3,6 +3,12 @@ mcts/mcts_api.py — MCTS 統一 API
 
 提供 run_mcts（單一搜尋）和 run_mcts_batch（批次搜尋）
 作為 MCTS 引擎的頂層入口，自動選擇 Python / C++ / 非同步後端。
+
+這裡是整個搜尋系統的 routing layer：
+- `run_mcts()` 處理單局面
+- `run_mcts_batch()` 處理多局面
+- 呼叫者不需要自己知道目前是 python backend、cpp backend、
+    還是 async batch 路徑
 """
 
 from __future__ import annotations
@@ -53,6 +59,8 @@ def run_mcts(
     if root_state.is_done():
         raise ValueError("Cannot run MCTS from terminal state")
 
+    # 單局面時，優先嘗試 C++ SearchSession；
+    # 若 backend / state 不符合條件才回退到 Python 搜尋。
     if _cfg._ACTIVE_STATE_BACKEND == "cpp":
         if _cfg._ACTIVE_CPP_MODULE is None:
             if CPP_BACKEND_REQUIRED:
@@ -135,6 +143,8 @@ def run_mcts_batch(
     if not root_states:
         return []
 
+    # 目前的「批次」只表示呼叫端一次丟入多個 root states。
+    # 真正是否走 async，要看 backend、module、state 型別是否同時滿足。
     can_use_async = (
         ASYNC_MCTS_CFG.enabled
         and _cfg._ACTIVE_STATE_BACKEND == "cpp"

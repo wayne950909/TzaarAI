@@ -50,6 +50,26 @@ class SearchSession {
   // ─── 根節點快照 ───────────────────────────────────────
   LeafSnapshot root_snapshot();
 
+  // ─── 供 SearchManager 使用的內部批次模擬 ─────────────
+  // 模擬 chunk 次，將結果寫入指定的外部 buffer
+  // board_out / global_out / mask_out / node_ids_out 是外部預分配的連續記憶體
+  // tree_id 會寫入 tree_ids_out（如果非 null）
+  // 回傳實際模擬的葉節點數量
+  int simulate_into_buffers(int chunk,
+                            float* board_out,
+                            float* global_out,
+                            uint8_t* mask_out,
+                            int32_t* node_ids_out,
+                            int32_t* tree_ids_out,
+                            int tree_id);
+
+  // 提交單一節點的評估結果（供 SearchManager 使用）
+  // 與 submit_leaf_eval 不同，不會觸發 process_pending_evals
+  // 而是將結果暫存，等所有 pending 都到齊後自動處理
+  void submit_single_eval(int node_id,
+                          const float* priors,
+                          float value);
+
  private:
   struct PendingEval {
     std::vector<float> priors;
@@ -122,3 +142,4 @@ class SearchSession {
 }  // namespace tzaar
 
 #endif  // TZAAR_MCTS_SEARCH_H_
+

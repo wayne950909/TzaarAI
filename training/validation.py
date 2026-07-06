@@ -14,6 +14,7 @@ from config import (
     GATE_CFG,
     REPLAY_CFG,
     NETWORK_CFG,
+    ASYNC_MCTS_CFG,
 )
 
 
@@ -47,6 +48,17 @@ def validate_constants() -> None:
         raise ValueError("HEURISTIC_SOFTMAX_TEMPERATURE must be > 0")
     if not (0.0 <= MCTS_CFG.heuristic_prior_weight <= 1.0):
         raise ValueError("HEURISTIC_PRIOR_WEIGHT must be in [0, 1]")
+    if ASYNC_MCTS_CFG.enabled:
+        if ASYNC_MCTS_CFG.parallel_games <= 0:
+            raise ValueError("ASYNC_PARALLEL_GAMES must be >= 1")
+        if ASYNC_MCTS_CFG.infer_max_batch <= 0:
+            raise ValueError("ASYNC_INFER_MAX_BATCH must be >= 1")
+        if ASYNC_MCTS_CFG.request_queue_size <= 0:
+            raise ValueError("ASYNC_REQUEST_QUEUE_SIZE must be >= 1")
+        if ASYNC_MCTS_CFG.infer_max_wait_ms < 0:
+            raise ValueError("ASYNC_INFER_MAX_WAIT_MS must be >= 0")
+        if ASYNC_MCTS_CFG.response_timeout_s <= 0:
+            raise ValueError("ASYNC_RESPONSE_TIMEOUT_S must be > 0")
     if REPLAY_CFG.enabled:
         if REPLAY_CFG.max_samples <= 0:
             raise ValueError(

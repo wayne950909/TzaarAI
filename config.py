@@ -4,10 +4,17 @@ config.py — 所有超參數集中管理
 使用方式
 --------
     from config import MCTS_CFG, TRAINING_CFG, GATE_CFG, NETWORK_CFG, ...
-    
+
     # 可在執行前修改
     MCTS_CFG.simulations = 800
     TRAINING_CFG.games_per_update = 200
+
+這個檔案在目前架構中同時扮演三個角色：
+1. 訓練主流程的超參數來源
+2. Python / C++ 搜尋共用的關鍵設定來源
+3. 執行期後端狀態（_ACTIVE_STATE_BACKEND / _ACTIVE_CPP_MODULE）保存位置
+
+因此它不只是靜態設定檔，也是一個小型 runtime registry。
 """
 
 from __future__ import annotations
@@ -94,10 +101,17 @@ MCTS_CFG = MCTSConfig()
 class AsyncMCTSConfig:
     """多 CPU worker + 共享 GPU worker 的非同步 pipeline"""
     enabled: bool = True
+    # 目前正式訓練使用的是 active game pool 大小，
+    # 不是文件最終目標中的固定 10-thread SearchManager pool。
     parallel_games: int = 15
+    # 單次 GPU forward 最多聚合多少個 leaf states。
     infer_max_batch: int = 480
+    # GPU worker 最多等待多久，再把目前已收集到的 request 一起送進模型。
     infer_max_wait_ms: float = 2.0
+    # Python async worker request queue 的容量上限。
     request_queue_size: int = 30
+    # CPU worker 等待 GPU 回傳結果的超時秒數；
+    # 超時時目前訓練會在 selfplay engine 退回 sync-single。
     response_timeout_s: float = 30.0
 
 

@@ -13,6 +13,12 @@ namespace tzaar {
 // 建構子
 // ══════════════════════════════════════════════════════════════════════
 
+// SearchSession 代表「單棵搜尋樹」。
+// 它本身不碰多執行緒調度，只專注在：
+// - 節點選擇
+// - 葉節點狀態重建
+// - pending eval 管理
+// - backup / expand / root noise
 SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig config)
     : config_(std::move(config)), rng_(std::random_device{}()) {
 
@@ -37,7 +43,8 @@ SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig conf
 
   nodes_.push_back(std::move(root));
 
-  // 根節點 CNN 特徵快取
+  // 根節點 CNN 特徵快取。
+  // 之後所有葉節點 state 都可從這裡出發，沿動作序列重建。
   root_board_flat_.resize(static_cast<std::size_t>(kBoardFlatSize), 0.0f);
   root_global_feat_.resize(static_cast<std::size_t>(kGlobalFeatureDim), 0.0f);
   if (!root_state_.is_done()) {
@@ -183,9 +190,166 @@ LeafSnapshot SearchSession::root_snapshot() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 供 SearchManager 使用的方法
+// ══════════════════════════════════════════════════════════════════════
+
+// 這是給 SearchManager 使用的「零配置批次模擬」介面。
+// 它會把待推論葉節點直接寫進外部 buffer，而不是先建立 Python 物件。
+int SearchSession::simulate_into_buffers(int chunk,
+                                         float* board_out,
+                                         float* global_out,
+                                         uint8_t* mask_out,
+                                         int32_t* node_ids_out,
+                                         int32_t* tree_ids_out,
+                                         int tree_id) {
+  if (chunk <= 0) return 0;
+
+  int simulated_count = 0;
+  for (int sim = 0; sim < chunk; ++sim) {
+    if (is_complete()) break;
+
+    simulations_processed_ += 1;
+
+    int node_idx = root_node_index_;
+    std::vector<int> path;
+    path.reserve(128);
+    path.push_back(node_idx);
+
+    while (true) {
+      MctsNode& node = nodes_[node_idx];
+
+      if (node.is_terminal) {
+        const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
+        backup(path, leaf_value, node.to_play);
+        break;
+      }
+
+      if (node.expanded) {
+        if (node.children.empty()) {
+          backup(path, 0.0f, node.to_play);
+          break;
+        }
+        const int action = select_child_action(node_idx);
+        node_idx = node.children.at(action);
+        path.push_back(node_idx);
+        continue;
+      }
+
+      // 未展開葉節點：
+      // - 第一次到達時，重建 state、建子節點、寫入外部 buffer
+      // - 若同一節點已在 pending queue 中，則只施加 virtual loss
+      if (pending_paths_.count(node_idx) > 0) {
+        // 已在佇列中：應用 virtual loss
+        for (const int idx : path) {
+          nodes_[idx].visit_count += 1;
+          nodes_[idx].value_sum -= 1.0f;
+        }
+        pending_paths_[node_idx].push_back(path);
+        break;
+      }
+
+      // 首次訪問：重建狀態一次
+      PhaseGameState state = reconstruct_state_for_node(node_idx);
+      node.to_play = state.current_player();
+      node.is_terminal = state.is_done();
+      node.winner = state.winner();
+      node.has_player = !node.is_terminal;
+
+      if (node.is_terminal) {
+        node.expanded = true;
+        node.legal_mask_ready = true;
+        node.cached_legal_mask.assign(static_cast<std::size_t>(kActionCount), static_cast<std::uint8_t>(0));
+        const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
+        backup(path, leaf_value, node.to_play);
+        break;
+      }
+
+      // ─── 將 CNN 特徵寫入外部 buffer ─────────────────
+      {
+        const auto counts = state.game().piece_counts();
+        const std::size_t offset = static_cast<std::size_t>(simulated_count);
+        build_cnn_features_into(
+            state.game().board(), state.current_player(), state.turn_number(),
+            state.phase(), counts,
+            board_out + (offset * static_cast<std::size_t>(kBoardFlatSize)),
+            global_out + (offset * static_cast<std::size_t>(kGlobalFeatureDim)));
+      }
+
+      // ─── 合法遮罩寫入外部 buffer ────────────────────
+      const std::vector<bool> legal = state.legal_mask();
+      node.cached_legal_mask.resize(static_cast<std::size_t>(kActionCount), 0);
+      {
+        const std::size_t offset = static_cast<std::size_t>(simulated_count) * static_cast<std::size_t>(kActionCount);
+        for (std::size_t j = 0; j < legal.size() && j < static_cast<std::size_t>(kActionCount); ++j) {
+          const uint8_t v = legal[j] ? static_cast<std::uint8_t>(1) : static_cast<std::uint8_t>(0);
+          node.cached_legal_mask[j] = v;
+          mask_out[offset + j] = v;
+        }
+      }
+      node.legal_mask_ready = true;
+
+      // ─── 建立子節點樁 ──────────────────────────────
+      for (int action = 0; action < kActionCount; ++action) {
+        if (!legal[static_cast<std::size_t>(action)]) continue;
+        const int new_idx = static_cast<int>(nodes_.size());
+        MctsNode child;
+        child.prior = 0.0f;
+        child.parent_idx = node_idx;
+        child.action_from_parent = action;
+        nodes_.push_back(std::move(child));
+        nodes_[node_idx].children[action] = new_idx;
+      }
+
+      // ─── Virtual loss ──────────────────────────────
+      for (const int idx : path) {
+        nodes_[idx].visit_count += 1;
+        nodes_[idx].value_sum -= 1.0f;
+      }
+
+      // ─── 記錄 pending ──────────────────────────────
+      pending_node_order_.push_back(node_idx);
+      node_ids_out[simulated_count] = static_cast<int32_t>(node_idx + 1);
+      if (tree_ids_out) {
+        tree_ids_out[simulated_count] = static_cast<int32_t>(tree_id);
+      }
+      pending_paths_[node_idx].push_back(path);
+      simulated_count++;
+      break;
+    }
+  }
+
+  return simulated_count;
+}
+
+void SearchSession::submit_single_eval(int node_id,
+                                       const float* priors,
+                                       float value) {
+  const int node_idx = node_id - 1;
+  if (node_idx < 0 || node_idx >= static_cast<int>(nodes_.size()))
+    throw std::invalid_argument("unknown node_id for current search session");
+  if (pending_paths_.find(node_idx) == pending_paths_.end())
+    throw std::invalid_argument("node_id is not in pending leaves");
+  if (pending_eval_map_.find(node_idx) != pending_eval_map_.end())
+    throw std::invalid_argument("leaf evaluation already submitted for this node");
+
+  std::vector<float> prior_row(static_cast<std::size_t>(kActionCount), 0.0f);
+  std::memcpy(prior_row.data(), priors,
+              static_cast<std::size_t>(kActionCount) * sizeof(float));
+
+  pending_eval_map_.emplace(node_idx, PendingEval{std::move(prior_row), value});
+
+  // 當所有 pending 都到齊時自動處理
+  if (pending_eval_map_.size() == pending_node_order_.size()) {
+    process_pending_evals();
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // 內部方法
 // ══════════════════════════════════════════════════════════════════════
 
+// 只記錄 parent/action，而不是在每個節點存完整 state。
+// 這樣可大量降低樹的記憶體成本。
 std::vector<int> SearchSession::collect_action_path_to_node(int node_idx) const {
   std::vector<int> reversed;
   int current = node_idx;
@@ -198,6 +362,8 @@ std::vector<int> SearchSession::collect_action_path_to_node(int node_idx) const 
   return reversed;
 }
 
+// 由 root_state_ + action path 重建任意節點局面。
+// 這正是 mctsLogic.md 中描述的「根狀態快取 + 動作序列重建」實作。
 PhaseGameState SearchSession::reconstruct_state_for_node(int node_idx) const {
   PhaseGameState state = root_state_.clone();
   const std::vector<int> actions = collect_action_path_to_node(node_idx);
@@ -444,6 +610,8 @@ int SearchSession::select_child_action(int node_idx) {
   return best_actions[static_cast<std::size_t>(pick(rng_))];
 }
 
+// 反向傳播時，若節點玩家與 leaf_to_play 不同，就翻號。
+// 這對應文件中「玩家不同 value 要加負號」的規則。
 void SearchSession::backup(const std::vector<int>& path, float leaf_value, int leaf_to_play) {
   for (const int idx : path) {
     MctsNode& node = nodes_[idx];
@@ -454,6 +622,10 @@ void SearchSession::backup(const std::vector<int>& path, float leaf_value, int l
   }
 }
 
+// 當一批 pending eval 都到齊後：
+// 1. 先 expand 對應葉節點
+// 2. 對所有等待同一節點結果的 path 還原 virtual loss
+// 3. 再做真正 backup
 void SearchSession::process_pending_evals() {
   for (const int node_idx : pending_node_order_) {
     auto eval_it = pending_eval_map_.find(node_idx);
