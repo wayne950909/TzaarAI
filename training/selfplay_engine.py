@@ -4,13 +4,13 @@
 如何產生自我對弈資料」集中在同一個地方。
 
 目前它做四件事：
-1. 判斷 async self-play 條件是否成立
+1. 判斷 C++ SearchManager self-play 條件是否成立
 2. 維護 active game pool（多局同時推進）
-3. 根據條件呼叫單局或批次 MCTS
-4. 在 async 路徑出錯時自動降級成 sync-single
+3. 透過 CppSearchManager 執行批次 MCTS 搜尋（常駐 C++ worker pool + 雙 buffer）
+4. 在 CppSearchManager 路徑出錯時自動降級成 sync-single
 
-注意：目前這裡的 async 路徑仍然是 Python thread-based 的 async_worker，
-還沒有切換到 C++ SearchManager 常駐 worker pool。
+注意：async 路徑已從 Python thread-based 的 async_worker
+切換到 C++ SearchManager 常駐 worker pool（CppSearchManager）。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from core.env import EnvConfig, TzaarEnv
 from core.types import GameResult
 from training.metrics import record_exploration_stats
 from training.sample import PolicySample
+from mcts.cpp_manager import CppSearchManager
 
 
 def winner_sign_from_result(result: Optional[GameResult]) -> int:
@@ -50,7 +51,7 @@ def assign_value_targets(samples: List[PolicySample], winner_sign: int) -> None:
 
 
 def is_async_selfplay_ready() -> bool:
-    """檢查目前執行期是否具備 async-batch self-play 條件。"""
+    """檢查目前執行期是否具備 C++ SearchManager self-play 條件。"""
     return (
         ASYNC_MCTS_CFG.enabled
         and int(ASYNC_MCTS_CFG.parallel_games) > 1
@@ -68,7 +69,7 @@ def log_runtime_mode() -> None:
         and int(TRAINING_CFG.games_per_update) > 1
     )
     async_ready = is_async_selfplay_ready()
-    mode = "async-batch" if async_ready else "sync-single"
+    mode = "CppSearchManager" if async_ready else "sync-single"
     print(
         "[runtime] "
         f"backend={_cfg._ACTIVE_STATE_BACKEND} | "
@@ -163,26 +164,32 @@ def collect_selfplay_samples(
     stats: Dict[str, float],
     total_updates: int,
     rng_seed_offset: Any,
+    search_manager: Optional[CppSearchManager] = None,
 ) -> tuple[List[PolicySample], int, int, float]:
     """執行一個 update 需要的 self-play，並回傳訓練樣本。
 
-回傳：
+    如果 search_manager 不為 None 且 C++ backend 可用，則使用
+    CppSearchManager（常駐 C++ worker pool + 雙 buffer）加速批次搜尋，
+    否則使用 sync-single 搜尋作為降級路徑。
+
+    回傳：
     fresh_samples      當前 update 產生的新樣本
     games_played       實際完成的局數
     total_game_samples 新增樣本總數
     last_temperature   最後一個決策使用的溫度（供 checkpoint 記錄）
 
-主要資料流：
+    主要資料流：
     active envs -> root states -> MCTS -> sampled action -> env.step -> PolicySample
     terminal game -> assign_value_targets -> fresh_samples
 """
     from mcts import run_mcts as _mcts_search
-    from mcts import run_mcts_batch as _mcts_search_batch
 
     n_games = int(TRAINING_CFG.games_per_update)
-    async_ready = is_async_selfplay_ready()
+    async_ready = (
+        is_async_selfplay_ready()
+        and search_manager is not None
+    )
     async_active = async_ready
-    parallel_games = min(n_games, int(ASYNC_MCTS_CFG.parallel_games)) if async_ready else 1
 
     fresh_samples: List[PolicySample] = []
     games_played = 0
@@ -195,6 +202,11 @@ def collect_selfplay_samples(
     launched = 0
 
     while games_played < n_games:
+        # 補滿 active pool 到 parallel_games 上限
+        parallel_games = min(
+            n_games - games_played,
+            int(ASYNC_MCTS_CFG.parallel_games) if async_active else 1,
+        )
         while launched < n_games and len(active) < parallel_games:
             game_i = launched
             rand_seed = rng_seed_offset(
@@ -260,22 +272,33 @@ def collect_selfplay_samples(
         if not root_states:
             continue
 
+                        # ── 執行 MCTS 批次搜尋 ─────────────────────────
+        # 走 CppSearchManager 路徑或 sync-single 降級路徑
         apply_noise = bool(update_idx > 0)
         simulations = int(MCTS_CFG.simulations)
-        # 只要本輪仍允許 async，且目前 active states 超過 1，
-        # 就先試 run_mcts_batch；失敗則本 update 內降級為同步。
-        if async_active and len(root_states) > 1:
+        use_cpp_manager = async_active and len(root_states) > 1
+
+        if use_cpp_manager:
             try:
-                batch_outputs = _mcts_search_batch(
-                    policy,
-                    root_states,
-                    device,
-                    apply_dirichlet_noise=apply_noise,
-                    simulations=simulations,
-                )
+                # 使用 C++ SearchManager（常駐 worker pool + 雙 buffer）
+                search_manager.reset_trees(root_states, simulations=simulations)
+                search_outputs = search_manager.run_search(policy, device)
+                # 將搜尋輸出轉為 _mcts_search 格式以便重用 action sampling 邏輯
+                batch_outputs = []
+                for output in search_outputs:
+                    batch_outputs.append((
+                        output["head"]
+                        if "head" in output
+                        else _cfg.HEAD_ACTION,
+                        output["action_dim"],
+                        output["legal_mask"],
+                        output["visits"],
+                        output["replay_board"],
+                        output["replay_global"],
+                    ))
             except Exception as exc:
                 print(
-                    "[runtime] async selfplay failed in update "
+                    "[runtime] CppSearchManager failed in update "
                     f"{update_idx}; falling back to sync-single. "
                     f"reason={type(exc).__name__}: {exc}"
                 )
@@ -291,6 +314,7 @@ def collect_selfplay_samples(
                     for state in root_states
                 ]
         else:
+            # sync-single 降級路徑：逐局面呼叫 Python/C++ SearchSession
             batch_outputs = [
                 _mcts_search(
                     policy,

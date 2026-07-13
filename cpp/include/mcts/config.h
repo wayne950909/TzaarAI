@@ -15,6 +15,8 @@ struct SearchConfig {
   bool add_root_dirichlet_noise = false;
   float root_dirichlet_eps = 0.25f;
   float root_dirichlet_alpha = 0.05f;
+  int min_batch_for_swap = 0;    // 最小累積 leaf 數才送 GPU (0=用 max_batch)
+  int flush_timeout_ms = 0;      // 強制送 GPU 的 timeout (0=不使用)
 };
 
 struct SearchResult {
@@ -36,3 +38,4 @@ struct SearchResult {
 }  // namespace tzaar
 
 #endif  // TZAAR_MCTS_CONFIG_H_
+

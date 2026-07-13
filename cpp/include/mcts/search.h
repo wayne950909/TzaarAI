@@ -21,6 +21,8 @@ class SearchSession {
   SearchConfig config() const { return config_; }
   bool has_pending_leaves() const { return !pending_node_order_.empty(); }
   bool is_complete() const;
+  int simulations_processed() const { return simulations_processed_; }
+  int simulations_requested() const { return config_.simulations; }
 
   // ─── 葉節點收集（舊 API） ─────────────────────────────
   std::vector<LeafSnapshot> collect_pending_leaves(int max_batch);

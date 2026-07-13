@@ -32,6 +32,7 @@ from config import (
     MCTS_CFG,
     GATE_CFG,
     REPLAY_CFG,
+    ASYNC_MCTS_CFG,
     _ACTIVE_STATE_BACKEND,
     _ACTIVE_CPP_MODULE,
 )
@@ -58,8 +59,10 @@ from training.selfplay_engine import (
     build_phase_state_from_env as _build_phase_state_from_env,
     collect_selfplay_samples as _collect_selfplay_samples,
     log_runtime_mode as _log_runtime_mode,
+    is_async_selfplay_ready,
 )
 from training.validation import validate_constants
+from mcts.cpp_manager import CppSearchManager
 
 import debugpy  # type: ignore[import-untyped]
 
@@ -208,7 +211,7 @@ def run(title: str) -> None:
         raise RuntimeError("CUDA is required for training.")
     device = torch.device("cuda")
 
-        # 解析後端（設定 _ACTIVE_* 全域變數）
+            # 解析後端（設定 _ACTIVE_* 全域變數）
     import config as _cfg
     state_backend, cpp_module = _resolve_state_backend()
     _cfg._ACTIVE_STATE_BACKEND = state_backend
@@ -217,6 +220,23 @@ def run(title: str) -> None:
     _ACTIVE_STATE_BACKEND = state_backend
     _ACTIVE_CPP_MODULE = cpp_module
     _log_runtime_mode()
+
+    # ── 建立 CppSearchManager（如適用） ──────────────
+    search_manager: Optional[CppSearchManager] = None
+    if is_async_selfplay_ready():
+        try:
+            search_manager = CppSearchManager(
+                num_threads=int(ASYNC_MCTS_CFG.parallel_games),
+                max_batch=int(ASYNC_MCTS_CFG.infer_max_batch),
+                response_timeout_s=float(ASYNC_MCTS_CFG.response_timeout_s),
+            )
+            print("[loop] CppSearchManager created successfully")
+        except Exception as exc:
+            print(
+                "[loop] failed to create CppSearchManager, "
+                f"falling back to sync-single. error: {exc}"
+            )
+            search_manager = None
 
     # ── 載入/初始化政策網路 ────────────────────────────
     # 這裡開始進入正式訓練 lifecycle：
@@ -266,7 +286,7 @@ def run(title: str) -> None:
         # - 是否因錯誤而 fallback 到 sync-single
         policy.eval()
         with torch.no_grad():
-            fresh_samples, games_played, n_new_samples, inference_temperature = _collect_selfplay_samples(
+                        fresh_samples, games_played, n_new_samples, inference_temperature = _collect_selfplay_samples(
                 policy,
                 device,
                 env_cfg,
@@ -274,8 +294,9 @@ def run(title: str) -> None:
                 stats,
                 total_updates,
                 _rng_seed_offset,
+                search_manager=search_manager,
             )
-            total_fresh_samples += n_new_samples
+        total_fresh_samples += n_new_samples
 
         # ── 訓練 ────────────────────────────────────────────
         # 資料來源可能是：
@@ -394,7 +415,7 @@ def run(title: str) -> None:
             f"n_train={len(train_samples)}"
         )
 
-    # ── 訓練結束 ──────────────────────────────────────
+        # ── 訓練結束 ──────────────────────────────────────
     final_ckpt = train_module.save_checkpoint(
         title=title,
         policy=policy,
@@ -418,6 +439,15 @@ def run(title: str) -> None:
     elapsed_total = time.perf_counter() - start_time
     print(f"[done] total time: {elapsed_total:.1f}s")
     print(f"[done] total fresh samples generated: {total_fresh_samples}")
+
+    # ── 關閉 SearchManager（如已建立） ────────────────
+    if search_manager is not None:
+        print("[loop] shutting down SearchManager...")
+        try:
+            search_manager.shutdown()
+        except Exception as e:
+            print(f"[loop] error shutting down SearchManager: {e}")
+        print("[loop] SearchManager shut down complete")
 
     if _LOG_FILE_PATH is not None:
         try:

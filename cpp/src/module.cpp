@@ -78,7 +78,9 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("puct_c",                   &tz::SearchConfig::puct_c)
     .def_readwrite("add_root_dirichlet_noise", &tz::SearchConfig::add_root_dirichlet_noise)
     .def_readwrite("root_dirichlet_eps",       &tz::SearchConfig::root_dirichlet_eps)
-    .def_readwrite("root_dirichlet_alpha",     &tz::SearchConfig::root_dirichlet_alpha);
+    .def_readwrite("root_dirichlet_alpha",     &tz::SearchConfig::root_dirichlet_alpha)
+    .def_readwrite("min_batch_for_swap",       &tz::SearchConfig::min_batch_for_swap)
+    .def_readwrite("flush_timeout_ms",         &tz::SearchConfig::flush_timeout_ms);
 
   // ─── SearchResult ─────────────────────────────────────
   py::class_<tz::SearchResult>(m, "SearchResult")
@@ -305,7 +307,9 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("run", &tz::SearchManager::run)
     .def("start_workers", &tz::SearchManager::start_workers)
     .def("wait_for_completion", &tz::SearchManager::wait_for_completion)
-    .def("finish_all", &tz::SearchManager::finish_all);
+    .def("finish_all", &tz::SearchManager::finish_all)
+    .def("shutdown", &tz::SearchManager::shutdown)
+    .def("total_remaining_simulations", &tz::SearchManager::total_remaining_simulations);
 
   // ─── CpuBench（純 CPU MCTS 效能測試） ────────────────
   py::class_<tz::CpuBenchResult>(m, "CpuBenchResult")
