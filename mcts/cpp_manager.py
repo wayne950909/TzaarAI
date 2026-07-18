@@ -192,6 +192,15 @@ class CppSearchManager:
 
             if batch_size == 0 or buffer_id < 0:
                 loop_iter += 1
+                # 每 100 次 idle 印一次 trees completed 狀態
+                if loop_iter % 100 == 0:
+                    completed_trees = self._manager.completed_tree_count()
+                    swap_reason = self._manager.last_swap_reason()
+                    print(
+                        f"  [SearchManager]  idle loop={loop_iter}, "
+                        f"trees_completed={completed_trees}/{self._n_trees}, "
+                        f"last_swap={swap_reason}"
+                    )
                 time.sleep(0.001)
                 continue
 
@@ -244,23 +253,29 @@ class CppSearchManager:
 
             # 每處理 10 個 batch 或最後幾次時印進度
             if total_batches_processed >= next_progress_log:
+                completed_trees = self._manager.completed_tree_count()
                 remaining = self._manager.total_remaining_simulations()
                 total_sims = self._n_trees * self._config.simulations
+                swap_reason = self._manager.last_swap_reason()
                 elapsed = time.perf_counter() - t_start
                 print(
                     f"  [SearchManager]  batches={total_batches_processed}, "
                     f"leaves={total_leaves_evaluated}, "
+                    f"trees_completed={completed_trees}/{self._n_trees}, "
                     f"remaining={remaining}/{total_sims}, "
+                    f"swap={swap_reason}, "
                     f"elapsed={elapsed:.1f}s"
                 )
                 next_progress_log = total_batches_processed * 2  # 等比級數遞增
 
         elapsed_total = time.perf_counter() - t_start
+        swap_reason = self._manager.last_swap_reason()
         print(
             f"[SearchManager] search done: "
             f"{total_batches_processed} batches, "
             f"{total_leaves_evaluated} leaves, "
-            f"elapsed={elapsed_total:.3f}s"
+            f"elapsed={elapsed_total:.3f}s, "
+            f"last_swap={swap_reason}"
         )
 
         # ── 所有樹已完成，取回結果 ─────────────────────

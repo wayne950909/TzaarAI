@@ -41,7 +41,7 @@ class SearchManager {
   // max_batch   : 單個 buffer 的最大葉節點數（預設 480 = 30 棵樹 * 16 leaf_batch_size）
   SearchManager(const std::vector<PhaseGameState>& root_states,
                 SearchConfig config,
-                int num_threads = 10,
+                int num_threads = 1,
                 int max_batch = 480);
 
   SearchManager(const SearchManager&) = delete;
@@ -75,7 +75,9 @@ class SearchManager {
 
   // ─── 結果取得 ───────────────────────────────────────
   bool is_complete() const;
+  int completed_tree_count() const;
   int total_remaining_simulations() const;
+  std::string last_swap_reason() const;
   std::vector<SearchResult> finish_all();
 
  private:
@@ -98,8 +100,13 @@ class SearchManager {
     // write_index   ：下一個寫入位置（worker fetch_add 取得）
     // active_writers：目前正在寫入的 worker 數量
     // pending_count ：目前已累積的葉節點總數
+    //
+    // 每個原子變數置於獨立 cache line（64 bytes），
+    // 並用 padding 確保彼此不互相干擾，符合 multi_thread_logic.md 要求。
     alignas(64) std::atomic<int> write_index{0};
+    char _pad1[64 - sizeof(std::atomic<int>)];
     alignas(64) std::atomic<int> active_writers{0};
+    char _pad2[64 - sizeof(std::atomic<int>)];
     alignas(64) std::atomic<int> pending_count{0};
 
     bool eval_done = true;  // GPU 是否已處理完這個 buffer
@@ -128,7 +135,7 @@ class SearchManager {
     std::unique_ptr<SearchSession> session;
     std::mutex mtx;                      // per-tree mutex（取代 atomic<bool> locked）
     bool completed = false;
-    bool flushed_to_buffer = false;      // 最近一批 leaf 是否已 flush 進 buffer
+    std::atomic<bool> flushed_to_buffer{false}; // 最近一批 leaf 是否已 flush 進 buffer
     int tree_id = -1;
   };
   std::vector<std::unique_ptr<SearchTree>> trees_;
@@ -152,10 +159,18 @@ class SearchManager {
   // 強制 swap 的時序控制
   std::atomic<int64_t> last_swap_time_ms_{0};
 
+  // 記錄本次 swap 的呼叫來源（worker_loop, result_handler, submit_eval, timeout）
+  // 由呼叫點設定，try_swap_buffer() 成功時用它來記錄 last_swap_reason_
+  mutable std::atomic<const char*> swap_caller_{"unknown"};
+
   // 執行緒池
   std::vector<std::thread> pool_;
   std::thread result_handler_;
   std::atomic<bool> result_handler_stop_{false};
+
+  // 最近一次 swap_buffer 的原因（供 Python 端日誌用）
+  mutable std::mutex swap_reason_mtx_;
+  std::string last_swap_reason_;
 
   // 同步（Python 通知用）
   mutable std::mutex cv_mtx_;
@@ -175,17 +190,16 @@ class SearchManager {
   // 專用 GPU 結果處理執行緒主迴圈
   void result_handler_loop();
 
-  // Thread-local buffer
-  struct ThreadLocalSlot {
-    float board_flat[kBoardFlatSize];
-    float global_feat[kGlobalFeatureDim];
-    uint8_t legal_mask[kActionCount];
-    int32_t node_id;
-    int32_t tree_id;
-  };
+  // Thread-local buffer（連續記憶體，符合 multi_thread_logic.md 一次累積 leaf_batch_size 個 leaf）
+  // 用連續陣列取代離散 slots，讓 simulate_into_buffers 可以直接寫入
   struct ThreadLocalBuffer {
-    std::vector<ThreadLocalSlot> slots;
+    std::vector<float> board_flat;     // [leaf_batch_size * kBoardFlatSize]
+    std::vector<float> global_feat;    // [leaf_batch_size * kGlobalFeatureDim]
+    std::vector<uint8_t> legal_mask;   // [leaf_batch_size * kActionCount]
+    std::vector<int32_t> node_ids;     // [leaf_batch_size]
+    std::vector<int32_t> tree_ids;     // [leaf_batch_size]
     int count = 0;
+    int capacity = 0;
   };
 
   // 從佇列取得一棵樹（佇列空則 wait）

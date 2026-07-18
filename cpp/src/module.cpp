@@ -304,6 +304,8 @@ PYBIND11_MODULE(tzaar_cpp, m) {
          py::arg("priors"), py::arg("values"))
 
     .def("is_complete", &tz::SearchManager::is_complete)
+    .def("completed_tree_count", &tz::SearchManager::completed_tree_count)
+    .def("last_swap_reason", &tz::SearchManager::last_swap_reason)
     .def("run", &tz::SearchManager::run)
     .def("start_workers", &tz::SearchManager::start_workers)
     .def("wait_for_completion", &tz::SearchManager::wait_for_completion)
