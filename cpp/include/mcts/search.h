@@ -139,6 +139,10 @@ class SearchSession {
   void process_pending_evals();
   void expand_node(int node_idx, const std::vector<float>& priors);
   void apply_root_dirichlet_noise();
+  
+  // ─── 供 simulate_into_buffers 使用的輔助方法 ──────
+  // 檢查子節點底下是否有 pending leaf（遞迴檢查）
+  bool has_pending_descendant(int node_idx) const;
 };
 
 }  // namespace tzaar

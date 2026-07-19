@@ -51,11 +51,15 @@ def assign_value_targets(samples: List[PolicySample], winner_sign: int) -> None:
 
 
 def is_async_selfplay_ready() -> bool:
-    """檢查目前執行期是否具備 C++ SearchManager self-play 條件。"""
+    """檢查目前執行期是否具備 C++ SearchManager self-play 條件。
+    
+    即使 parallel_games = 1 也能使用 SearchManager
+    （1 CPU worker + 1 result_handler 的多執行緒架構）。
+    """
     return (
         ASYNC_MCTS_CFG.enabled
-        and int(ASYNC_MCTS_CFG.parallel_games) > 1
-        and int(TRAINING_CFG.games_per_update) > 1
+        and int(ASYNC_MCTS_CFG.parallel_games) >= 1
+        and int(TRAINING_CFG.games_per_update) >= 1
         and _cfg._ACTIVE_STATE_BACKEND == "cpp"
         and _cfg._ACTIVE_CPP_MODULE is not None
     )
@@ -65,8 +69,8 @@ def log_runtime_mode() -> None:
     """輸出目前訓練將走哪種 self-play / backend 路徑。"""
     async_requested = (
         ASYNC_MCTS_CFG.enabled
-        and int(ASYNC_MCTS_CFG.parallel_games) > 1
-        and int(TRAINING_CFG.games_per_update) > 1
+        and int(ASYNC_MCTS_CFG.parallel_games) >= 1
+        and int(TRAINING_CFG.games_per_update) >= 1
     )
     async_ready = is_async_selfplay_ready()
     mode = "CppSearchManager" if async_ready else "sync-single"
@@ -202,11 +206,14 @@ def collect_selfplay_samples(
     launched = 0
 
     while games_played < n_games:
-        # 補滿 active pool 到 parallel_games 上限
+                # 補滿 active pool 到 parallel_games 上限
+        # 即使 async_active=True 且 parallel_games=1，仍走 CppSearchManager
         parallel_games = min(
             n_games - games_played,
             int(ASYNC_MCTS_CFG.parallel_games) if async_active else 1,
         )
+        # 確保至少 1 局
+        parallel_games = max(parallel_games, 1)
         while launched < n_games and len(active) < parallel_games:
             game_i = launched
             rand_seed = rng_seed_offset(
@@ -276,7 +283,7 @@ def collect_selfplay_samples(
         # 走 CppSearchManager 路徑或 sync-single 降級路徑
         apply_noise = bool(update_idx > 0)
         simulations = int(MCTS_CFG.simulations)
-        use_cpp_manager = async_active and len(root_states) > 1
+        use_cpp_manager = async_active
 
         if use_cpp_manager:
             try:
