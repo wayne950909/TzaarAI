@@ -195,6 +195,9 @@ LeafSnapshot SearchSession::root_snapshot() {
 
 // 這是給 SearchManager 使用的「零配置批次模擬」介面。
 // 它會把待推論葉節點直接寫進外部 buffer，而不是先建立 Python 物件。
+// 注意：回傳值可能少於 chunk，因為：
+//   - 終端節點消耗模擬次數但不產出 leaf（backup 已內處理）
+//   - 所有路徑都被 pending leaf 阻塞時（stall）提前結束
 int SearchSession::simulate_into_buffers(int chunk,
                                          float* board_out,
                                          float* global_out,
@@ -205,8 +208,10 @@ int SearchSession::simulate_into_buffers(int chunk,
     if (chunk <= 0) return 0;
 
   int simulated_count = 0;
-  FILE* dbg = fopen("C:\\temp\\sim_debug.txt", "a");
-  for (int sim = 0; sim < chunk; ++sim) {
+  const int max_attempts = chunk + 32;  // 預留給終端節點的重試空間
+
+  for (int attempts = 0; attempts < max_attempts; ++attempts) {
+    if (simulated_count >= chunk) break;
     if (is_complete()) break;
 
     // ── Selection：從 root 開始，避開已有 pending leaf 的子樹 ──
@@ -218,40 +223,36 @@ int SearchSession::simulate_into_buffers(int chunk,
     while (true) {
       MctsNode& node = nodes_[node_idx];
 
-      // 情況 A：終端節點 → backup，繼續下一次模擬
+      // 情況 A：終端節點 → backup，不產 leaf，跳出 while 讓外層重試
       if (node.is_terminal) {
-        fprintf(dbg, "  sim=%d TERMINAL node_idx=%d\n", sim, node_idx);
         const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
         backup(path, leaf_value, node.to_play);
         simulations_processed_ += 1;
-                goto next_simulation;
+        break;
       }
 
       // 情況 B：已展開節點 → selection 繼續往下
       if (node.expanded) {
-        fprintf(dbg, "  sim=%d EXPANDED node_idx=%d children=%zu\n", sim, node_idx, node.children.size());
         if (node.children.empty()) {
           // 已展開但無合法子節點（可能因為遊戲結束判斷不同步）
           backup(path, 0.0f, node.to_play);
           simulations_processed_ += 1;
-          goto next_simulation;
+          break;
         }
-                const int action = select_child_action(node_idx);
-        fprintf(dbg, "    select_child_action -> action=%d\n", action);
+        const int action = select_child_action(node_idx);
         // select_child_action 回傳 -1 代表所有子節點都有 pending leaf
         if (action < 0) {
-          // 整棵樹已 stalled → 無法再產生新 leaf，直接返回
-          goto finished;
+          // 整棵樹已 stalled → 無法再產生新 leaf，回傳目前已累積的
+          return simulated_count;
         }
         node_idx = node.children.at(action);
         path.push_back(node_idx);
         continue;
       }
 
-            // 情況 C：未展開葉節點
-            fprintf(dbg, "  sim=%d UNEXPANDED_LEAF node_idx=%d (simulated_count=%d)\n", sim, node_idx, simulated_count);
+      // 情況 C：未展開葉節點
 
-            // 首次訪問：重建狀態
+      // 首次訪問：重建狀態
       PhaseGameState state = reconstruct_state_for_node(node_idx);
       node.to_play = state.current_player();
       node.is_terminal = state.is_done();
@@ -265,7 +266,7 @@ int SearchSession::simulate_into_buffers(int chunk,
         const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
         backup(path, leaf_value, node.to_play);
         simulations_processed_ += 1;
-        goto next_simulation;
+        break;
       }
 
       // ─── 將 CNN 特徵寫入外部 buffer ─────────────────
@@ -292,23 +293,23 @@ int SearchSession::simulate_into_buffers(int chunk,
       }
       node.legal_mask_ready = true;
 
-            // ─── 建立子節點樁 ──────────────────────────────
-            // 先保留空間，避免 push_back 時 vector reallocation 使 reference 失效
-            nodes_.reserve(nodes_.size() + static_cast<std::size_t>(kActionCount));
-            for (int action = 0; action < kActionCount; ++action) {
-              if (!legal[static_cast<std::size_t>(action)]) continue;
-              const int new_idx = static_cast<int>(nodes_.size());
-              MctsNode child;
-              child.prior = 0.0f;
-              child.parent_idx = node_idx;
-              child.action_from_parent = action;
-              nodes_.push_back(std::move(child));
-              nodes_[node_idx].children[action] = new_idx;
-            }
+      // ─── 建立子節點樁 ──────────────────────────────
+      // 先保留空間，避免 push_back 時 vector reallocation 使 reference 失效
+      nodes_.reserve(nodes_.size() + static_cast<std::size_t>(kActionCount));
+      for (int action = 0; action < kActionCount; ++action) {
+        if (!legal[static_cast<std::size_t>(action)]) continue;
+        const int new_idx = static_cast<int>(nodes_.size());
+        MctsNode child;
+        child.prior = 0.0f;
+        child.parent_idx = node_idx;
+        child.action_from_parent = action;
+        nodes_.push_back(std::move(child));
+        nodes_[node_idx].children[action] = new_idx;
+      }
 
-                        // ─── 標記節點已展開（關鍵！否則下次又會走到相同節點）──
-            // 用直接索引存取，避免 reference 可能失效的風險
-            nodes_[node_idx].expanded = true;
+      // ─── 標記節點已展開（關鍵！否則下次又會走到相同節點）──
+      // 用直接索引存取，避免 reference 可能失效的風險
+      nodes_[node_idx].expanded = true;
 
       // ─── Virtual loss ──────────────────────────────
       for (const int idx : path) {
@@ -325,16 +326,10 @@ int SearchSession::simulate_into_buffers(int chunk,
       pending_paths_[node_idx].push_back(path);
       simulated_count++;
       simulations_processed_ += 1;
-      goto next_simulation;
+      break;
     }
-
-  next_simulation:
-    continue;
   }
 
-finished:
-  fprintf(dbg, "  => return simulated_count=%d\n", simulated_count);
-  fclose(dbg);
   return simulated_count;
 }
 

@@ -103,7 +103,7 @@ class AsyncMCTSConfig:
     enabled: bool = True
     # 目前正式訓練使用的是 active game pool 大小，
     # 不是文件最終目標中的固定 10-thread SearchManager pool。
-    parallel_games: int = 1
+    parallel_games: int = 5
     # 單次 GPU forward 最多聚合多少個 leaf states。
     infer_max_batch: int = 480
     # GPU worker 最多等待多久，再把目前已收集到的 request 一起送進模型。

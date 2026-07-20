@@ -273,9 +273,15 @@ void SearchManager::worker_loop(int thread_id) {
     swap_caller_.store("worker", std::memory_order_relaxed);
     try_swap_buffer();
 
-    // 8. 若所有樹都完成，結束
+        // 8. 若所有樹都完成，結束
     if (is_complete()) {
       sm_log("worker %d: loop=%d complete, exit", thread_id, loop_count);
+      // 通知 Python get_ready_batch 醒來
+      {
+        std::lock_guard<std::mutex> lock(cv_mtx_);
+        batch_ready_ = true;
+      }
+      batch_ready_cv_.notify_one();
       break;
     }
 
@@ -361,7 +367,7 @@ void SearchManager::simulate_tree_into_local(int tree_id,
   const int actual_chunk = std::min(chunk, local.capacity);
   if (actual_chunk <= 0) return;
 
-  int count = session->simulate_into_buffers(
+    int count = session->simulate_into_buffers(
       actual_chunk,
       local.board_flat.data(),
       local.global_feat.data(),
@@ -371,7 +377,8 @@ void SearchManager::simulate_tree_into_local(int tree_id,
       tree_id);
 
   local.count = count;
-  sm_log("    simulate tree=%d: simulated=%d", tree_id, count);
+  int remaining = session->simulations_requested() - session->simulations_processed();
+  sm_log("    simulate tree=%d: simulated=%d (remaining=%d)", tree_id, count, remaining);
 
   if (session->is_complete()) {
     tree.completed = true;
@@ -775,30 +782,14 @@ void SearchManager::result_handler_loop() {
         // 依 md：result_handler 先鎖住資料對應的樹，將 virtual loss 復原，
         // 然後將推論完的先驗機率跟 value 加到樹裡
                 {
-          std::lock_guard<std::mutex> tree_lock(tree.mtx);
-
-          const bool before_pending = tree.session->has_pending_leaves();
-          const int before_simulated = tree.session->simulations_processed();
+                    std::lock_guard<std::mutex> tree_lock(tree.mtx);
 
           // 將 NN 評估結果寫入樹（復原 virtual loss + expand + backup）
           tree.session->submit_single_eval(node_id, priors_row, value);
 
-          const bool after_complete = tree.session->is_complete();
-          const bool after_pending = tree.session->has_pending_leaves();
-          const int after_simulated = tree.session->simulations_processed();
-
-          // 記錄 eval 結果
-          sm_log("result_handler:   eval tree=%d node=%d val=%.4f (sim %d->%d, complete=%d, pending=%d->%d)",
-                 tree_id, node_id, value,
-                 before_simulated, after_simulated,
-                 (int)after_complete, (int)before_pending, (int)after_pending);
-
-                    // 若此樹的模擬次數尚未達到目標次數，則將樹的 id 放到佇列
+          // 若此樹的模擬次數尚未達到目標次數，則將樹的 id 放到佇列
           if (!tree.completed && !tree.session->has_pending_leaves()) {
-            sm_log("result_handler:   -> reenqueue tree=%d (sim=%d/%d, complete=%d)",
-                   tree_id, after_simulated,
-                   tree.session->simulations_requested(),
-                   (int)tree.session->is_complete());
+            sm_log("result_handler:   -> reenqueue tree=%d", tree_id);
             reenqueue_tree_if_needed(tree_id);
           }
         }
