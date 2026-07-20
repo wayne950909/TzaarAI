@@ -787,10 +787,14 @@ void SearchManager::result_handler_loop() {
           // 將 NN 評估結果寫入樹（復原 virtual loss + expand + backup）
           tree.session->submit_single_eval(node_id, priors_row, value);
 
-          // 若此樹的模擬次數尚未達到目標次數，則將樹的 id 放到佇列
-          if (!tree.completed && !tree.session->has_pending_leaves()) {
+                    // 若此樹尚有剩餘模擬次數且無 pending leaves，則重新入隊
+          // 注意：不用 tree.completed 判斷，因為 worker 模擬完若還有 pending leaves
+          // 就不會設 completed=true，要等 GPU 結果回來 process_pending_evals 後才知道
+          if (!tree.session->is_complete() && !tree.session->has_pending_leaves()) {
             sm_log("result_handler:   -> reenqueue tree=%d", tree_id);
             reenqueue_tree_if_needed(tree_id);
+          } else if (tree.session->is_complete()) {
+            tree.completed = true;
           }
         }
         // 解鎖 — 依 md

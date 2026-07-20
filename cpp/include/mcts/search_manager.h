@@ -41,7 +41,7 @@ class SearchManager {
   // max_batch   : 單個 buffer 的最大葉節點數（預設 480 = 30 棵樹 * 16 leaf_batch_size）
   SearchManager(const std::vector<PhaseGameState>& root_states,
                 SearchConfig config,
-                int num_threads = 4,
+                int num_threads = 8,
                 int max_batch = 480);
 
   SearchManager(const SearchManager&) = delete;
