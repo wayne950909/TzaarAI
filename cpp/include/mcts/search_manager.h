@@ -128,6 +128,7 @@ class SearchManager {
   int max_batch_;
   int tree_count_;
   std::atomic<bool> stop_{false};
+  std::atomic<int> completed_count_{0};    // 已完成模擬的樹數量（問題 3 修復）
 
   // 樹的管理
   struct SearchTree {
@@ -151,7 +152,7 @@ class SearchManager {
   // ─── 雙 buffer ─────────────────────────────────────
   EvalBuffer buffers_[2];
   std::atomic<int> active_buffer_{0};     // CPU 正在填入的 buffer 索引
-  bool fillable_[2] = {true, false};      // buffer 是否可以填入
+  std::atomic<bool> fillable_[2] = {true, false};      // buffer 是否可以填入
 
   // 原子交換鎖：避免多個 worker 同時 swap_buffer
   std::atomic<bool> swapping_{false};
@@ -228,6 +229,9 @@ class SearchManager {
 
   // 將一棵樹重新入隊（若未完成且無 pending leaves）
   void reenqueue_tree_if_needed(int tree_id);
+
+  // 將一棵樹標記為完成，若所有樹都完成則觸發 shutdown 並通知 Python
+  void complete_tree(SearchTree& tree);
 
   // 輔助：取得目前毫秒時間
   static int64_t now_ms();

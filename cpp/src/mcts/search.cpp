@@ -4,8 +4,24 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdarg>
 #include <limits>
 #include <stdexcept>
+#include <fstream>
+#include <mutex>
+
+// 共用的 debug log（與 search_manager.cpp 寫入同一個檔案）
+static std::mutex g_search_log_mtx;
+static void search_log(const char* fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    std::lock_guard<std::mutex> lk(g_search_log_mtx);
+    std::ofstream log("C:/temp/sm_log.txt", std::ios::app);
+    log << buf << std::endl;
+}
 
 namespace tzaar {
 
@@ -208,11 +224,21 @@ int SearchSession::simulate_into_buffers(int chunk,
     if (chunk <= 0) return 0;
 
   int simulated_count = 0;
-  const int max_attempts = chunk + 32;  // 預留給終端節點的重試空間
+  const int max_attempts = chunk + 128;  // 預留給終端節點的重試空間
 
-  for (int attempts = 0; attempts < max_attempts; ++attempts) {
+    for (int attempts = 0; attempts < max_attempts; ++attempts) {
     if (simulated_count >= chunk) break;
     if (is_complete()) break;
+
+    // DEBUG: 記錄每次 attempt 的狀態
+    if (attempts == 0) {
+      search_log("  ** SIMDEBUG ** tree=%d: chunk=%d max_attempts=%d rem=%d root_terminal=%d root_expanded=%d root_children=%d",
+                 tree_id, chunk, max_attempts,
+                 config_.simulations - simulations_processed_,
+                 nodes_[root_node_index_].is_terminal ? 1 : 0,
+                 nodes_[root_node_index_].expanded ? 1 : 0,
+                 (int)nodes_[root_node_index_].children.size());
+    }
 
     // ── Selection：從 root 開始，避開已有 pending leaf 的子樹 ──
     int node_idx = root_node_index_;
@@ -239,9 +265,25 @@ int SearchSession::simulate_into_buffers(int chunk,
           simulations_processed_ += 1;
           break;
         }
-        const int action = select_child_action(node_idx);
+                const int action = select_child_action(node_idx);
         // select_child_action 回傳 -1 代表所有子節點都有 pending leaf
         if (action < 0) {
+          // DEBUG: 記錄為什麼 stalled
+          {
+            int child_count = 0;
+            int skipped_count = 0;
+            int pending_descendant_count = 0;
+            for (const auto& p : nodes_[node_idx].children) {
+              child_count++;
+              if (has_pending_descendant(p.second)) {
+                pending_descendant_count++;
+              }
+            }
+            search_log("  ** STALLED ** simulate tree=%d: node_idx=%d expanded=%d children=%d skipped_by_pending=%d pending_paths_size=%zu pending_node_order_size=%zu",
+                   tree_id, node_idx, nodes_[node_idx].expanded ? 1 : 0, 
+                   child_count, pending_descendant_count,
+                   pending_paths_.size(), pending_node_order_.size());
+          }
           // 整棵樹已 stalled → 無法再產生新 leaf，回傳目前已累積的
           return simulated_count;
         }
