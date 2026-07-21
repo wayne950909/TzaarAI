@@ -230,10 +230,12 @@ PYBIND11_MODULE(tzaar_cpp, m) {
 
   // ─── SearchManager ─────────────────────────────────────
   py::class_<tz::SearchManager>(m, "SearchManager")
-    .def(py::init<const std::vector<tz::PhaseGameState>&, tz::SearchConfig, int, int>(),
-         py::arg("root_states"), py::arg("config"),
-         py::arg("num_threads") = 10, py::arg("max_batch") = 480)
+    .def(py::init<tz::SearchConfig, int, int>(),
+         py::arg("config"), py::arg("num_threads") = 8, py::arg("max_batch") = 480)
 
+    .def("reset", &tz::SearchManager::reset,
+         py::arg("root_states"), py::arg("config"))
+    .def("join_workers", &tz::SearchManager::join_workers)
     .def("has_ready_batch", &tz::SearchManager::has_ready_batch)
 
     // get_ready_batch: 回傳 dict 包含 numpy views（零拷貝）
@@ -306,9 +308,6 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("is_complete", &tz::SearchManager::is_complete)
     .def("completed_tree_count", &tz::SearchManager::completed_tree_count)
     .def("last_swap_reason", &tz::SearchManager::last_swap_reason)
-    .def("run", &tz::SearchManager::run)
-    .def("start_workers", &tz::SearchManager::start_workers)
-    .def("wait_for_completion", &tz::SearchManager::wait_for_completion)
     .def("finish_all", &tz::SearchManager::finish_all)
     .def("shutdown", &tz::SearchManager::shutdown)
     .def("total_remaining_simulations", &tz::SearchManager::total_remaining_simulations);

@@ -224,7 +224,7 @@ int SearchSession::simulate_into_buffers(int chunk,
     if (chunk <= 0) return 0;
 
   int simulated_count = 0;
-  const int max_attempts = chunk + 128;  // 預留給終端節點的重試空間
+  const int max_attempts = chunk + 256;  // 預留給終端節點的重試空間
 
     for (int attempts = 0; attempts < max_attempts; ++attempts) {
     if (simulated_count >= chunk) break;

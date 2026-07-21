@@ -39,32 +39,28 @@ namespace tzaar {
 // 建構子
 // ══════════════════════════════════════════════════════════════════════
 
-SearchManager::SearchManager(const std::vector<PhaseGameState>& root_states,
-                             SearchConfig config,
+SearchManager::SearchManager(SearchConfig config,
                              int num_threads,
                              int max_batch)
     : config_(std::move(config)),
       num_threads_(num_threads),
       max_batch_(max_batch),
-      tree_count_(static_cast<int>(root_states.size())) {
+      tree_count_(0) {
 
-  if (tree_count_ <= 0)
-    throw std::invalid_argument("root_states must not be empty");
   if (num_threads_ <= 0)
     throw std::invalid_argument("num_threads must be >= 1");
   if (max_batch_ <= 0)
     throw std::invalid_argument("max_batch must be >= 1");
 
-  trees_.reserve(static_cast<std::size_t>(tree_count_));
-  for (int i = 0; i < tree_count_; ++i) {
-    auto tree = std::make_unique<SearchTree>();
-    tree->root_state = root_states[static_cast<std::size_t>(i)].clone();
-    tree->session = std::make_unique<SearchSession>(tree->root_state, config_);
-    tree->tree_id = i;
-    trees_.push_back(std::move(tree));
-  }
+    // 建立常駐 threads（佇列空的，workers 直接在 acquire_tree_from_queue 中 wait）
+  stop_ = false;
+  result_handler_stop_ = false;
 
-  init_buffers();
+  result_handler_ = std::thread(&SearchManager::result_handler_loop, this);
+  pool_.reserve(static_cast<std::size_t>(num_threads_));
+  for (int i = 0; i < num_threads_; ++i) {
+    pool_.emplace_back(&SearchManager::worker_loop, this, i);
+  }
 }
 
 void SearchManager::init_buffers() {
@@ -102,76 +98,86 @@ void SearchManager::enqueue_all_trees() {
   queue_cv_.notify_all();
 }
 
-void SearchManager::start_workers() {
-  sm_log("start_workers: %d workers + 1 result handler", num_threads_);
+void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
+                           SearchConfig config) {
+  // 不用暫停 workers，直接重置
+  // workers 此時可能在 acquire_tree_from_queue 中 wait（佇列空的）
+  // 或正在處理上一次的樹（但我們即將清空佇列並放新樹）
+  sm_log("reset: %zu trees", root_states.size());
 
-  // 把所有樹 ID 放入佇列
-  enqueue_all_trees();
+  config_ = std::move(config);
+  tree_count_ = static_cast<int>(root_states.size());
 
-  result_handler_stop_ = false;
-  result_handler_ = std::thread(&SearchManager::result_handler_loop, this);
+  if (tree_count_ <= 0)
+    throw std::invalid_argument("root_states must not be empty");
 
-  pool_.reserve(static_cast<std::size_t>(num_threads_));
-  for (int i = 0; i < num_threads_; ++i) {
-    pool_.emplace_back(&SearchManager::worker_loop, this, i);
+  // 重置 trees
+  trees_.clear();
+  trees_.reserve(static_cast<std::size_t>(tree_count_));
+  for (int i = 0; i < tree_count_; ++i) {
+    auto tree = std::make_unique<SearchTree>();
+    tree->root_state = root_states[static_cast<std::size_t>(i)].clone();
+    tree->session = std::make_unique<SearchSession>(tree->root_state, config_);
+    tree->tree_id = i;
+    trees_.push_back(std::move(tree));
   }
+
+  // 重置 buffers
+  init_buffers();
+
+  // 重置所有計數器和狀態
+  completed_count_ = 0;
+  stop_ = false;
+  result_handler_stop_ = false;
+  active_buffer_ = 0;
+  swapping_ = false;
+  pending_results_.clear();
+
+  // 清空佇列並重新入隊
+  {
+    std::lock_guard<std::mutex> lock(queue_mtx_);
+    while (!tree_queue_.empty()) tree_queue_.pop();
+    for (int i = 0; i < tree_count_; ++i) {
+      tree_queue_.push(i);
+    }
+  }
+  queue_cv_.notify_all();
 }
 
-void SearchManager::wait_for_completion() {
-  sm_log("wait_for_completion: start");
-
-  // 先設停止旗標，確保 threads 可以跳出 wait
+void SearchManager::shutdown() {
   stop_ = true;
   result_handler_stop_ = true;
+
   {
     std::lock_guard<std::mutex> lock(queue_mtx_);
     queue_cv_.notify_all();
   }
   batch_ready_cv_.notify_all();
   results_cv_.notify_all();
+}
 
-  // 1. 等待所有 CPU worker threads 完成
+void SearchManager::join_workers() {
+  sm_log("join_workers: start");
+
+  // 確保 thread 已經被通知停止
+  shutdown();
+
   for (auto& t : pool_) {
     if (t.joinable()) {
       t.join();
     }
   }
   pool_.clear();
-  sm_log("wait_for_completion: all workers joined");
+  sm_log("join_workers: all workers joined");
 
-  // 2. 通知 result handler 停止（它可能在等 results_cv_）
-  {
-    std::lock_guard<std::mutex> lock(results_mtx_);
-    result_handler_stop_ = true;
-  }
-  results_cv_.notify_all();
-
-  // 3. 等待 result handler 完成
   if (result_handler_.joinable()) {
     result_handler_.join();
   }
-  sm_log("wait_for_completion: result handler joined");
+  sm_log("join_workers: result handler joined");
 
-  // 4. 確保任何殘留結果被處理（如果 result handler 在停止時來不及處理的遺留）
+  // 處理殘留結果
   process_pending_results();
-  sm_log("wait_for_completion: done");
-}
-
-void SearchManager::run() {
-  sm_log("run: start");
-  start_workers();
-  wait_for_completion();
-}
-
-void SearchManager::shutdown() {
-  stop_ = true;
-  result_handler_stop_ = true;
-  batch_ready_cv_.notify_all();
-  results_cv_.notify_all();
-  {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    queue_cv_.notify_all();
-  }
+  sm_log("join_workers: done");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -205,7 +211,7 @@ void SearchManager::worker_loop(int thread_id) {
   local.node_ids.resize(static_cast<std::size_t>(local_cap), 0);
   local.tree_ids.resize(static_cast<std::size_t>(local_cap), 0);
 
-  int loop_count = 0;
+    int loop_count = 0;
   while (!stop_) {
     loop_count++;
 
@@ -295,23 +301,20 @@ void SearchManager::worker_loop(int thread_id) {
 
 // 從佇列取得一棵樹 ID。
 // 佇列為空時在 condition_variable 上 wait。
-// 回傳 -1 表示收到停止訊號或所有樹已完成。
+// 回傳 -1 表示收到停止訊號。
 int SearchManager::acquire_tree_from_queue() {
     std::unique_lock<std::mutex> lock(queue_mtx_);
   sm_log("worker: waiting on queue (queue_size=%zu)", tree_queue_.size());
     queue_cv_.wait(lock, [this]() {
-    return !tree_queue_.empty() || stop_ || is_complete();
+    return !tree_queue_.empty() || stop_;
   });
 
   if (stop_) {
     sm_log("worker: awake (stop signal)");
     return -1;
   }
-  if (tree_queue_.empty()) {
-    sm_log("worker: awake (all trees complete, queue empty)");
-    return -1;
-  }
 
+  // 醒來 = 佇列一定有樹（被 reset 或 reenqueue 塞入）
   int tree_id = tree_queue_.front();
   tree_queue_.pop();
   sm_log("worker: awake (got tree=%d, queue_size=%zu)", tree_id, tree_queue_.size());
@@ -364,14 +367,13 @@ void SearchManager::complete_tree(SearchTree& tree) {
   
   sm_log("COMPLETE A TREE. current tree = %d (actual count = %d / %d queue=%d)%s", 
          completed_count_.load(), actual_completed, tree_count_, qsize, detail_str.c_str());
-  if (is_complete()) {
-    shutdown();
+    if (is_complete()) {
     sm_log("complete_tree: last tree completed, notify python");
     {
       std::lock_guard<std::mutex> cv_lock(cv_mtx_);
       batch_ready_ = true;
     }
-    batch_ready_cv_.notify_one();
+    batch_ready_cv_.notify_all();
   }
 }
 
@@ -658,16 +660,8 @@ SearchManager::PackedBatch SearchManager::get_ready_batch() {
   sm_log("  get_ready_batch: waiting on batch_ready_cv_");
   {
     std::unique_lock<std::mutex> lock(cv_mtx_);
-    batch_ready_cv_.wait(lock, [this]() {
-      if (batch_ready_) {
-        sm_log("  get_ready_batch: batch_ready_=true, wake up");
-        return true;
-      }
-      if (is_complete()) {
-        sm_log("  get_ready_batch: is_complete, wake up");
-        return true;
-      }
-      return false;
+        batch_ready_cv_.wait(lock, [this]() {
+      return batch_ready_;
     });
     batch_ready_ = false;
   }
@@ -780,11 +774,11 @@ void SearchManager::submit_eval_batch(int buffer_id,
 void SearchManager::result_handler_loop() {
   sm_log("result_handler: started");
 
-  while (!result_handler_stop_) {
+    while (!result_handler_stop_) {
     std::unique_lock<std::mutex> lock(results_mtx_);
 
-    results_cv_.wait(lock, [this]() {
-      return !pending_results_.empty() || result_handler_stop_ || is_complete();
+        results_cv_.wait(lock, [this]() {
+      return !pending_results_.empty() || result_handler_stop_;
     });
 
     sm_log("result_handler: woke up (stop=%d pending=%zu)",
@@ -961,32 +955,6 @@ int SearchManager::total_remaining_simulations() const {
 
 std::vector<SearchResult> SearchManager::finish_all() {
   sm_log("finish_all: start");
-
-  // 先設定停止旗標，讓 worker threads 和 result handler 跳出等待
-  stop_ = true;
-  result_handler_stop_ = true;
-  {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    queue_cv_.notify_all();
-  }
-  batch_ready_cv_.notify_all();
-  results_cv_.notify_all();
-
-  // 確保所有 worker threads 完成
-  for (auto& t : pool_) {
-    if (t.joinable()) {
-      t.join();
-    }
-  }
-  pool_.clear();
-
-  // 等待 result handler 完成
-  if (result_handler_.joinable()) {
-    result_handler_.join();
-  }
-
-  // 處理殘留結果（如果有）
-  process_pending_results();
 
   // 收集所有樹的搜尋結果
   std::vector<SearchResult> results;

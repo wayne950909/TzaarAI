@@ -30,17 +30,23 @@ namespace tzaar {
 //   - shared double buffer（write_index / active_writers 原子變數）
 //   - 原子交換鎖避免多 worker 同時 swap_buffer
 //   - result_handler 負責回寫 GPU 結果，並將未完成的樹重新入隊
+//
+// worker 的存活
+//   - 執行緒在建構時就被建立，在佇列上等待樹
+//   - 每次 reset() 把樹塞入佇列 + notify_all 即可喚醒
+//   - 所有樹完成後，佇列為空，workers 繼續在佇列上 wait
+//   - shutdown() + join_workers() 時才真正 join threads
 // ──────────────────────────────────────────────────────────
 
 class SearchManager {
  public:
   // ─── 建構子 ─────────────────────────────────────────
-  // root_states : 每棵樹的根狀態（每個元素 clone 後獨立使用）
-  // config      : 共用搜尋設定（每棵樹使用相同設定）
-  // num_threads : CPU worker 執行緒數量（預設 10）
-  // max_batch   : 單個 buffer 的最大葉節點數（預設 480 = 30 棵樹 * 16 leaf_batch_size）
-  SearchManager(const std::vector<PhaseGameState>& root_states,
-                SearchConfig config,
+  // 不傳入 root_states，只設定固定參數，直接建立常駐 threads
+  // threads 建立後立即進入 pause wait 狀態
+  // config      : 預設搜尋設定（reset 時可重新設定）
+  // num_threads : CPU worker 執行緒數量（預設 8）
+  // max_batch   : 單個 buffer 的最大葉節點數（預設 480）
+  SearchManager(SearchConfig config,
                 int num_threads = 8,
                 int max_batch = 480);
 
@@ -48,10 +54,15 @@ class SearchManager {
   SearchManager& operator=(const SearchManager&) = delete;
 
   // ─── 生命週期 ───────────────────────────────────────
-  void start_workers();
-  void wait_for_completion();
-  void run();
+  // 重置樹和 buffer，將新樹 ID 塞入佇列喚醒 workers
+  void reset(const std::vector<PhaseGameState>& root_states,
+             SearchConfig config);
+
+  // 停止 workers（設 stop flag + notify_all，不 join）
   void shutdown();
+
+  // 等待所有 workers 結束（真正 join threads）
+  void join_workers();
 
   // ─── Python 端專用介面 ────────────────────────────────
   bool has_ready_batch() const;

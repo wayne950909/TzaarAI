@@ -71,4 +71,9 @@ swap_buffer的前提:
 # mcts搜尋結束
 每當已完成的樹的數量增加時，檢查是否等於樹的總數，是的話則喚醒cpu worker執行緒並結束cpu worker和result_handler執行緒，最後喚醒python執行緒
 
+# worker的存活
+- 每次searchManager不重建，每次執行run_search()時就把樹、buffer清空，變數及佇列重置
+- cpu worker和result worker在結束搜尋時就進入wait狀態，等到下一次呼叫run_search時喚醒全部
+- 最後每場遊戲都模擬完才會把執行緒關閉
 
+當一次搜尋結束後，cpu workers跟result_handler進入wait，然後喚醒python端，python端先蒐集這次search獲得的資料，然後開始下次search，清空樹及buffer(只需要重置原子變數即可)，初始化變數，然後再啟動workers

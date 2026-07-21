@@ -7,8 +7,9 @@ mcts/cpp_manager.py — C++ SearchManager Python 包裝
 核心設計
 --------
 - CppSearchManager 是常駐物件（跨多個 update 重複使用）
-- 內部持有一個 C++ SearchManager 實例
-- 每次搜尋時重置其樹（保留 worker pool），重用既有 worker threads
+- 內部持有一個 C++ SearchManager 實例，其 worker threads 在建構時就已建立
+- 每次搜尋時 reset_trees() 重置樹和 buffer，workers 自動從佇列取樹
+- 搜尋完成後 workers 在空的佇列上 wait，等待下一次 reset
 - Python 端只做：get_ready_batch → model forward → submit_eval_batch
 
 使用方式
@@ -39,7 +40,7 @@ class CppSearchManager:
     """C++ SearchManager 的 Python 包裝（常駐 worker pool）。
 
     職責：
-    1. 建立並持有 C++ SearchManager 實例
+    1. 建立並持有 C++ SearchManager 實例（建構時即建立常駐 threads）
     2. 每次 self-play 時呼叫 reset_trees() 重置搜尋樹
     3. 在 run_search() 中與 C++ worker threads 協同：
        - get_ready_batch() 取得待評估葉節點
@@ -63,14 +64,39 @@ class CppSearchManager:
         self._num_threads = num_threads
         self._max_batch = max_batch
         self._response_timeout_s = response_timeout_s
-        self._manager = None
         self._config = None
         self._state_list = []
+
+        # 建立一個暫時 config（reset_trees 時會重新給）
+        default_cfg = self._module.SearchConfig()
+        default_cfg.simulations = 1
+        default_cfg.leaf_batch_size = int(MCTS_CFG.leaf_batch_size)
+
+        # 直接建立常駐 SearchManager（threads 已建立，在空的佇列上 wait）
+        self._manager = self._module.SearchManager(
+            default_cfg,
+            self._num_threads,
+            self._max_batch,
+        )
+        self._n_trees = 0
 
         print(
             f"[SearchManager] __init__: threads={num_threads}, "
             f"max_batch={max_batch}, timeout={response_timeout_s}s"
         )
+
+    def _build_config(self, simulations: int) -> Any:
+        """建立 SearchConfig。"""
+        cfg = self._module.SearchConfig()
+        cfg.simulations = int(simulations)
+        cfg.leaf_batch_size = int(MCTS_CFG.leaf_batch_size)
+        cfg.puct_c = float(MCTS_CFG.puct_c)
+        cfg.add_root_dirichlet_noise = bool(MCTS_CFG.use_root_dirichlet_noise)
+        cfg.root_dirichlet_eps = float(MCTS_CFG.root_dirichlet_eps)
+        cfg.root_dirichlet_alpha = float(MCTS_CFG.root_dirichlet_alpha)
+        cfg.min_batch_for_swap = int(MCTS_CFG.leaf_batch_size)
+        cfg.flush_timeout_ms = int(ASYNC_MCTS_CFG.infer_max_wait_ms)
+        return cfg
 
     def reset_trees(
         self,
@@ -94,41 +120,16 @@ class CppSearchManager:
                     "with _inner attribute"
                 )
 
-        n_trees = len(root_states)
-
         # 建立 SearchConfig
-        cfg = self._module.SearchConfig()
-        cfg.simulations = int(simulations)
-        cfg.leaf_batch_size = int(MCTS_CFG.leaf_batch_size)
-        cfg.puct_c = float(MCTS_CFG.puct_c)
-        cfg.add_root_dirichlet_noise = bool(MCTS_CFG.use_root_dirichlet_noise)
-        cfg.root_dirichlet_eps = float(MCTS_CFG.root_dirichlet_eps)
-        cfg.root_dirichlet_alpha = float(MCTS_CFG.root_dirichlet_alpha)
-        cfg.min_batch_for_swap = int(MCTS_CFG.leaf_batch_size)
-        cfg.flush_timeout_ms = int(ASYNC_MCTS_CFG.infer_max_wait_ms)
+        cfg = self._build_config(simulations)
         self._config = cfg
-
-        # 如果有舊的 manager，先 shutdown 確保 threads 被 join
-        if self._manager is not None:
-            try:
-                self._manager.finish_all()
-                self._manager.shutdown()
-            except Exception:
-                pass
-            self._manager = None
 
         inner_states = [s._inner for s in root_states]
         t0 = time.perf_counter()
-        self._manager = self._module.SearchManager(
-            inner_states,
-            cfg,
-            self._num_threads,
-            self._max_batch,
-        )
+        self._manager.reset(inner_states, cfg)
         elapsed = time.perf_counter() - t0
         self._state_list = list(root_states)
         self._n_trees = len(root_states)
-        self._workers_started = False
 
     def run_search(
         self,
@@ -138,7 +139,7 @@ class CppSearchManager:
         """與 C++ SearchManager 協同執行 MCTS 搜尋。
 
         這是 Python 端的「事件迴圈」：
-        1. 啟動 C++ worker threads（第一次呼叫時）
+        1. reset_trees() 已經把樹塞入佇列，workers 已在工作中
         2. 輪詢 get_ready_batch()，直到所有樹完成
         3. 對每個 batch 做 GPU forward
         4. submit_eval_batch() 回寫結果
@@ -158,31 +159,23 @@ class CppSearchManager:
             - "visits": Tensor (CPU)
             - "replay_board": Tensor (CPU, 12x9x9)
             - "replay_global": Tensor (CPU)
-            - "result": SearchResult (原始 C++ 結果)
+            - "root_value": float
+            - "root_player": int
+            - "is_done": bool
+            - "winner": int
         """
         if self._manager is None:
             raise RuntimeError(
                 "SearchManager not initialized; call reset_trees() first"
             )
 
-        # 啟動 worker threads
-        # start_workers 若 thread 已存在會拋異常，所以用旗標保護
-        if not self._workers_started:
-            print("[SearchManager] run_search: starting worker threads...")
-            t0 = time.perf_counter()
-            self._manager.start_workers()
-            self._workers_started = True
-            elapsed = time.perf_counter() - t0
-            print(f"[SearchManager]   workers started in {elapsed:.3f}s")
-        else:
-            print("[SearchManager] run_search: workers already started, reusing")
-
+        # workers 已被 reset_trees() 喚醒，開始搜尋
         # 主事件迴圈
         loop_iter = 0
         total_batches_processed = 0
         total_leaves_evaluated = 0
         t_start = time.perf_counter()
-        next_progress_log = 10  # 每處理 10 個 batch 印一次進度
+        next_progress_log = 10
 
         while not self._manager.is_complete():
             packed = self._manager.get_ready_batch()
@@ -192,7 +185,6 @@ class CppSearchManager:
 
             if batch_size == 0 or buffer_id < 0:
                 loop_iter += 1
-                # 每 100 次 idle 印一次 trees completed 狀態
                 if loop_iter % 100 == 0:
                     completed_trees = self._manager.completed_tree_count()
                     swap_reason = self._manager.last_swap_reason()
@@ -251,7 +243,6 @@ class CppSearchManager:
                 values_np,
             )
 
-            # 每處理 10 個 batch 或最後幾次時印進度
             if total_batches_processed >= next_progress_log:
                 completed_trees = self._manager.completed_tree_count()
                 remaining = self._manager.total_remaining_simulations()
@@ -266,7 +257,7 @@ class CppSearchManager:
                     f"swap={swap_reason}, "
                     f"elapsed={elapsed:.1f}s"
                 )
-                next_progress_log = total_batches_processed * 2  # 等比級數遞增
+                next_progress_log = total_batches_processed * 2
 
         elapsed_total = time.perf_counter() - t_start
         swap_reason = self._manager.last_swap_reason()
@@ -279,6 +270,7 @@ class CppSearchManager:
         )
 
         # ── 所有樹已完成，取回結果 ─────────────────────
+        # workers 在空的佇列上 wait，等著下一次 reset
         t0 = time.perf_counter()
         raw_results = self._manager.finish_all()
         finish_elapsed = time.perf_counter() - t0
@@ -334,9 +326,10 @@ class CppSearchManager:
     def shutdown(self) -> None:
         """關閉 SearchManager 及其 worker threads。"""
         if self._manager is not None:
+            print("[SearchManager] shutting down workers...")
             self._manager.shutdown()
+            self._manager.join_workers()
             self._manager = None
-        self._workers_started = False
         self._state_list = []
         self._config = None
 
