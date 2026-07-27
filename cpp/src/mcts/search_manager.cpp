@@ -12,23 +12,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <cstdarg>
 #include <stdexcept>
-#include <fstream>
 #include <mutex>
-
-// Thread-safe debug log
-static std::mutex g_sm_log_mtx;
-static void sm_log(const char* fmt, ...) {
-    char buf[512];
-    va_list args;
-    va_start(args, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    std::lock_guard<std::mutex> lk(g_sm_log_mtx);
-    std::ofstream log("C:/temp/sm_log.txt", std::ios::app);
-    log << buf << std::endl;
-}
 
 namespace tzaar {
 
@@ -70,8 +55,6 @@ SearchManager::SearchManager(SearchConfig config,
     per_worker_pending_cv_.push_back(std::make_unique<std::condition_variable>());
   }
 
-  sm_log("SearchManager ctor: %d threads, max_batch=%d", num_threads_, max_batch_);
-
   // 建立常駐 CPU workers
   pool_.reserve(static_cast<std::size_t>(num_threads_));
   for (int i = 0; i < num_threads_; ++i) {
@@ -91,9 +74,6 @@ SearchManager::SearchManager(SearchConfig config,
 
 void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
                            SearchConfig config) {
-  sm_log("reset: %zu trees, config.simulations=%d config.batch_increment=%d",
-         root_states.size(), config.simulations, config.batch_increment);
-
   config_ = std::move(config);
   tree_count_ = static_cast<int>(root_states.size());
 
@@ -154,7 +134,6 @@ void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
 }
 
 void SearchManager::shutdown() {
-  sm_log("shutdown: start");
   stop_ = true;
   result_handler_stop_ = true;
 
@@ -177,8 +156,6 @@ void SearchManager::shutdown() {
 }
 
 void SearchManager::join_workers() {
-  sm_log("join_workers: start");
-
   {
     EvalBatch dummy;
     while (eval_queue_.try_dequeue(dummy)) {
@@ -199,8 +176,6 @@ void SearchManager::join_workers() {
     if (t.joinable()) t.join();
   }
   result_handlers_.clear();
-
-  sm_log("join_workers: done");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -208,15 +183,10 @@ void SearchManager::join_workers() {
 // ══════════════════════════════════════════════════════════════════════
 
 void SearchManager::worker_loop(int worker_id) {
-  sm_log("worker %d: started, assigned %zu trees",
-         worker_id, assigned_trees_[static_cast<std::size_t>(worker_id)].size());
-
   std::vector<int>& my_trees = assigned_trees_[static_cast<std::size_t>(worker_id)];
   const int batch_increment = (config_.batch_increment > 0) ? config_.batch_increment : kBatchIncrement;
 
-  int loop_count = 0;
   while (!stop_) {
-    loop_count++;
     bool did_work = false;
 
     for (auto it = my_trees.begin(); it != my_trees.end(); ) {
@@ -285,7 +255,6 @@ void SearchManager::worker_loop(int worker_id) {
     }
   }
 
-  sm_log("worker %d: exit (total loops=%d)", worker_id, loop_count);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -298,8 +267,6 @@ void SearchManager::worker_loop(int worker_id) {
 // Result Handler 用 tree_id 找到樹，呼叫 submit_single_eval 寫回。
 
 void SearchManager::result_handler_loop(int worker_id) {
-  sm_log("result_handler %d: started", worker_id);
-
   const std::size_t idx = static_cast<std::size_t>(worker_id);
 
   while (!result_handler_stop_) {
@@ -331,7 +298,6 @@ void SearchManager::result_handler_loop(int worker_id) {
     }
   }
 
-  sm_log("result_handler %d: exit", worker_id);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -564,9 +530,6 @@ void SearchManager::complete_tree(SearchTree& tree) {
   tree.completed = true;
   completed_count_.fetch_add(1, std::memory_order_release);
 
-  sm_log("COMPLETE A TREE. tree=%d (count=%d/%d)",
-         tree.tree_id, completed_count_.load(), tree_count_);
-
   if (all_trees_completed()) {
     std::lock_guard<std::mutex> lock(search_done_mtx_);
     search_done_ = true;
@@ -602,13 +565,11 @@ int SearchManager::total_remaining_simulations() const {
 }
 
 std::vector<SearchResult> SearchManager::finish_all() {
-  sm_log("finish_all: start");
   std::vector<SearchResult> results;
   results.reserve(trees_.size());
   for (auto& tree_ptr : trees_) {
     results.push_back(tree_ptr->session->finish());
   }
-  sm_log("finish_all: done, %zu results", results.size());
   return results;
 }
 

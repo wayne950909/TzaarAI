@@ -226,7 +226,7 @@ def run(title: str) -> None:
     if is_async_selfplay_ready():
         try:
             search_manager = CppSearchManager(
-                num_threads=int(ASYNC_MCTS_CFG.parallel_games),
+                num_threads=int(ASYNC_MCTS_CFG.num_threads),
                 max_batch=int(ASYNC_MCTS_CFG.infer_max_batch),
                 response_timeout_s=float(ASYNC_MCTS_CFG.response_timeout_s),
             )
