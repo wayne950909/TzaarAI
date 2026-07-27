@@ -284,6 +284,7 @@ void SearchManager::result_handler_loop(int worker_id) {
     lk.unlock();
 
     // 處理結果 — 這些 tree_id 一定是我負責的
+    bool need_wake_worker = false;
     for (auto& res : results) {
       for (int i = 0; i < res.batch_size; ++i) {
         const int node_id = res.node_ids[static_cast<std::size_t>(i)];
@@ -293,8 +294,16 @@ void SearchManager::result_handler_loop(int worker_id) {
                                  static_cast<std::size_t>(kActionCount));
         const float value = res.values[static_cast<std::size_t>(i)];
 
-        process_pending_eval_result(tree_id, node_id, priors_row, value);
+        bool became_ready = process_pending_eval_result(
+            worker_id, tree_id, node_id, priors_row, value);
+        if (became_ready) need_wake_worker = true;
       }
+    }
+
+    // 一批結果全部處理完後，只需喚醒同一個 worker 一次
+    if (need_wake_worker) {
+      std::lock_guard<std::mutex> wake_lk(*worker_cv_mtx_[idx]);
+      worker_cv_[idx]->notify_one();
     }
   }
 
@@ -304,35 +313,28 @@ void SearchManager::result_handler_loop(int worker_id) {
 // 處理 GPU 推論結果（寫回樹、解除 pending、喚醒 worker）
 // ══════════════════════════════════════════════════════════════════════
 
-void SearchManager::process_pending_eval_result(int tree_id, int node_id,
+
+bool SearchManager::process_pending_eval_result(int /*worker_id*/, int tree_id,
+                                                 int node_id,
                                                  const float* priors,
                                                  float value) {
-  if (tree_id < 0 || tree_id >= tree_count_) return;
+  if (tree_id < 0 || tree_id >= tree_count_) return false;
 
   SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
-  if (tree.completed) return;
-
-  bool became_ready = false;
+  if (tree.completed) return false;
 
   tree.session->submit_single_eval(node_id, priors, value);
 
   if (!tree.session->is_complete() && !tree.session->has_pending_leaves()) {
-    became_ready = true;
-  } else if (tree.session->is_complete()) {
+    // 樹變得 ready，由呼叫方(result_handler_loop)統一喚醒 worker
+    return true;
+  }
+
+  if (tree.session->is_complete()) {
     if (!tree.completed) complete_tree(tree);
   }
 
-  // 如果樹解除 pending 且未完成，喚醒對應的 CPU Worker
-  if (became_ready) {
-    for (int w = 0; w < num_threads_; ++w) {
-      const auto& assigned = assigned_trees_[static_cast<std::size_t>(w)];
-      if (std::find(assigned.begin(), assigned.end(), tree_id) != assigned.end()) {
-        std::lock_guard<std::mutex> lk(*worker_cv_mtx_[static_cast<std::size_t>(w)]);
-        worker_cv_[static_cast<std::size_t>(w)]->notify_one();
-        break;
-      }
-    }
-  }
+  return false;
 }
 
 // ══════════════════════════════════════════════════════════════════════

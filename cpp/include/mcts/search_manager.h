@@ -204,8 +204,9 @@ class SearchManager {
   // 檢查是否有「處在就緒狀態」的樹（未完成且無 pending leaves）
   bool HasAnyReadyTree(const std::vector<int>& tree_ids) const;
 
-    // 處理 GPU 推論結果（寫回樹、解除 pending、喚醒 worker）
-  void process_pending_eval_result(int tree_id, int node_id,
+      // 處理 GPU 推論結果（寫回樹、解除 pending）
+  // 回傳 true 表示該樹變得 ready（呼叫方自行決定是否喚醒 worker）
+  bool process_pending_eval_result(int worker_id, int tree_id, int node_id,
                                    const float* priors, float value);
 
   // 將一棵樹標記為完成
