@@ -102,7 +102,7 @@ class AsyncMCTSConfig:
     """多 CPU worker + 共享 GPU worker 的非同步 pipeline"""
     enabled: bool = True
     # 同時模擬的遊戲數量（決定 MCTS tree 總數）
-    parallel_games: int = 10
+    parallel_games: int = 200
     # CPU worker 數量（每個 worker 配一個 result handler）
     # 若 num_threads < parallel_games，每個 worker 輪流處理多棵樹
     num_threads: int = 10

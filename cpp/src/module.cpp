@@ -238,49 +238,52 @@ PYBIND11_MODULE(tzaar_cpp, m) {
          py::arg("root_states"), py::arg("config"))
     .def("join_workers", &tz::SearchManager::join_workers)
 
-        // dequeue_batch: 回傳 dict 包含 numpy arrays
-    // 從 queue 累積多個 EvalBatch，合併成一個大 batch 回傳
+                // dequeue_batch: 回傳 dict 包含 numpy arrays（零拷貝）
+    // 從 queue 累積多個 EvalBatch，合併成一個大 batch 回傳。
+    // numpy array 直接 view SearchManager 內部的 dequeued_*_ 緩衝區，
+    // 完全免除一次 memcpy。
+    //
+    // 生命期安全：
+    //   SearchManager 由 Python 端的 CppSearchManager 持有，
+    //   在 run_search() 主迴圈的生命期內保證存活。每次 dequeue_batch
+    //   回傳的 view 在下次呼叫 dequeue_batch 之前有效，而 Python 端
+    //   在該次 view 的資料消費完畢（GPU forward + submit_leaf_evals）
+    //   之後才會呼叫下一次 dequeue_batch。
     .def("dequeue_batch",
          [](tz::SearchManager& mgr, int max_batch, int timeout_ms) {
            auto packed = mgr.dequeue_batch(max_batch, timeout_ms);
            py::dict out;
 
            if (packed.batch_size == 0) {
-             out["buffer_id"] = py::int_(-1);
              out["batch_size"] = py::int_(0);
              return out;
            }
 
            const py::ssize_t bsz = static_cast<py::ssize_t>(packed.batch_size);
 
-           // 複製資料到新的 numpy arrays
-           py::array_t<int32_t> node_ids(bsz);
-           py::array_t<int32_t> tree_ids(bsz);
-           py::array_t<int32_t> worker_ids(bsz);
-           py::array_t<uint8_t> legal_masks({bsz, static_cast<py::ssize_t>(tz::kActionCount)});
-           py::array_t<float> board_flat({bsz, static_cast<py::ssize_t>(tz::kBoardFlatSize)});
-           py::array_t<float> global_feat({bsz, static_cast<py::ssize_t>(tz::kGlobalFeatureDim)});
+           // Capsules with no-op destructors:
+           // 資料由 SearchManager 內部的 dequeued_*_ 向量持有，
+           // SearchManager 的生命期由 Python 端的 CppSearchManager 確保。
+           py::capsule node_cap (packed.node_ids,          [](void*) {});
+           py::capsule tree_cap (packed.tree_ids,          [](void*) {});
+           py::capsule work_cap (packed.worker_ids,        [](void*) {});
+           py::capsule mask_cap (packed.legal_masks,       [](void*) {});
+           py::capsule board_cap(packed.board_state_flat,  [](void*) {});
+           py::capsule glob_cap (packed.global_features,   [](void*) {});
 
-           std::memcpy(node_ids.mutable_data(), packed.node_ids,
-                       static_cast<std::size_t>(bsz) * sizeof(int32_t));
-           std::memcpy(tree_ids.mutable_data(), packed.tree_ids,
-                       static_cast<std::size_t>(bsz) * sizeof(int32_t));
-           std::memcpy(worker_ids.mutable_data(), packed.worker_ids,
-                       static_cast<std::size_t>(bsz) * sizeof(int32_t));
-           std::memcpy(legal_masks.mutable_data(), packed.legal_masks,
-                       static_cast<std::size_t>(bsz) * static_cast<std::size_t>(tz::kActionCount) * sizeof(uint8_t));
-           std::memcpy(board_flat.mutable_data(), packed.board_state_flat,
-                       static_cast<std::size_t>(bsz) * static_cast<std::size_t>(tz::kBoardFlatSize) * sizeof(float));
-           std::memcpy(global_feat.mutable_data(), packed.global_features,
-                       static_cast<std::size_t>(bsz) * static_cast<std::size_t>(tz::kGlobalFeatureDim) * sizeof(float));
-
-           out["batch_size"] = py::int_(packed.batch_size);
-           out["node_ids"] = std::move(node_ids);
-           out["tree_ids"] = std::move(tree_ids);
-           out["worker_ids"] = std::move(worker_ids);
-           out["legal_masks"] = std::move(legal_masks);
-           out["board_state_flat"] = std::move(board_flat);
-           out["global_features"] = std::move(global_feat);
+           out["batch_size"]   = py::int_(packed.batch_size);
+           out["node_ids"]     = py::array_t<int32_t>({bsz}, packed.node_ids, node_cap);
+           out["tree_ids"]     = py::array_t<int32_t>({bsz}, packed.tree_ids, tree_cap);
+           out["worker_ids"]   = py::array_t<int32_t>({bsz}, packed.worker_ids, work_cap);
+           out["legal_masks"]  = py::array_t<uint8_t>(
+               {bsz, static_cast<py::ssize_t>(tz::kActionCount)},
+               packed.legal_masks, mask_cap);
+           out["board_state_flat"] = py::array_t<float>(
+               {bsz, static_cast<py::ssize_t>(tz::kBoardFlatSize)},
+               packed.board_state_flat, board_cap);
+           out["global_features"] = py::array_t<float>(
+               {bsz, static_cast<py::ssize_t>(tz::kGlobalFeatureDim)},
+               packed.global_features, glob_cap);
            return out;
          },
          py::arg("max_batch") = 480, py::arg("timeout_ms") = 100)
