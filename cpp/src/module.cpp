@@ -80,7 +80,8 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("root_dirichlet_eps",       &tz::SearchConfig::root_dirichlet_eps)
     .def_readwrite("root_dirichlet_alpha",     &tz::SearchConfig::root_dirichlet_alpha)
     .def_readwrite("min_batch_for_swap",       &tz::SearchConfig::min_batch_for_swap)
-    .def_readwrite("flush_timeout_ms",         &tz::SearchConfig::flush_timeout_ms);
+    .def_readwrite("flush_timeout_ms",         &tz::SearchConfig::flush_timeout_ms)
+    .def_readwrite("batch_increment",          &tz::SearchConfig::batch_increment);
 
   // ─── SearchResult ─────────────────────────────────────
   py::class_<tz::SearchResult>(m, "SearchResult")
@@ -228,7 +229,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
          py::call_guard<py::gil_scoped_release>())
     .def("root_snapshot", &tz::SearchSession::root_snapshot);
 
-  // ─── SearchManager ─────────────────────────────────────
+    // ─── SearchManager ─────────────────────────────────────
   py::class_<tz::SearchManager>(m, "SearchManager")
     .def(py::init<tz::SearchConfig, int, int>(),
          py::arg("config"), py::arg("num_threads") = 8, py::arg("max_batch") = 480)
@@ -236,15 +237,15 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("reset", &tz::SearchManager::reset,
          py::arg("root_states"), py::arg("config"))
     .def("join_workers", &tz::SearchManager::join_workers)
-    .def("has_ready_batch", &tz::SearchManager::has_ready_batch)
 
-    // get_ready_batch: 回傳 dict 包含 numpy views（零拷貝）
-    .def("get_ready_batch",
-         [](tz::SearchManager& mgr) {
-           auto packed = mgr.get_ready_batch();
+        // dequeue_batch: 回傳 dict 包含 numpy arrays
+    // 從 queue 累積多個 EvalBatch，合併成一個大 batch 回傳
+    .def("dequeue_batch",
+         [](tz::SearchManager& mgr, int max_batch, int timeout_ms) {
+           auto packed = mgr.dequeue_batch(max_batch, timeout_ms);
            py::dict out;
 
-           if (packed.batch_size == 0 || packed.buffer_id < 0) {
+           if (packed.batch_size == 0) {
              out["buffer_id"] = py::int_(-1);
              out["batch_size"] = py::int_(0);
              return out;
@@ -252,62 +253,82 @@ PYBIND11_MODULE(tzaar_cpp, m) {
 
            const py::ssize_t bsz = static_cast<py::ssize_t>(packed.batch_size);
 
-           // Capsules with no-op destructors
-           py::capsule ids_cap  (packed.node_ids,         [](void*) {});
-           py::capsule mask_cap (packed.legal_masks,       [](void*) {});
-           py::capsule board_cap(packed.board_state_flat,  [](void*) {});
-           py::capsule glob_cap (packed.global_features,   [](void*) {});
-           py::capsule tree_cap (packed.tree_ids,          [](void*) {});
+           // 複製資料到新的 numpy arrays
+           py::array_t<int32_t> node_ids(bsz);
+           py::array_t<int32_t> tree_ids(bsz);
+           py::array_t<int32_t> worker_ids(bsz);
+           py::array_t<uint8_t> legal_masks({bsz, static_cast<py::ssize_t>(tz::kActionCount)});
+           py::array_t<float> board_flat({bsz, static_cast<py::ssize_t>(tz::kBoardFlatSize)});
+           py::array_t<float> global_feat({bsz, static_cast<py::ssize_t>(tz::kGlobalFeatureDim)});
 
-           out["buffer_id"] = py::int_(packed.buffer_id);
+           std::memcpy(node_ids.mutable_data(), packed.node_ids,
+                       static_cast<std::size_t>(bsz) * sizeof(int32_t));
+           std::memcpy(tree_ids.mutable_data(), packed.tree_ids,
+                       static_cast<std::size_t>(bsz) * sizeof(int32_t));
+           std::memcpy(worker_ids.mutable_data(), packed.worker_ids,
+                       static_cast<std::size_t>(bsz) * sizeof(int32_t));
+           std::memcpy(legal_masks.mutable_data(), packed.legal_masks,
+                       static_cast<std::size_t>(bsz) * static_cast<std::size_t>(tz::kActionCount) * sizeof(uint8_t));
+           std::memcpy(board_flat.mutable_data(), packed.board_state_flat,
+                       static_cast<std::size_t>(bsz) * static_cast<std::size_t>(tz::kBoardFlatSize) * sizeof(float));
+           std::memcpy(global_feat.mutable_data(), packed.global_features,
+                       static_cast<std::size_t>(bsz) * static_cast<std::size_t>(tz::kGlobalFeatureDim) * sizeof(float));
+
            out["batch_size"] = py::int_(packed.batch_size);
-           out["node_ids"] = py::array_t<int32_t>({bsz}, packed.node_ids, ids_cap);
-           out["tree_ids"] = py::array_t<int32_t>({bsz}, packed.tree_ids, tree_cap);
-           out["legal_masks"] = py::array_t<uint8_t>(
-               {bsz, static_cast<py::ssize_t>(tz::kActionCount)},
-               packed.legal_masks, mask_cap);
-           out["board_state_flat"] = py::array_t<float>(
-               {bsz, static_cast<py::ssize_t>(tz::kBoardFlatSize)},
-               packed.board_state_flat, board_cap);
-           out["global_features"] = py::array_t<float>(
-               {bsz, static_cast<py::ssize_t>(tz::kGlobalFeatureDim)},
-               packed.global_features, glob_cap);
+           out["node_ids"] = std::move(node_ids);
+           out["tree_ids"] = std::move(tree_ids);
+           out["worker_ids"] = std::move(worker_ids);
+           out["legal_masks"] = std::move(legal_masks);
+           out["board_state_flat"] = std::move(board_flat);
+           out["global_features"] = std::move(global_feat);
            return out;
-         })
+         },
+         py::arg("max_batch") = 480, py::arg("timeout_ms") = 100)
 
-    // submit_eval_batch
-    .def("submit_eval_batch",
-         [](tz::SearchManager& mgr, int buffer_id,
+            // submit_leaf_evals
+    // worker_ids 陣列，每個 leaf 對應所屬的 worker_id
+    .def("submit_leaf_evals",
+         [](tz::SearchManager& mgr,
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> worker_ids,
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_ids,
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> tree_ids,
             py::array_t<float, py::array::c_style | py::array::forcecast> priors,
             py::array_t<float, py::array::c_style | py::array::forcecast> values) {
 
+           if (worker_ids.ndim() != 1)
+             throw std::invalid_argument("worker_ids must be a 1D array");
            if (node_ids.ndim() != 1)
              throw std::invalid_argument("node_ids must be a 1D array");
+           if (tree_ids.ndim() != 1)
+             throw std::invalid_argument("tree_ids must be a 1D array");
            if (priors.ndim() != 2)
              throw std::invalid_argument("priors must be a 2D array [B, N_ACTIONS]");
            if (values.ndim() != 1)
              throw std::invalid_argument("values must be a 1D array [B]");
 
            const py::ssize_t bsz = node_ids.shape(0);
-           if (priors.shape(0) != bsz || values.shape(0) != bsz)
-             throw std::invalid_argument("batch size mismatch among node_ids/priors/values");
+           if (worker_ids.shape(0) != bsz ||
+               tree_ids.shape(0) != bsz ||
+               priors.shape(0) != bsz ||
+               values.shape(0) != bsz)
+             throw std::invalid_argument("batch size mismatch");
            if (priors.shape(1) != static_cast<py::ssize_t>(tz::kActionCount))
              throw std::invalid_argument("priors second dim must equal N_ACTIONS");
 
-           mgr.submit_eval_batch(
-               buffer_id,
+           mgr.submit_leaf_evals(
+               static_cast<const int32_t*>(worker_ids.request().ptr),
                static_cast<const int32_t*>(node_ids.request().ptr),
+               static_cast<const int32_t*>(tree_ids.request().ptr),
                static_cast<const float*>(priors.request().ptr),
                static_cast<const float*>(values.request().ptr),
                static_cast<int>(bsz));
          },
-         py::arg("buffer_id"), py::arg("node_ids"),
+         py::arg("worker_ids"),
+         py::arg("node_ids"), py::arg("tree_ids"),
          py::arg("priors"), py::arg("values"))
 
     .def("is_complete", &tz::SearchManager::is_complete)
     .def("completed_tree_count", &tz::SearchManager::completed_tree_count)
-    .def("last_swap_reason", &tz::SearchManager::last_swap_reason)
     .def("finish_all", &tz::SearchManager::finish_all)
     .def("shutdown", &tz::SearchManager::shutdown)
     .def("total_remaining_simulations", &tz::SearchManager::total_remaining_simulations);

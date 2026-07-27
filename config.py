@@ -113,6 +113,8 @@ class AsyncMCTSConfig:
     # CPU worker 等待 GPU 回傳結果的超時秒數；
     # 超時時目前訓練會在 selfplay engine 退回 sync-single。
     response_timeout_s: float = 30.0
+    # 每次 worker 從樹中連續模擬的步數（新 SearchManager 使用）
+    batch_increment: int = 16
 
 
 ASYNC_MCTS_CFG = AsyncMCTSConfig()

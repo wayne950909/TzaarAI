@@ -1,79 +1,58 @@
 # 多執行緒目的
-預設建立多個c++的CPU執行緒和1個python的GPU執行緒，目的是讓**CPU和GPU同時運行**
-**執行緒不會反覆被創立並刪除**
+預設建立多個 c++ 的 CPU 執行緒和 1 個 python 的 GPU 執行緒，目的是讓 **CPU 和GPU同時運行**。
+**執行緒不會反覆被創立並刪除**，生命週期與 `SearchManager` 綁定。
 
-
-# 蒐集資料
-cpu worker負責收集mcts待推論的葉節點，一棵樹只會由一個執行緒來模擬，一次**最多收集16的葉節點**
-定義模擬次數，模擬一次最多產生一個待推論葉節點，也有可能不會產生，像是遇到底部節點
-存在一個佇列(queue)，裡面放著尚需模擬的樹id
-
-## CPU worker
-1. 若佇列內有id，負責模擬mcts的CPU worker從佇列拿一個取出一個樹id；若佇列內沒有id，worker進入wait狀態，直到佇列內有id
-2. 嘗試鎖住樹(mutex)，鎖住失敗就跳到步驟1.，成功鎖住的話則開始跑mcts
-3. 模擬的過程，worker會把資料放進local暫存的地方(大小設為16，資料不會和其他樹混合)
-4. 除非模擬次數消耗完，否則會持續蒐集到16個葉節點
-5. 如果將模擬次數消耗完，沒有待推論的葉節點，則**已完成的樹數量增加1**
-6. 完成模擬後，直接將所有節點資料丟進可以被填入的buffer
-7. 填入資料後，檢查是否可以swap_buffer，可以的話就swap_buffer
-8. 解鎖
-9. 重複以上動作，找到下一棵樹來模擬
-
-# buffer的運作
-存在兩個buffer，每個的空間大小限制為樹的總數*16，也就是說**不用判定模擬完的資料放不放得下**，可以直接放
-會設定一個原子變數，代表**資料要填到buffer 0或1**
-
-## buffer寫入
-cpu worker將資料從local寫到buffer會用到
-1. 每個buffer存在兩個原子變數write_index和acitve_writers，分別記錄下一個寫入的位置跟正在寫入的執行緒數量
-2. 避免位於同一個 Cache Line，以免false sharing
-3. 當cpu worker要寫入資料時，增加write_index和active_writers(都用std::memory_order_relaxed，write_index根據要寫入的資料數量增加，active_writers增加1)，並根據write_index找到資料該寫入buffer的位置
-4. 當cpu worker寫完資料後，再將active_writers(std::memory_order_release)減少1
-這樣的原子變數確保active_writers的減少在write_index和active_writers的增加後面，這麼一來，active_writers可以藉由std::memory_order_acquire取得正確的active_writers數量
-
-## swap_buffer
-swap_buffer就是先讓資料轉為填入另一個buffer，然後將蒐集到資料的buffer拿去做gpu推論
-
-### swap_buffer的檢查時機
-- 每個cpu worker往buffer填入資料後
-- gpu推論完將結果傳回result_handler時
-### swap_buffer條件
 ---
-swap_buffer的前提:
-- 目前非填入資料的buffer已經gpu推論完成，這是cpu worker填入資料後要先檢查的
-- 沒有其他執行緒在swap_buffer
+
+# 一、 樹的固定分配與輪詢機制 (CPU Worker)
+- **固定指派**：每次呼叫 `reset_search()` 時，將總樹數平均分配給每個 CPU worker，每個 worker 內部維護一個專屬的「活躍樹 ID 清單」（Active Trees）。
+- **輪詢與過濾**：CPU worker 只輪詢自己內部清單中的樹。若某棵樹已完成（`is_complete()`），**立即從該 worker 的內部活躍清單中移除（`erase`）**，之後不再納入輪詢。
+
 ---
-若前提都成立，則以下條件至少符合一項就swap_buffer:
-- buffer內的資料數量達到一定值
-- 沒有新的樹可以被模擬了(所有的樹都已經被模擬過或是正在被模擬或是模擬次數結束)
-如果沒有符合條件，也就代表目前蒐集的資料不夠
-### swap_buffer流程
-1. 若cpu worker決定要swap_buffer，必須先用原子交換鎖來避免多個worker去swap_buffer，其他worker若發現正在swap，略過就好
-2. 假設現在填入的為buffer 0，另一個是buffer 1:
-    1. 先將兩個buffer的能否被填入的布林值對調，代表接下來填入資料都變成填到buffer 1
-    2. 接著等待buffer 0的active_writers變為0(std::memory_order_acquire)，沒有正在寫入的執行緒才能送進gpu
-    3. 接著將buffer 0的資料送進gpu推論
 
-# 一棵樹的模擬完成
-模擬完成的定義是**消耗完模擬次數且沒有待推論葉節點**
-樹有沒有完成會影響result_handler是否要再把樹放回佇列
-存在**一個已完成樹的數量原子變數，從0開始**
+# 二、 模擬與 16 次批次資料收集
+- **每輪 16 次模擬**：CPU worker 輪詢其活躍樹，對選中的樹進行**最多 16 次模擬**（模擬一次最多產生一個待推論葉節點，遇到底部節點可能不產生）。
+- **打包送出**：累積滿 16 次模擬（或該樹暫時無法再模擬）後，將收集到的一批待推論葉節點**以指標形式**整批送進 `concurrentQueue`。
+- **閥值檢查**：送入後檢查累積資料有沒有超過設定的閥值量，如果有，則喚醒 Python 端去做 GPU 推論。
 
+---
 
-# 處理推論完的資料 - result_handler worker
-跟著負責模擬mcts的cpu worker一起被創建，result_handler負責處理gpu推論完的資料
-1. 當result_handler worker收到buffer推論完的資料，會嘗試swap_buffer(不用檢查是否gpu推論完)
-2. result_handler會根據資料，先鎖住資料對應的樹，將樹裡的virtual loss復原，然後將推論完的先驗機率跟value加到樹裡
-3. 若此樹的模擬次數尚未達到目標次數，則將樹的id放到尚需模擬的佇列；若到達模擬次數，則不用放回佇列，並將已完成的樹數量增加1
-4. 解鎖
-5. 如果有將樹的id放回佇列，喚醒一個worker
+# 三、 防空轉機制 (Worker Sleep / Wakeup)
+- **主動睡眠**：若 CPU worker 輪詢完自己所有活躍的樹，發現：
+  1. 樹全部都已完成 (`is_complete()`)；或者
+  2. 尚未完成的樹**全部都在等 GPU 推論 (`has_pending_leaves() == true`)**。
+  - 此時 worker 會透過專屬的 `std::condition_variable` **主動進入睡眠狀態**，避免 CPU 發生 100% Busy-Spinning。
+- **精準喚醒**：當對應的 1:1 `result_handler` 處理完 GPU 結果並解鎖該樹後，會發出 `notify_one()` 將睡眠中的 CPU worker 喚醒繼續工作。
 
-# mcts搜尋結束
-每當已完成的樹的數量增加時，檢查是否等於樹的總數，是的話則喚醒cpu worker執行緒並結束cpu worker和result_handler執行緒，最後喚醒python執行緒
+---
 
-# worker的存活
-- 每次searchManager不重建，每次執行run_search()時就把樹、buffer清空，變數及佇列重置
-- cpu worker和result worker在結束搜尋時就進入wait狀態，等到下一次呼叫run_search時喚醒全部
-- 最後每場遊戲都模擬完才會把執行緒關閉
+# 四、 ConcurrentQueue 設計
+- 每個 CPU worker 負責將資料指標（或批次指標）丟入佇列，Python 從裡面拿資料去進行神經網路推論。
+- 資料的進出全程**使用指標來傳遞**，實現零拷貝高效能。
 
-當一次搜尋結束後，cpu workers跟result_handler進入wait，然後喚醒python端，python端先蒐集這次search獲得的資料，然後開始下次search，清空樹及buffer(只需要重置原子變數即可)，初始化變數，然後再啟動workers
+---
+
+# 五、 一棵樹的模擬完成與狀態更新
+- **完成定義**：模擬完成的定義是**消耗完模擬次數且沒有待推論葉節點**（`is_complete()`）。
+- **已完成計數**：存在一個已完成樹的數量原子變數，從 0 開始遞增。
+- **重新入隊/解鎖**：樹有沒有完成會影響 `result_handler` 是否要解除該樹的 pending 狀態，讓 worker 可以繼續對其進行後續模擬。
+
+---
+
+# 六、 處理推論完的資料 (Result Handler Worker - 1:1 配對)
+- **1 對 1 伴隨創建**：每個負責模擬 MCTS 的 CPU worker 都會**伴隨一個專屬的 `result_handler` 執行緒**（模擬執行緒數量等於 `result_handler` 數量）。
+- **專屬處理**：事先在每個資料封包標記所屬的 CPU worker。每個 `result_handler` 專責挑選該 CPU worker 負責的 GPU 推論結果。
+- **回填與喚醒**：將先驗機率（Prior）與 Value 加到對應的樹上（`submit_single_eval`），解除 pending 狀態，若樹未完成則透過 `notify_one()` 喚醒對應的 CPU worker。
+
+---
+
+# 七、 MCTS 搜尋結束
+- 每當已完成的樹的數量增加時，檢查是否等於樹的總數。
+- 若等於總樹數，則喚醒 Python 執行緒，Python 端即會察覺搜尋結束並收回搜尋結果。
+
+---
+
+# 八、 Worker 的存活與生命週期
+- `SearchManager` 在多場對局中不重建。每次執行 `run_search()` 時，只將樹與 `concurrentQueue` 清空並重新指派。
+- CPU worker 和 Result Handler 在結束搜尋時不關閉，而是**進入 `wait` 狀態**，等到下一次呼叫 `run_search()` 時被喚醒全部。
+- 只有當整場遊戲結束、呼叫 `shutdown()` 時，才會正式關閉並銷毀所有執行緒。

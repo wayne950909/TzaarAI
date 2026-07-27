@@ -96,6 +96,7 @@ class CppSearchManager:
         cfg.root_dirichlet_alpha = float(MCTS_CFG.root_dirichlet_alpha)
         cfg.min_batch_for_swap = int(MCTS_CFG.leaf_batch_size)
         cfg.flush_timeout_ms = int(ASYNC_MCTS_CFG.infer_max_wait_ms)
+        cfg.batch_increment = int(ASYNC_MCTS_CFG.batch_increment)
         return cfg
 
     def reset_trees(
@@ -169,7 +170,7 @@ class CppSearchManager:
                 "SearchManager not initialized; call reset_trees() first"
             )
 
-        # workers 已被 reset_trees() 喚醒，開始搜尋
+                # workers 已被 reset_trees() 喚醒，開始搜尋
         # 主事件迴圈
         loop_iter = 0
         total_batches_processed = 0
@@ -178,34 +179,26 @@ class CppSearchManager:
         next_progress_log = 10
 
         while not self._manager.is_complete():
-            packed = self._manager.get_ready_batch()
+            # 從 ConcurrentQueue 取出一個大 batch
+            # max_batch（預設 480）個 leaf，或 queue 空了就回傳
+            packed = self._manager.dequeue_batch(self._max_batch, 0)
 
-            buffer_id = int(packed["buffer_id"])
             batch_size = int(packed["batch_size"])
 
-            if batch_size == 0 or buffer_id < 0:
-                loop_iter += 1
-                if loop_iter % 100 == 0:
-                    completed_trees = self._manager.completed_tree_count()
-                    swap_reason = self._manager.last_swap_reason()
-                    print(
-                        f"  [SearchManager]  idle loop={loop_iter}, "
-                        f"trees_completed={completed_trees}/{self._n_trees}, "
-                        f"last_swap={swap_reason}"
-                    )
-                time.sleep(0.001)
+            if batch_size == 0:
                 continue
 
             loop_iter += 1
             total_batches_processed += 1
             total_leaves_evaluated += batch_size
 
-            # ── 從 packed buffer 取出資料 ──────────────
-            node_ids_np = np.asarray(packed["node_ids"], dtype=np.int32).copy()
-            tree_ids_np = np.asarray(packed["tree_ids"], dtype=np.int32).copy()
-            boards_np = np.asarray(packed["board_state_flat"], dtype=np.float32).copy()
-            globals_np = np.asarray(packed["global_features"], dtype=np.float32).copy()
-            masks_np = np.asarray(packed["legal_masks"], dtype=np.uint8).copy()
+            # ── 從 packed buffer 取出資料（已拷貝為 numpy arrays） ─
+            node_ids_np = np.asarray(packed["node_ids"], dtype=np.int32)
+            tree_ids_np = np.asarray(packed["tree_ids"], dtype=np.int32)
+            worker_ids_np = np.asarray(packed["worker_ids"], dtype=np.int32)
+            boards_np = np.asarray(packed["board_state_flat"], dtype=np.float32)
+            globals_np = np.asarray(packed["global_features"], dtype=np.float32)
+            masks_np = np.asarray(packed["legal_masks"], dtype=np.uint8)
 
             # ── GPU forward ────────────────────────────
             board_batch = (
@@ -235,10 +228,11 @@ class CppSearchManager:
                 .numpy()
             )
 
-            # ── 回寫結果 ──────────────────────────────
-            self._manager.submit_eval_batch(
-                int(buffer_id),
+            # ── 回寫結果（帶 worker_ids 陣列） ──
+            self._manager.submit_leaf_evals(
+                worker_ids_np,
                 node_ids_np,
+                tree_ids_np,
                 priors_np,
                 values_np,
             )
@@ -247,26 +241,22 @@ class CppSearchManager:
                 completed_trees = self._manager.completed_tree_count()
                 remaining = self._manager.total_remaining_simulations()
                 total_sims = self._n_trees * self._config.simulations
-                swap_reason = self._manager.last_swap_reason()
                 elapsed = time.perf_counter() - t_start
                 print(
                     f"  [SearchManager]  batches={total_batches_processed}, "
                     f"leaves={total_leaves_evaluated}, "
                     f"trees_completed={completed_trees}/{self._n_trees}, "
-                    f"remaining={remaining}/{total_sims}, "
-                    f"swap={swap_reason}, "
+                    f"remaining_sims={remaining}/{total_sims}, "
                     f"elapsed={elapsed:.1f}s"
                 )
                 next_progress_log = total_batches_processed * 2
 
         elapsed_total = time.perf_counter() - t_start
-        swap_reason = self._manager.last_swap_reason()
         print(
             f"[SearchManager] search done: "
             f"{total_batches_processed} batches, "
             f"{total_leaves_evaluated} leaves, "
-            f"elapsed={elapsed_total:.3f}s, "
-            f"last_swap={swap_reason}"
+            f"elapsed={elapsed_total:.3f}s"
         )
 
         # ── 所有樹已完成，取回結果 ─────────────────────

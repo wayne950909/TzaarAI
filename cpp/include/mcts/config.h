@@ -15,8 +15,10 @@ struct SearchConfig {
   bool add_root_dirichlet_noise = false;
   float root_dirichlet_eps = 0.25f;
   float root_dirichlet_alpha = 0.05f;
-  int min_batch_for_swap = 0;    // 最小累積 leaf 數才送 GPU (0=用 max_batch)
-  int flush_timeout_ms = 0;      // 強制送 GPU 的 timeout (0=不使用)
+  int min_batch_for_swap = 0;    // 不再使用（保留相容性）
+  int flush_timeout_ms = 0;      // 不再使用（保留相容性）
+  int batch_threshold = 0;       // ConcurrentQueue 觸發通知的閥值（0 = 使用 max_batch）
+  int batch_increment = 16;      // 每輪模擬的批次大小（預設 16）
 };
 
 struct SearchResult {
@@ -38,4 +40,5 @@ struct SearchResult {
 }  // namespace tzaar
 
 #endif  // TZAAR_MCTS_CONFIG_H_
+
 

@@ -25,6 +25,15 @@ set(TZAAR_SOURCES
 set(TZAAR_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# 下載 moodycamel concurrentqueue（header-only，不需要編譯）
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/external/concurrentqueue.h")
+  message(FATAL_ERROR "Missing moodycamel/concurrentqueue.h! "
+          "Please download it from:\n"
+          "  https://raw.githubusercontent.com/cameron314/concurrentqueue/master/concurrentqueue.h\n"
+          "and place it at:\n"
+          "  cpp/include/external/concurrentqueue.h")
+endif()
 pybind11_add_module(tzaar_cpp ${TZAAR_SOURCES})
 target_include_directories(tzaar_cpp PRIVATE ${TZAAR_INCLUDE_DIRS})
 target_compile_features(tzaar_cpp PRIVATE cxx_std_17)

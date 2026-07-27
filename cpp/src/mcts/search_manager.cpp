@@ -1,13 +1,11 @@
-// search_manager.cpp
+// search_manager.cpp (v3 — 新架構)
 // 實作 SearchManager：多樹 MCTS 搜尋的管理器。
-// 使用固定數量 worker thread + 樹 ID 佇列 + 雙 buffer 架構。
 //
-// 本檔案對應 multi_thread_logic.md 的設計：
-//   - Worker 從佇列取出樹 ID，無樹時 wait（condition_variable）
-//   - 一棵樹由 per-tree mutex 保護，一次只由一個 worker 模擬
-//   - 模擬結果用 write_index/active_writers 原子變數寫入 shared buffer
-//   - try_swap_buffer 用 atomic exchange lock 確保互斥
-//   - result_handler 處理 GPU 結果並將未完成樹重新入隊
+// 對應 multi_thread_logic.md 與 migration_plan_v3.md 的新規劃：
+//   - 固定分配樹給每個 CPU worker，內部活躍清單管理
+//   - 16 次模擬為一個單位，指標傳遞進 ConcurrentQueue
+//   - 1:1 配對的 Result Handler
+//   - 防空轉 condition_variable 睡眠/喚醒機制
 
 #include "mcts/search_manager.h"
 
@@ -32,7 +30,6 @@ static void sm_log(const char* fmt, ...) {
     log << buf << std::endl;
 }
 
-
 namespace tzaar {
 
 // ══════════════════════════════════════════════════════════════════════
@@ -52,58 +49,50 @@ SearchManager::SearchManager(SearchConfig config,
   if (max_batch_ <= 0)
     throw std::invalid_argument("max_batch must be >= 1");
 
-    // 建立常駐 threads（佇列空的，workers 直接在 acquire_tree_from_queue 中 wait）
   stop_ = false;
   result_handler_stop_ = false;
 
-  result_handler_ = std::thread(&SearchManager::result_handler_loop, this);
+  // 初始化每個 worker 的同步原語
+  worker_cv_mtx_.reserve(static_cast<std::size_t>(num_threads_));
+  worker_cv_.reserve(static_cast<std::size_t>(num_threads_));
+  for (int i = 0; i < num_threads_; ++i) {
+    worker_cv_mtx_.push_back(std::make_unique<std::mutex>());
+    worker_cv_.push_back(std::make_unique<std::condition_variable>());
+  }
+  assigned_trees_.resize(static_cast<std::size_t>(num_threads_));
+
+  // 初始化每個 Result Handler 的專屬 pending queue
+  per_worker_pending_mtx_.reserve(static_cast<std::size_t>(num_threads_));
+  per_worker_pending_results_.resize(static_cast<std::size_t>(num_threads_));
+  per_worker_pending_cv_.reserve(static_cast<std::size_t>(num_threads_));
+  for (int i = 0; i < num_threads_; ++i) {
+    per_worker_pending_mtx_.push_back(std::make_unique<std::mutex>());
+    per_worker_pending_cv_.push_back(std::make_unique<std::condition_variable>());
+  }
+
+  sm_log("SearchManager ctor: %d threads, max_batch=%d", num_threads_, max_batch_);
+
+  // 建立常駐 CPU workers
   pool_.reserve(static_cast<std::size_t>(num_threads_));
   for (int i = 0; i < num_threads_; ++i) {
     pool_.emplace_back(&SearchManager::worker_loop, this, i);
   }
-}
 
-void SearchManager::init_buffers() {
-  // buffer capacity = 樹的總數 * leaf_batch_size（符合 multi_thread_logic.md）
-  const int buf_capacity = tree_count_ * config_.leaf_batch_size;
-  for (int b = 0; b < 2; ++b) {
-    EvalBuffer& buf = buffers_[b];
-    buf.capacity = buf_capacity;
-    buf.board_flat.resize(static_cast<std::size_t>(buf_capacity) *
-                          static_cast<std::size_t>(kBoardFlatSize), 0.0f);
-    buf.global_feat.resize(static_cast<std::size_t>(buf_capacity) *
-                           static_cast<std::size_t>(kGlobalFeatureDim), 0.0f);
-    buf.legal_mask.resize(static_cast<std::size_t>(buf_capacity) *
-                          static_cast<std::size_t>(kActionCount), 0);
-    buf.node_ids.resize(static_cast<std::size_t>(buf_capacity), 0);
-    buf.tree_ids.resize(static_cast<std::size_t>(buf_capacity), 0);
-    buf.write_index = 0;
-    buf.active_writers = 0;
-    buf.pending_count = 0;
-    buf.eval_done = true;
+  // 建立 1:1 配對的 Result Handlers
+  result_handlers_.reserve(static_cast<std::size_t>(num_threads_));
+  for (int i = 0; i < num_threads_; ++i) {
+    result_handlers_.emplace_back(&SearchManager::result_handler_loop, this, i);
   }
-    fillable_[0].store(true, std::memory_order_relaxed);
-  fillable_[1].store(false, std::memory_order_relaxed);
 }
 
 // ══════════════════════════════════════════════════════════════════════
 // 生命週期
 // ══════════════════════════════════════════════════════════════════════
 
-void SearchManager::enqueue_all_trees() {
-  std::lock_guard<std::mutex> lock(queue_mtx_);
-  for (int i = 0; i < tree_count_; ++i) {
-    tree_queue_.push(i);
-  }
-  queue_cv_.notify_all();
-}
-
 void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
                            SearchConfig config) {
-  // 不用暫停 workers，直接重置
-  // workers 此時可能在 acquire_tree_from_queue 中 wait（佇列空的）
-  // 或正在處理上一次的樹（但我們即將清空佇列並放新樹）
-  sm_log("reset: %zu trees", root_states.size());
+  sm_log("reset: %zu trees, config.simulations=%d config.batch_increment=%d",
+         root_states.size(), config.simulations, config.batch_increment);
 
   config_ = std::move(config);
   tree_count_ = static_cast<int>(root_states.size());
@@ -122,797 +111,471 @@ void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
     trees_.push_back(std::move(tree));
   }
 
-  // 重置 buffers
-  init_buffers();
+  // === 固定分配樹給每個 Worker ===
+  int trees_per_worker = tree_count_ / num_threads_;
+  int remainder = tree_count_ % num_threads_;
+  int idx = 0;
+  for (int w = 0; w < num_threads_; ++w) {
+    assigned_trees_[static_cast<std::size_t>(w)].clear();
+    int count = trees_per_worker + (w < remainder ? 1 : 0);
+    for (int j = 0; j < count; ++j) {
+      assigned_trees_[static_cast<std::size_t>(w)].push_back(idx++);
+    }
+  }
 
   // 重置所有計數器和狀態
   completed_count_ = 0;
   stop_ = false;
   result_handler_stop_ = false;
-  active_buffer_ = 0;
-  swapping_ = false;
-  pending_results_.clear();
+  search_done_ = false;
+  accumulated_leaves_ = 0;
 
-  // 清空佇列並重新入隊
+  // 清空 queue
   {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    while (!tree_queue_.empty()) tree_queue_.pop();
-    for (int i = 0; i < tree_count_; ++i) {
-      tree_queue_.push(i);
+    EvalBatch dummy;
+    while (eval_queue_.try_dequeue(dummy)) {
+      for (LeafData* leaf : dummy.leaves) {
+        delete leaf;
+      }
     }
   }
-  queue_cv_.notify_all();
+
+  // 清空每個 worker 的 pending queue
+  for (int w = 0; w < num_threads_; ++w) {
+    std::lock_guard<std::mutex> lk(*per_worker_pending_mtx_[static_cast<std::size_t>(w)]);
+    per_worker_pending_results_[static_cast<std::size_t>(w)].clear();
+  }
+
+  // 喚醒所有 workers
+  for (int w = 0; w < num_threads_; ++w) {
+    std::lock_guard<std::mutex> lock(*worker_cv_mtx_[static_cast<std::size_t>(w)]);
+    worker_cv_[static_cast<std::size_t>(w)]->notify_one();
+  }
 }
 
 void SearchManager::shutdown() {
+  sm_log("shutdown: start");
   stop_ = true;
   result_handler_stop_ = true;
 
-  {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    queue_cv_.notify_all();
+  for (int w = 0; w < num_threads_; ++w) {
+    std::lock_guard<std::mutex> lock(*worker_cv_mtx_[static_cast<std::size_t>(w)]);
+    worker_cv_[static_cast<std::size_t>(w)]->notify_one();
   }
-  batch_ready_cv_.notify_all();
-  results_cv_.notify_all();
+
+  // 喚醒所有 Result Handler
+  for (int w = 0; w < num_threads_; ++w) {
+    std::lock_guard<std::mutex> lk(*per_worker_pending_mtx_[static_cast<std::size_t>(w)]);
+    per_worker_pending_cv_[static_cast<std::size_t>(w)]->notify_one();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(search_done_mtx_);
+    search_done_ = true;
+    search_done_cv_.notify_all();
+  }
 }
 
 void SearchManager::join_workers() {
   sm_log("join_workers: start");
 
-  // 確保 thread 已經被通知停止
+  {
+    EvalBatch dummy;
+    while (eval_queue_.try_dequeue(dummy)) {
+      for (LeafData* leaf : dummy.leaves) {
+        delete leaf;
+      }
+    }
+  }
+
   shutdown();
 
   for (auto& t : pool_) {
-    if (t.joinable()) {
-      t.join();
-    }
+    if (t.joinable()) t.join();
   }
   pool_.clear();
-  sm_log("join_workers: all workers joined");
 
-  if (result_handler_.joinable()) {
-    result_handler_.join();
+  for (auto& t : result_handlers_) {
+    if (t.joinable()) t.join();
   }
-  sm_log("join_workers: result handler joined");
+  result_handlers_.clear();
 
-  // 處理殘留結果
-  process_pending_results();
   sm_log("join_workers: done");
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Worker Thread 主迴圈
+// CPU Worker 主迴圈
 // ══════════════════════════════════════════════════════════════════════
 
-// Worker 的節奏（依 multi_thread_logic.md）：
-// 1. 從佇列取得一棵樹 ID（佇列空時 wait）
-// 2. 鎖住該樹的 mutex
-// 3. 多次呼叫 simulate_into_buffers，直到 local buffer 滿 leaf_batch_size、
-//    樹已完成、或樹 stalled（有 pending leaves 在等 GPU）
-// 4. 解鎖樹
-// 5. 用 write_index/active_writers 原子寫入 shared buffer（已不持有樹鎖）
-// 6. 嘗試 swap_buffer
-// 7. 找下一棵樹（重新入隊由 result_handler 負責）
-//
-// 注意：重新入隊的責任歸 result_handler（依 multi_thread_logic.md），
-//       worker 只管模擬→flush→找下一棵樹。
-void SearchManager::worker_loop(int thread_id) {
-  sm_log("worker %d: started cap=%d", thread_id, config_.leaf_batch_size);
-  ThreadLocalBuffer local;
-  const int local_cap = config_.leaf_batch_size;
-  local.capacity = local_cap;
-  local.count = 0;
-  local.board_flat.resize(static_cast<std::size_t>(local_cap) *
-                          static_cast<std::size_t>(kBoardFlatSize), 0.0f);
-  local.global_feat.resize(static_cast<std::size_t>(local_cap) *
-                           static_cast<std::size_t>(kGlobalFeatureDim), 0.0f);
-  local.legal_mask.resize(static_cast<std::size_t>(local_cap) *
-                          static_cast<std::size_t>(kActionCount), 0);
-  local.node_ids.resize(static_cast<std::size_t>(local_cap), 0);
-  local.tree_ids.resize(static_cast<std::size_t>(local_cap), 0);
+void SearchManager::worker_loop(int worker_id) {
+  sm_log("worker %d: started, assigned %zu trees",
+         worker_id, assigned_trees_[static_cast<std::size_t>(worker_id)].size());
 
-    int loop_count = 0;
+  std::vector<int>& my_trees = assigned_trees_[static_cast<std::size_t>(worker_id)];
+  const int batch_increment = (config_.batch_increment > 0) ? config_.batch_increment : kBatchIncrement;
+
+  int loop_count = 0;
   while (!stop_) {
     loop_count++;
+    bool did_work = false;
 
-    // 1. 從佇列取得一棵樹（佇列空則 wait）
-    int tree_id = acquire_tree_from_queue();
-    if (tree_id < 0) {
-      // 收到停止訊號
-      break;
-    }
-
-    // 2. 嘗試鎖住該樹的 mutex（依 md：鎖住失敗就跳到步驟 1，找下一棵樹）
-    SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
-    bool simulated = false;
-    {
-      std::unique_lock<std::mutex> lock(tree.mtx, std::try_to_lock);
-      if (!lock.owns_lock()) {
-        // 鎖不住：將樹放回佇列，讓其他 worker 有機會
-        {
-          std::lock_guard<std::mutex> qlock(queue_mtx_);
-          tree_queue_.push(tree_id);
-        }
-        queue_cv_.notify_one();
+    for (auto it = my_trees.begin(); it != my_trees.end(); ) {
+      int tree_id = *it;
+      if (tree_id < 0 || tree_id >= tree_count_) {
+        it = my_trees.erase(it);
         continue;
       }
 
-            // 跳過有 pending leaves 的樹（還在等 GPU 結果）
+      SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
+
+      if (tree.session->is_complete()) {
+        if (!tree.completed) complete_tree(tree);
+        it = my_trees.erase(it);
+        continue;
+      }
+
       if (tree.session->has_pending_leaves()) {
-        sm_log("worker %d: loop=%d SKIP tree=%d has_pending_leaves (completed=%d rem=%d)",
-               thread_id, loop_count, tree_id, 
-               tree.completed ? 1 : 0,
-               tree.session->simulations_requested() - tree.session->simulations_processed());
+        ++it;
         continue;
       }
 
-      // 檢查樹是否已經完成但未被標記（debug 用）
+      int simulated_count = 0;
+      std::vector<LeafData*> batch_leaves;
+      batch_leaves.reserve(static_cast<std::size_t>(batch_increment));
+
+      while (simulated_count < batch_increment &&
+             !tree.session->is_complete() &&
+             !tree.session->has_pending_leaves()) {
+
+        LeafData* leaf = simulate_single_step(tree_id);
+        if (leaf) batch_leaves.push_back(leaf);
+        simulated_count++;
+      }
+
+      if (!batch_leaves.empty()) {
+        did_work = true;
+        EvalBatch batch;
+        batch.worker_id = worker_id;
+        batch.leaves = std::move(batch_leaves);
+        eval_queue_.enqueue(std::move(batch));
+        accumulated_leaves_.fetch_add(simulated_count, std::memory_order_relaxed);
+      }
+
       if (tree.session->is_complete()) {
-        sm_log("worker %d: loop=%d tree=%d is_complete but not marked, completing now",
-               thread_id, loop_count, tree_id);
-        complete_tree(tree);
-        if (is_complete()) break;
+        if (!tree.completed) complete_tree(tree);
+        it = my_trees.erase(it);
         continue;
       }
-
-      // 3. 重設 flushed_to_buffer，開始新一輪模擬
-      tree.flushed_to_buffer = false;
-
-      sm_log("worker %d: loop=%d tree=%d simulate", thread_id, loop_count, tree_id);
-      simulate_tree_into_local(tree_id, local);
-
-      if (local.count > 0) {
-        simulated = true;
-      }
-
-            // 檢查樹是否已完成（在鎖內更新 completed）
-      if (tree.session->is_complete()) {
-        complete_tree(tree);
-        if (is_complete()) {
-          sm_log("worker %d: loop=%d last tree completed in early check, notify python", thread_id, loop_count);
-          break;
-        }
-      }
-
-      // 4. 解鎖（lock 離開 scope 時自動釋放）
-      //    依 md：flush 到 shared buffer 不應在持有樹鎖時進行
-    }
-    // ═══ mutex 已解鎖 ═══
-
-    // 5. 解鎖後，將 local buffer flush 到 shared buffer
-    //    使用 write_index/active_writers 原子變數，不用 mutex
-    if (simulated) {
-      sm_log("worker %d: loop=%d tree=%d flushing %d leaves",
-             thread_id, loop_count, tree_id, local.count);
-      flush_local_to_shared(thread_id, local, tree_id);
+      ++it;
     }
 
-    // 6. 嘗試 swap_buffer（重新入隊由 result_handler 負責）
-    swap_caller_.store("worker", std::memory_order_relaxed);
-    try_swap_buffer();
+    if (!did_work) {
+      std::unique_lock<std::mutex> lk(*worker_cv_mtx_[static_cast<std::size_t>(worker_id)]);
+      if (HasAnyReadyTree(my_trees)) continue;
+      worker_cv_[static_cast<std::size_t>(worker_id)]->wait(lk, [this, &my_trees]() {
+        return stop_ || HasAnyReadyTree(my_trees);
+      });
+    }
+
+    if (completed_count_.load(std::memory_order_acquire) >= tree_count_) {
+      // 所有樹完成，進入睡眠等待下一次 reset
+      std::unique_lock<std::mutex> lk(*worker_cv_mtx_[static_cast<std::size_t>(worker_id)]);
+      worker_cv_[static_cast<std::size_t>(worker_id)]->wait(lk, [&]() { return stop_.load(); });
+      if (stop_) break;
+    }
   }
 
-  if (local.count > 0) {
-    sm_log("worker %d: final flush local=%d", thread_id, local.count);
-    flush_local_to_shared(thread_id, local, -1);
-  }
-  sm_log("worker %d: exit (total loops=%d)", thread_id, loop_count);
+  sm_log("worker %d: exit (total loops=%d)", worker_id, loop_count);
 }
 
-// 從佇列取得一棵樹 ID。
-// 佇列為空時在 condition_variable 上 wait。
-// 回傳 -1 表示收到停止訊號。
-int SearchManager::acquire_tree_from_queue() {
-    std::unique_lock<std::mutex> lock(queue_mtx_);
-  sm_log("worker: waiting on queue (queue_size=%zu)", tree_queue_.size());
-    queue_cv_.wait(lock, [this]() {
-    return !tree_queue_.empty() || stop_;
-  });
+// ══════════════════════════════════════════════════════════════════════
+// 1:1 Result Handler 主迴圈
+// ══════════════════════════════════════════════════════════════════════
+//
+// 不再從 eval_queue_ 拿資料，只等自己的 per_worker_pending_queue。
+// 當 Python 呼叫 submit_leaf_evals(worker_id, ...) 時，資料被直接
+// 放進對應 worker_id 的 queue，然後喚醒對應的 Result Handler。
+// Result Handler 用 tree_id 找到樹，呼叫 submit_single_eval 寫回。
 
-  if (stop_) {
-    sm_log("worker: awake (stop signal)");
-    return -1;
+void SearchManager::result_handler_loop(int worker_id) {
+  sm_log("result_handler %d: started", worker_id);
+
+  const std::size_t idx = static_cast<std::size_t>(worker_id);
+
+  while (!result_handler_stop_) {
+    // 只等自己的 queue
+    std::unique_lock<std::mutex> lk(*per_worker_pending_mtx_[idx]);
+    per_worker_pending_cv_[idx]->wait(lk, [this, idx]() {
+      return result_handler_stop_ || !per_worker_pending_results_[idx].empty();
+    });
+
+    if (result_handler_stop_) break;
+
+    // 取出自己 queue 裡的全部結果
+    std::vector<PendingEvalResult> results;
+    results.swap(per_worker_pending_results_[idx]);
+    lk.unlock();
+
+    // 處理結果 — 這些 tree_id 一定是我負責的
+    for (auto& res : results) {
+      for (int i = 0; i < res.batch_size; ++i) {
+        const int node_id = res.node_ids[static_cast<std::size_t>(i)];
+        const int tree_id = res.tree_ids[static_cast<std::size_t>(i)];
+        const float* priors_row =
+            res.priors.data() + (static_cast<std::size_t>(i) *
+                                 static_cast<std::size_t>(kActionCount));
+        const float value = res.values[static_cast<std::size_t>(i)];
+
+        process_pending_eval_result(tree_id, node_id, priors_row, value);
+      }
+    }
   }
 
-  // 醒來 = 佇列一定有樹（被 reset 或 reenqueue 塞入）
-  int tree_id = tree_queue_.front();
-  tree_queue_.pop();
-  sm_log("worker: awake (got tree=%d, queue_size=%zu)", tree_id, tree_queue_.size());
-  return tree_id;
+  sm_log("result_handler %d: exit", worker_id);
 }
 
-// 若樹未完成且無 pending leaves，重新放入佇列
-// 注意：此函式僅由 result_handler 呼叫（依 multi_thread_logic.md），
-//       worker 不負責重新入隊（問題 2 修復）。
-void SearchManager::reenqueue_tree_if_needed(int tree_id) {
+// ══════════════════════════════════════════════════════════════════════
+// 處理 GPU 推論結果（寫回樹、解除 pending、喚醒 worker）
+// ══════════════════════════════════════════════════════════════════════
+
+void SearchManager::process_pending_eval_result(int tree_id, int node_id,
+                                                 const float* priors,
+                                                 float value) {
+  if (tree_id < 0 || tree_id >= tree_count_) return;
+
   SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
   if (tree.completed) return;
-  if (tree.session->has_pending_leaves()) return;  // 還在等 GPU
-  {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    tree_queue_.push(tree_id);
-  }
-  queue_cv_.notify_one();
-}
 
-void SearchManager::complete_tree(SearchTree& tree) {
-  if (tree.completed) return;  // 防止重複標記
-  
-  tree.completed = true;
-  completed_count_.fetch_add(1, std::memory_order_release);
+  bool became_ready = false;
 
-  // 遍歷所有樹，計算實際 tree.completed == true 的數量，以及每棵樹的剩餘次數
-  int actual_completed = 0;
-  std::string detail_str;
-  for (int i = 0; i < tree_count_; ++i) {
-    const auto& tree_ptr = trees_[static_cast<std::size_t>(i)];
-    if (tree_ptr->completed) {
-      ++actual_completed;
-    }
-    int remaining = tree_ptr->session->simulations_requested() - tree_ptr->session->simulations_processed();
-    if (remaining < 0) remaining = 0;
-    int pending = tree_ptr->session->has_pending_leaves() ? 1 : 0;
-    char tmp[64];
-    std::snprintf(tmp, sizeof(tmp), "  [%d]c=%d rem=%d pend=%d", 
-                  i, tree_ptr->completed ? 1 : 0, remaining, pending);
-    detail_str += tmp;
+  tree.session->submit_single_eval(node_id, priors, value);
+
+  if (!tree.session->is_complete() && !tree.session->has_pending_leaves()) {
+    became_ready = true;
+  } else if (tree.session->is_complete()) {
+    if (!tree.completed) complete_tree(tree);
   }
 
-  // 取得佇列長度
-  int qsize = 0;
-  {
-    std::lock_guard<std::mutex> qlock(queue_mtx_);
-    qsize = static_cast<int>(tree_queue_.size());
-  }
-  
-  sm_log("COMPLETE A TREE. current tree = %d (actual count = %d / %d queue=%d)%s", 
-         completed_count_.load(), actual_completed, tree_count_, qsize, detail_str.c_str());
-    if (is_complete()) {
-    sm_log("complete_tree: last tree completed, notify python");
-    {
-      std::lock_guard<std::mutex> cv_lock(cv_mtx_);
-      batch_ready_ = true;
-    }
-    batch_ready_cv_.notify_all();
-  }
-}
-
-void SearchManager::simulate_tree_into_local(int tree_id,
-                                              ThreadLocalBuffer& local) {
-  SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
-  auto& session = tree.session;
-
-  local.count = 0;
-
-  // 依 multi_thread_logic.md：
-  // 「除非模擬次數消耗完，否則會持續蒐集到 leaf_batch_size 個葉節點」
-  // 在同一棵樹上持續呼叫 simulate_into_buffers，直到：
-  //   - local buffer 滿了（count >= leaf_batch_size）
-  //   - 樹的模擬次數已耗盡（is_complete）
-  //   - 樹 stalled（simulate_into_buffers 回傳 0 且有 pending leaves）
-  const int local_cap = local.capacity;
-  while (local.count < local_cap) {
-    // 檢查是否已完成或正在等 GPU
-    if (session->is_complete()) break;
-    if (session->has_pending_leaves()) break;
-
-    const int remaining_cap = local_cap - local.count;
-    const int chunk = std::min(config_.leaf_batch_size, remaining_cap);
-    if (chunk <= 0) break;
-
-    // 計算要寫入 local buffer 的位置偏移
-    float* board_ptr = local.board_flat.data() +
-        static_cast<std::size_t>(local.count) * static_cast<std::size_t>(kBoardFlatSize);
-    float* global_ptr = local.global_feat.data() +
-        static_cast<std::size_t>(local.count) * static_cast<std::size_t>(kGlobalFeatureDim);
-    uint8_t* mask_ptr = local.legal_mask.data() +
-        static_cast<std::size_t>(local.count) * static_cast<std::size_t>(kActionCount);
-    int32_t* node_ptr = local.node_ids.data() + static_cast<std::size_t>(local.count);
-    int32_t* tree_ptr = local.tree_ids.data() + static_cast<std::size_t>(local.count);
-
-        int n = session->simulate_into_buffers(
-        chunk,
-        board_ptr, global_ptr, mask_ptr,
-        node_ptr, tree_ptr,
-        tree_id);
-
-    if (n > 0) {
-      local.count += n;
-      sm_log("    simulate tree=%d: +%d leaves (total=%d, remaining=%d)",
-             tree_id, n, local.count,
-             session->simulations_requested() - session->simulations_processed());
-    }
-
-    // simulate_into_buffers 回傳 0 表示 stalled（所有路徑都被 pending leaf 阻塞）
-    // 或樹已 complete。跳出 while 迴圈，不要 busy loop。
-    if (n == 0) {
-      // 檢查是否有異常：還有剩餘次數、無 pending leaves、但卻模擬不出東西
-      if (!session->is_complete() && !session->has_pending_leaves()) {
-        sm_log("  ** ANOMALY ** simulate tree=%d: n=0 but rem=%d has_pending=0 is_complete=0",
-               tree_id, session->simulations_requested() - session->simulations_processed());
+  // 如果樹解除 pending 且未完成，喚醒對應的 CPU Worker
+  if (became_ready) {
+    for (int w = 0; w < num_threads_; ++w) {
+      const auto& assigned = assigned_trees_[static_cast<std::size_t>(w)];
+      if (std::find(assigned.begin(), assigned.end(), tree_id) != assigned.end()) {
+        std::lock_guard<std::mutex> lk(*worker_cv_mtx_[static_cast<std::size_t>(w)]);
+        worker_cv_[static_cast<std::size_t>(w)]->notify_one();
+        break;
       }
-      break;
     }
   }
-}
-
-// 將 local buffer 的內容 flush 到 shared buffer。
-// 使用 write_index / active_writers 原子變數，不用 mutex。
-//
-// 流程（依 multi_thread_logic.md）：
-// 1. 等待 buffer 處於 fillable 狀態
-// 2. Increment active_writers (memory_order_relaxed)
-// 3. fetch_add write_index 取得寫入位置 (memory_order_relaxed)
-// 4. 寫入資料
-// 5. 更新 pending_count (memory_order_relaxed)
-// 6. Decrement active_writers (memory_order_release)
-// 7. 若 local 清空，設 tree.flushed_to_buffer = true
-void SearchManager::flush_local_to_shared(int thread_id,
-                                           ThreadLocalBuffer& local,
-                                           int tree_id) {
-  if (local.count <= 0) return;
-
-  const int to_copy = local.count;
-  int active = active_buffer_.load();
-
-    // 1. 等待 buffer fillable（使用 spin + yield 而非 mutex cv）
-  //    因為我們希望寫入是 lock-free 的
-  int spin_count = 0;
-  while (!fillable_[active].load(std::memory_order_acquire)) {
-    spin_count++;
-    if (spin_count > 1000) {
-      // 長時間不 fillable，可能是 buffer 正被 GPU 使用，等 swap
-      std::this_thread::yield();
-      spin_count = 0;
-    }
-    active = active_buffer_.load(std::memory_order_relaxed);  // 重新檢查
-  }
-
-  EvalBuffer& buf = buffers_[active];
-
-  // 2. Increment active_writers (relaxed)
-  buf.active_writers.fetch_add(1, std::memory_order_relaxed);
-
-  // 3. 取得寫入位置 (relaxed)
-  const int slot = buf.write_index.fetch_add(to_copy, std::memory_order_relaxed);
-
-  // 檢查是否超過 capacity（需要 swap）
-  if (slot + to_copy > buf.capacity) {
-    // 空間不足，回退 write_index
-    buf.write_index.fetch_sub(to_copy, std::memory_order_relaxed);
-    buf.active_writers.fetch_sub(1, std::memory_order_release);
-
-    // 嘗試 swap
-    try_swap_buffer();
-    // 重試 flush（遞迴呼叫）
-    flush_local_to_shared(thread_id, local, tree_id);
-    return;
-  }
-
-    // 4. 寫入資料（從連續 local buffer 直接整段 memcpy）
-  {
-    const std::size_t dst_offset = static_cast<std::size_t>(slot);
-
-    std::memcpy(
-        buf.board_flat.data() + dst_offset * static_cast<std::size_t>(kBoardFlatSize),
-        local.board_flat.data(),
-        static_cast<std::size_t>(to_copy) *
-            static_cast<std::size_t>(kBoardFlatSize) * sizeof(float));
-
-    std::memcpy(
-        buf.global_feat.data() + dst_offset * static_cast<std::size_t>(kGlobalFeatureDim),
-        local.global_feat.data(),
-        static_cast<std::size_t>(to_copy) *
-            static_cast<std::size_t>(kGlobalFeatureDim) * sizeof(float));
-
-    std::memcpy(
-        buf.legal_mask.data() + dst_offset * static_cast<std::size_t>(kActionCount),
-        local.legal_mask.data(),
-        static_cast<std::size_t>(to_copy) *
-            static_cast<std::size_t>(kActionCount) * sizeof(uint8_t));
-
-    std::memcpy(
-        buf.node_ids.data() + dst_offset,
-        local.node_ids.data(),
-        static_cast<std::size_t>(to_copy) * sizeof(int32_t));
-
-    std::memcpy(
-        buf.tree_ids.data() + dst_offset,
-        local.tree_ids.data(),
-        static_cast<std::size_t>(to_copy) * sizeof(int32_t));
-  }
-
-    // 5. 更新 pending_count (relaxed)
-  buf.pending_count.fetch_add(to_copy, std::memory_order_relaxed);
-
-  // 6. Decrement active_writers (release) — 確保寫入對 swapper 可見
-  buf.active_writers.fetch_sub(1, std::memory_order_release);
-
-  // 7. 標記樹已 flush
-  if (tree_id >= 0) {
-    trees_[static_cast<std::size_t>(tree_id)]->flushed_to_buffer = true;
-  }
-
-    sm_log("  flush %d: wrote %d leaves at slot=%d, pending=%d, tree=%d",
-         thread_id, to_copy, slot, buf.pending_count.load(std::memory_order_relaxed), tree_id);
-
-  // 清空 local
-  local.count = 0;
-
-  // 檢查 swap 條件：
-  // - pending_count >= swap_threshold 且
-  // - 另一個 buffer 已完成 GPU 推論（eval_done = true）
-  const int swap_threshold = std::min(
-      static_cast<int>(config_.min_batch_for_swap > 0 ? config_.min_batch_for_swap : max_batch_),
-      max_batch_);
-    if (buf.pending_count.load(std::memory_order_relaxed) >= swap_threshold) {
-    swap_caller_.store("flush", std::memory_order_relaxed);
-    try_swap_buffer();
-  }
-}
-
-// 嘗試交換雙 buffer（原子交換鎖保護）。
-// 流程（依 multi_thread_logic.md）：
-// 1. atomic exchange 鎖定 swapping_ (acquire)
-// 2. 檢查 precondition：另一個 buffer 已完成 GPU 推論
-// 3. 檢查條件（至少一項滿足）：
-//    A. pending_count >= swap_threshold
-//    B. 所有樹都已 stalled
-// 4. Swap fillable flag：舊 buffer=不可填入，新 buffer=可填入
-// 5. 等待舊 buffer 的 active_writers == 0 (acquire)
-// 6. 切換 active_buffer
-// 7. 將舊 buffer 送 GPU（設 eval_done=false，通知 Python）
-// 8. 釋放 swapping_
-bool SearchManager::try_swap_buffer() {
-  // 1. 嘗試取得交換鎖
-  bool expected = false;
-  if (!swapping_.compare_exchange_strong(expected, true,
-                                         std::memory_order_acquire,
-                                         std::memory_order_relaxed)) {
-    return false;  // 另一個 thread 正在 swap
-  }
-
-  const int active = active_buffer_.load();
-  const int other = 1 - active;
-
-  EvalBuffer& active_buf = buffers_[active];
-  EvalBuffer& other_buf = buffers_[other];
-
-    // 2. Precondition：另一個 buffer 必須已完成 GPU 推論
-    if (!other_buf.eval_done) {
-      swapping_.store(false, std::memory_order_release);
-      return false;
-    }
-
-    // 3. 檢查條件
-    const int pending = active_buf.pending_count.load(std::memory_order_acquire);
-    const int swap_threshold = std::min(
-        static_cast<int>(config_.min_batch_for_swap > 0 ? config_.min_batch_for_swap : max_batch_),
-        max_batch_);
-    bool condition_a = (pending >= swap_threshold);
-    bool condition_b = trees_all_stalled() && pending > 0;
-
-    if (!condition_a && !condition_b) {
-      swapping_.store(false, std::memory_order_release);
-      return false;
-    }
-
-    // 4. Swap fillable flags（使用 atomic store，問題 9 修復）
-  fillable_[active].store(false, std::memory_order_release);
-  fillable_[other].store(true, std::memory_order_release);
-
-  // 5. 等待 active buffer 上所有 writer 完成
-  while (active_buf.active_writers.load(std::memory_order_acquire) > 0) {
-    std::this_thread::yield();
-  }
-
-  // 6. 切換 active_buffer
-  active_buffer_.store(other);
-  last_swap_time_ms_.store(now_ms());
-
-    // 記錄 swap 原因（包含呼叫來源）
-    {
-      const char* caller = swap_caller_.load(std::memory_order_relaxed);
-      std::lock_guard<std::mutex> lock(swap_reason_mtx_);
-      std::string cond;
-      if (condition_a && condition_b) {
-        cond = "threshold+stalled";
-      } else if (condition_a) {
-        cond = "threshold";
-      } else {
-        cond = "stalled";
-      }
-      last_swap_reason_ = std::string(caller) + ":" + cond;
-    }
-
-  sm_log("  try_swap: buf%d->buf%d (pending=%d)", active, other, pending);
-
-  // 7. 將舊 buffer 送 GPU
-  active_buf.eval_done = false;
-
-  {
-    std::lock_guard<std::mutex> lock(cv_mtx_);
-    batch_ready_ = true;
-  }
-  batch_ready_cv_.notify_one();
-
-  // 8. 釋放交換鎖
-  swapping_.store(false, std::memory_order_release);
-
-  return true;
 }
 
 // ══════════════════════════════════════════════════════════════════════
 // Python 端專用介面
 // ══════════════════════════════════════════════════════════════════════
 
-bool SearchManager::has_ready_batch() const {
-  // 檢查是否有 buffer 處於「待評估」狀態
-  for (int b = 0; b < 2; ++b) {
-    if (!buffers_[b].eval_done && buffers_[b].pending_count > 0) {
-      return true;
+SearchManager::PackedBatch SearchManager::dequeue_batch(int max_batch,
+                                                        int timeout_ms) {
+  PackedBatch result;
+
+  // 先把 queue 中能拿的都拿出來，累積到一個 vector 中
+  std::vector<LeafData*> all_leaves;
+  std::vector<int> all_worker_ids;
+  int total = 0;
+
+  // ── 等待模式（timeout_ms > 0） ─────────────────
+  if (timeout_ms > 0) {
+    int spin = 0;
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+      EvalBatch batch;
+      if (eval_queue_.try_dequeue(batch)) {
+        const std::size_t n = batch.leaves.size();
+        for (std::size_t i = 0; i < n; ++i) {
+          all_leaves.push_back(batch.leaves[i]);
+          all_worker_ids.push_back(batch.worker_id);
+        }
+        total += static_cast<int>(n);
+        if (total >= max_batch) break;
+        continue;
+      }
+      // queue 空了
+      if (total > 0) break;  // 已有資料，直接回傳
+      if (stop_ || all_trees_completed()) break;
+      spin++;
+      if (spin > 10000) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        spin = 0;
+      }
     }
+  } else {
+    // ── non-blocking ──────────────────────────────
+    EvalBatch batch;
+    while (eval_queue_.try_dequeue(batch)) {
+      const std::size_t n = batch.leaves.size();
+      for (std::size_t i = 0; i < n; ++i) {
+        all_leaves.push_back(batch.leaves[i]);
+        all_worker_ids.push_back(batch.worker_id);
+      }
+      total += static_cast<int>(n);
+      if (total >= max_batch) break;
+    }
+  }
+
+  if (total == 0) {
+    result.batch_size = 0;
+    return result;
+  }
+
+  const std::size_t bsz = static_cast<std::size_t>(total);
+
+  dequeued_node_ids_.resize(bsz);
+  dequeued_tree_ids_.resize(bsz);
+  dequeued_worker_ids_.resize(bsz);
+  dequeued_board_flat_.resize(bsz * static_cast<std::size_t>(kBoardFlatSize));
+  dequeued_global_feat_.resize(bsz * static_cast<std::size_t>(kGlobalFeatureDim));
+  dequeued_legal_mask_.resize(bsz * static_cast<std::size_t>(kActionCount));
+
+  for (std::size_t i = 0; i < bsz; ++i) {
+    LeafData* leaf = all_leaves[i];
+    dequeued_node_ids_[i] = leaf->node_id;
+    dequeued_tree_ids_[i] = leaf->tree_id;
+    dequeued_worker_ids_[i] = all_worker_ids[i];
+
+    std::memcpy(dequeued_board_flat_.data() + i * static_cast<std::size_t>(kBoardFlatSize),
+                leaf->board_flat,
+                sizeof(float) * static_cast<std::size_t>(kBoardFlatSize));
+    std::memcpy(dequeued_global_feat_.data() + i * static_cast<std::size_t>(kGlobalFeatureDim),
+                leaf->global_feat,
+                sizeof(float) * static_cast<std::size_t>(kGlobalFeatureDim));
+    std::memcpy(dequeued_legal_mask_.data() + i * static_cast<std::size_t>(kActionCount),
+                leaf->legal_mask,
+                sizeof(uint8_t) * static_cast<std::size_t>(kActionCount));
+  }
+
+    for (LeafData* leaf : all_leaves) delete leaf;
+
+  result.batch_size = total;
+  result.node_ids          = dequeued_node_ids_.data();
+  result.tree_ids          = dequeued_tree_ids_.data();
+  result.worker_ids        = dequeued_worker_ids_.data();
+  result.board_state_flat  = dequeued_board_flat_.data();
+  result.global_features   = dequeued_global_feat_.data();
+  result.legal_masks       = dequeued_legal_mask_.data();
+
+  return result;
+}
+
+void SearchManager::submit_leaf_evals(
+    const int32_t* worker_ids,
+    const int32_t* node_ids,
+    const int32_t* tree_ids,
+    const float* priors,
+    const float* values,
+    int batch_size) {
+  if (batch_size <= 0)
+    throw std::invalid_argument("batch_size must be >= 1");
+
+  // 先按 worker_id 分組
+  // 為避免每次重新分配記憶體，先用 map 結構收集
+  // worker_id -> (node_ids, tree_ids, priors_row, values)
+  // 因為 worker 數固定且不多，使用固定大小陣列
+
+  // 先掃一遍，統計每個 worker 的數量
+  std::vector<int> per_worker_count(static_cast<std::size_t>(num_threads_), 0);
+  for (int i = 0; i < batch_size; ++i) {
+    int w = worker_ids[i];
+    if (w >= 0 && w < num_threads_) {
+      per_worker_count[static_cast<std::size_t>(w)]++;
+    }
+  }
+
+  // 為每個有資料的 worker 建立 PendingEvalResult
+  for (int w = 0; w < num_threads_; ++w) {
+    int cnt = per_worker_count[static_cast<std::size_t>(w)];
+    if (cnt == 0) continue;
+
+    PendingEvalResult res;
+    res.batch_size = cnt;
+    res.node_ids.reserve(static_cast<std::size_t>(cnt));
+    res.tree_ids.reserve(static_cast<std::size_t>(cnt));
+    res.priors.resize(static_cast<std::size_t>(cnt) *
+                      static_cast<std::size_t>(kActionCount));
+    res.values.reserve(static_cast<std::size_t>(cnt));
+
+    int dst_idx = 0;
+    for (int i = 0; i < batch_size; ++i) {
+      if (worker_ids[i] != w) continue;
+      res.node_ids.push_back(node_ids[i]);
+      res.tree_ids.push_back(tree_ids[i]);
+      std::memcpy(
+          res.priors.data() + static_cast<std::size_t>(dst_idx) *
+                                  static_cast<std::size_t>(kActionCount),
+          priors + static_cast<std::size_t>(i) *
+                       static_cast<std::size_t>(kActionCount),
+          static_cast<std::size_t>(kActionCount) * sizeof(float));
+      res.values.push_back(values[i]);
+      dst_idx++;
+    }
+
+    // 放進對應 worker 的 queue，喚醒
+    const std::size_t idx = static_cast<std::size_t>(w);
+    {
+      std::lock_guard<std::mutex> lock(*per_worker_pending_mtx_[idx]);
+      per_worker_pending_results_[idx].push_back(std::move(res));
+    }
+    per_worker_pending_cv_[idx]->notify_one();
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 輔助方法
+// ══════════════════════════════════════════════════════════════════════
+
+SearchManager::LeafData* SearchManager::simulate_single_step(int tree_id) {
+  SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
+  auto& session = tree.session;
+  if (session->is_complete() || session->has_pending_leaves()) return nullptr;
+
+  auto leaf = std::make_unique<LeafData>();
+  leaf->tree_id = tree_id;
+
+  int n = session->simulate_into_buffers(
+      1, leaf->board_flat, leaf->global_feat, leaf->legal_mask,
+      &leaf->node_id, &leaf->tree_id, tree_id);
+
+  return (n > 0) ? leaf.release() : nullptr;
+}
+
+bool SearchManager::HasAnyReadyTree(const std::vector<int>& tree_ids) const {
+  for (int tid : tree_ids) {
+    if (tid < 0 || tid >= tree_count_) continue;
+    const auto& tree = *trees_[static_cast<std::size_t>(tid)];
+    if (!tree.session->is_complete() && !tree.session->has_pending_leaves())
+      return true;
   }
   return false;
 }
 
-SearchManager::PackedBatch SearchManager::get_ready_batch() {
-  sm_log("  get_ready_batch: waiting on batch_ready_cv_");
-  {
-    std::unique_lock<std::mutex> lock(cv_mtx_);
-        batch_ready_cv_.wait(lock, [this]() {
-      return batch_ready_;
-    });
-    batch_ready_ = false;
+void SearchManager::complete_tree(SearchTree& tree) {
+  if (tree.completed) return;
+  tree.completed = true;
+  completed_count_.fetch_add(1, std::memory_order_release);
+
+  sm_log("COMPLETE A TREE. tree=%d (count=%d/%d)",
+         tree.tree_id, completed_count_.load(), tree_count_);
+
+  if (all_trees_completed()) {
+    std::lock_guard<std::mutex> lock(search_done_mtx_);
+    search_done_ = true;
+    search_done_cv_.notify_all();
   }
-
-  PackedBatch result;
-
-  // 找出哪個 buffer 需要評估
-  for (int b = 0; b < 2; ++b) {
-    EvalBuffer& buf = buffers_[b];
-    if (!buf.eval_done && buf.pending_count > 0) {
-      const int count = buf.pending_count.load();
-      sm_log("  get_ready_batch: returning buf%d size=%d", b, count);
-      result.buffer_id = b;
-      result.batch_size = count;
-      result.node_ids = buf.node_ids.data();
-      result.board_state_flat = buf.board_flat.data();
-      result.global_features = buf.global_feat.data();
-      result.legal_masks = buf.legal_mask.data();
-      result.tree_ids = buf.tree_ids.data();
-      return result;
-    }
-  }
-
-  // 沒有 ready batch
-  sm_log("  get_ready_batch: no ready buffer found");
-  result.buffer_id = -1;
-  result.batch_size = 0;
-  return result;
 }
 
-void SearchManager::submit_eval_batch(int buffer_id,
-                                       const int32_t* /*node_ids*/,
-                                       const float* priors,
-                                       const float* values,
-                                       int batch_size) {
-  
-  if (buffer_id < 0 || buffer_id > 1)
-    throw std::invalid_argument("buffer_id must be 0 or 1");
-  if (batch_size <= 0)
-    throw std::invalid_argument("batch_size must be >= 1");
-
-  EvalBuffer& buf = buffers_[buffer_id];
-                                        
-  // DEBUG: 記錄進來的資料樣本
-  {
-    // 取前 min(3, batch_size) 筆來看 value 跟 tree_id/node_id
-    int samples = batch_size < 3 ? batch_size : 3;
-    std::string sample_str;
-    for (int i = 0; i < samples; ++i) {
-      int t = buf.tree_ids[i];
-      int n = buf.node_ids[i];
-      float v = values[i];
-      float p0 = priors[i * kActionCount];
-      char tmp[128];
-      std::snprintf(tmp, sizeof(tmp), "[%d]tree=%d node=%d val=%.4f p0=%.4f", i, t, n, v, p0);
-      if (i > 0) sample_str += " | ";
-      sample_str += tmp;
-    }
-    sm_log("  submit_EVAL_BATCH: buf%d size=%d %s", buffer_id, batch_size, sample_str.c_str());
-  }
-
-  // 將 GPU 結果放入 pending_results_
-  {
-    std::lock_guard<std::mutex> lock(results_mtx_);
-
-    PendingEvalResult res;
-    res.buffer_id = buffer_id;
-    res.batch_size = batch_size;
-    res.node_ids.assign(buf.node_ids.begin(),
-                        buf.node_ids.begin() + static_cast<std::size_t>(batch_size));
-    res.tree_ids.assign(buf.tree_ids.begin(),
-                        buf.tree_ids.begin() + static_cast<std::size_t>(batch_size));
-    res.priors.resize(static_cast<std::size_t>(batch_size) *
-                      static_cast<std::size_t>(kActionCount));
-    res.values.resize(static_cast<std::size_t>(batch_size));
-
-    std::memcpy(res.priors.data(), priors,
-                static_cast<std::size_t>(batch_size) *
-                static_cast<std::size_t>(kActionCount) * sizeof(float));
-    std::memcpy(res.values.data(), values,
-                static_cast<std::size_t>(batch_size) * sizeof(float));
-
-    pending_results_.push_back(std::move(res));
-    sm_log("  submit_EVAL_BATCH: pending_results_ size now=%zu", pending_results_.size());
-  }
-  results_cv_.notify_all();
-
-    // 標記 buffer 為可用
-  buf.eval_done = true;
-  buf.write_index = 0;
-  buf.pending_count = 0;
-  buf.active_writers = 0;
-  sm_log("  submit_EVAL_BATCH: buf%d eval_done=true", buffer_id);
-
-    // 嘗試 swap — 另一個 buffer 可能已有資料
-    swap_caller_.store("submit_eval", std::memory_order_relaxed);
-    try_swap_buffer();
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// 專用 GPU 結果處理執行緒
-// ══════════════════════════════════════════════════════════════════════
-
-// 專用的 GPU 結果處理執行緒主迴圈。
-// 職責：
-// 1. 等待 GPU 回傳結果（由 Python 端透過 submit_eval_batch 放入）
-// 2. 將 priors/value 回填到對應的樹
-// 3. 若樹尚未完成且無 pending leaves，重新入隊
-// 4. 嘗試 swap_buffer（另一個 buffer 可能已有資料）
-void SearchManager::result_handler_loop() {
-  sm_log("result_handler: started");
-
-    while (!result_handler_stop_) {
-    std::unique_lock<std::mutex> lock(results_mtx_);
-
-        results_cv_.wait(lock, [this]() {
-      return !pending_results_.empty() || result_handler_stop_;
-    });
-
-    sm_log("result_handler: woke up (stop=%d pending=%zu)",
-           (int)result_handler_stop_, pending_results_.size());
-
-    if (result_handler_stop_ && pending_results_.empty()) {
-      sm_log("result_handler: stop signal, no pending data, exit");
-      break;
-    }
-
-    auto results_to_process = std::move(pending_results_);
-    pending_results_.clear();
-    lock.unlock();
-
-    sm_log("result_handler: processing %zu result batches", results_to_process.size());
-
-    for (auto& res : results_to_process) {
-      sm_log("result_handler: processing batch buf%d (size=%d)",
-             res.buffer_id, res.batch_size);
-
-      // 依 md：先鎖住資料對應的樹，在鎖內復原 virtual loss + expand + backup
-      // 然後檢查是否需要重新入隊
-      for (int i = 0; i < res.batch_size; ++i) {
-        const int tree_id = res.tree_ids[static_cast<std::size_t>(i)];
-        const int node_id = res.node_ids[static_cast<std::size_t>(i)];
-
-        if (tree_id < 0 || tree_id >= tree_count_) {
-          sm_log("result_handler:   SKIP tree_id=%d out of range", tree_id);
-          continue;
-        }
-        SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
-        if (tree.completed) {
-          sm_log("result_handler:   SKIP tree=%d already completed", tree_id);
-          continue;
-        }
-
-        const float* priors_row =
-            res.priors.data() + (static_cast<std::size_t>(i) *
-                                 static_cast<std::size_t>(kActionCount));
-        const float value = res.values[static_cast<std::size_t>(i)];
-
-        // 鎖住樹，在鎖內復原 virtual loss + expand + backup
-        // 依 md：result_handler 先鎖住資料對應的樹，將 virtual loss 復原，
-        // 然後將推論完的先驗機率跟 value 加到樹裡
-        {
-          std::lock_guard<std::mutex> tree_lock(tree.mtx);
-
-          // 將 NN 評估結果寫入樹（復原 virtual loss + expand + backup）
-          tree.session->submit_single_eval(node_id, priors_row, value);
-
-          // 若此樹尚有剩餘模擬次數且無 pending leaves，則重新入隊
-          // 注意：不用 tree.completed 判斷，因為 worker 模擬完若還有 pending leaves
-          // 就不會設 completed=true，要等 GPU 結果回來 process_pending_evals 後才知道
-          if (!tree.session->is_complete() && !tree.session->has_pending_leaves()) {
-            sm_log("result_handler:   -> reenqueue tree=%d", tree_id);
-            reenqueue_tree_if_needed(tree_id);
-          } else if (tree.session->is_complete()) {
-            complete_tree(tree);
-          }
-        }
-        // 解鎖 — 依 md
-      }
-    }
-
-    // 記憶體屏障：確保寫入對 worker 可見
-    std::atomic_thread_fence(std::memory_order_release);
-
-    // 嘗試 swap_buffer
-    swap_caller_.store("result_handler", std::memory_order_relaxed);
-    try_swap_buffer();
-    sm_log("result_handler: finish work ");
-  }
-  sm_log("result_handler: EXIT");
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// 處理 GPU 回傳的結果（保留給 wait_for_completion 的最終清理用）
-// ══════════════════════════════════════════════════════════════════════
-
-// 將 GPU 已算完的 priors/value 回填到各棵 SearchSession。
-// 這一步會真正解除先前 virtual loss 造成的暫時偏移。
-//
-// 注意：正常運行時由 result_handler_loop() 負責呼叫 submit_single_eval。
-// 這個函式只作為 wait_for_completion 中的「最終清理」備用路徑，
-// 處理 result handler 停止後來不及處理的殘留結果。
-void SearchManager::process_pending_results() {
-  // 從 pending_results_ 取出所有結果並分配給對應的樹
-  std::vector<PendingEvalResult> results_to_process;
-
-  {
-    std::lock_guard<std::mutex> lock(results_mtx_);
-    results_to_process.swap(pending_results_);
-    sm_log("  process_pending_results: took %zu batches from pending_results_", results_to_process.size());
-  }
-
-  if (results_to_process.empty()) {
-    sm_log("  process_pending_results: nothing to process");
-    return;
-  }
-
-    for (auto& res : results_to_process) {
-    sm_log("  process_pending_results: processing batch buf%d (size=%d)", res.buffer_id, res.batch_size);
-    for (int i = 0; i < res.batch_size; ++i) {
-      const int tree_id = res.tree_ids[static_cast<std::size_t>(i)];
-      const int node_id = res.node_ids[static_cast<std::size_t>(i)];
-
-      if (tree_id < 0 || tree_id >= tree_count_) {
-        sm_log("  process_pending_results:   SKIP tree_id=%d OOB", tree_id);
-        continue;
-      }
-      SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
-      if (tree.completed) {
-        sm_log("  process_pending_results:   SKIP tree=%d completed", tree_id);
-        continue;
-      }
-
-      const float* priors_row =
-          res.priors.data() + (static_cast<std::size_t>(i) *
-                               static_cast<std::size_t>(kActionCount));
-      const float value = res.values[static_cast<std::size_t>(i)];
-
-      sm_log("  process_pending_results: submit_single_eval(tree=%d, node=%d, val=%.4f)",
-             tree_id, node_id, value);
-
-      // 在鎖內復原 virtual loss + expand + backup（與 result_handler 一致）
-      {
-        std::lock_guard<std::mutex> tree_lock(tree.mtx);
-        tree.session->submit_single_eval(node_id, priors_row, value);
-      }
-    }
-  }
-
-  // 記憶體屏障：確保寫入對後續 worker 可見
-  std::atomic_thread_fence(std::memory_order_release);
+bool SearchManager::all_trees_completed() const {
+  return completed_count_.load(std::memory_order_acquire) >= tree_count_;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -920,26 +583,11 @@ void SearchManager::process_pending_results() {
 // ══════════════════════════════════════════════════════════════════════
 
 bool SearchManager::is_complete() const {
-  // 使用原子 completed_count_ 快速檢查（問題 3 修復）
-  // 只需要檢查計數器是否等於總樹數，不需遍歷所有樹
-  if (completed_count_.load(std::memory_order_acquire) < tree_count_) {
-    return false;
-  }
-  // pending_results_ 可能被 result_handler 或 submit_eval_batch 修改，
-  // 但 is_complete() 本身就是一個「快速檢查」，不保證絕對精確，
-  // 因為就算現在 empty，下一秒可能又有新結果進來。
-  // 這裡只確保 tree 都 completed，pending_results_ 大致清空即可。
-  std::lock_guard<std::mutex> results_lock(results_mtx_);
-  return pending_results_.empty();
+  return all_trees_completed();
 }
 
 int SearchManager::completed_tree_count() const {
   return completed_count_.load(std::memory_order_relaxed);
-}
-
-std::string SearchManager::last_swap_reason() const {
-  std::lock_guard<std::mutex> lock(swap_reason_mtx_);
-  return last_swap_reason_;
 }
 
 int SearchManager::total_remaining_simulations() const {
@@ -955,44 +603,13 @@ int SearchManager::total_remaining_simulations() const {
 
 std::vector<SearchResult> SearchManager::finish_all() {
   sm_log("finish_all: start");
-
-  // 收集所有樹的搜尋結果
   std::vector<SearchResult> results;
   results.reserve(trees_.size());
-
   for (auto& tree_ptr : trees_) {
     results.push_back(tree_ptr->session->finish());
   }
-
   sm_log("finish_all: done, %zu results", results.size());
   return results;
 }
-
-// ══════════════════════════════════════════════════════════════════════
-// 輔助函式
-// ══════════════════════════════════════════════════════════════════════
-
-int64_t SearchManager::now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::steady_clock::now().time_since_epoch()
-         ).count();
-}
-
-// 檢查是否「沒有新的樹可以被模擬了」。
-// 依 multi_thread_logic.md 的寬鬆定義：
-// 「所有的樹都已經被模擬過或是正在被模擬或是模擬次數結束」
-// 當所有未 completed 的樹都有 pending_leaves（已在等 GPU）時回傳 true。
-// 不需要檢查 flushed_to_buffer — 只要樹已經送出 leaf 在等 GPU，
-// 就代表沒有進度可以再做，應觸發 swap 讓 GPU 消化這些 pending leaves。
-bool SearchManager::trees_all_stalled() const {
-  for (const auto& tree_ptr : trees_) {
-    if (tree_ptr->completed) continue;
-    // 只要有一棵未 completed 的樹沒有 pending leaves（還能繼續模擬），就非 stalled
-    if (!tree_ptr->session->has_pending_leaves()) return false;
-  }
-  return true;  // 所有未 completed 的樹都已送出 leaf 在等 GPU
-}
-
-
 
 }  // namespace tzaar

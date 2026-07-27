@@ -6,6 +6,7 @@
 #include "mcts/config.h"
 #include "mcts/search.h"
 #include "features/cnn_builder.h"
+#include "external/concurrentqueue.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -18,23 +19,22 @@
 
 namespace tzaar {
 
-// ─── 多樹搜尋管理器 ───────────────────────────────────────
-// 管理多棵 MCTS 搜尋樹，使用多執行緒 + 雙 buffer 架構
-// 讓 CPU 和 GPU 可以同時工作。
+// ─── 多樹搜尋管理器（新架構 v3） ──────────────────────────
+// 管理多棵 MCTS 搜尋樹，使用多執行緒讓 CPU 和 GPU 可以同時工作。
 //
-// 這個類別實作 multi_thread_logic.md 的規劃：
-//   - 固定數量 CPU worker threads
-//   - 一個佇列存放尚需模擬的樹 ID，worker 從中取出，無樹時 wait
-//   - 一棵樹只會由一個執行緒模擬（per-tree mutex）
-//   - 每個 worker 的 thread-local leaf buffer（leaf_batch_size 大小）
-//   - shared double buffer（write_index / active_writers 原子變數）
-//   - 原子交換鎖避免多 worker 同時 swap_buffer
-//   - result_handler 負責回寫 GPU 結果，並將未完成的樹重新入隊
+// 實作 multi_thread_logic.md 的新規劃：
+//   - 固定分配樹給每個 CPU worker，每個 worker 持有內部活躍樹 ID 清單
+//   - 每輪最多 16 次模擬（kBatchIncrement），收集一批葉節點指標送 ConcurrentQueue
+//   - 指標型 ConcurrentQueue 傳遞，零拷貝
+//   - 1:1 配對：每個 CPU worker 伴隨一個專屬 Result Handler
+//   - 防空轉睡眠機制：worker 無事可做時透過 condition_variable 睡眠，
+//     由對應的 Result Handler 喚醒
+//   - 樹完成後立即從 worker 內部清單中 erase
 //
 // worker 的存活
-//   - 執行緒在建構時就被建立，在佇列上等待樹
-//   - 每次 reset() 把樹塞入佇列 + notify_all 即可喚醒
-//   - 所有樹完成後，佇列為空，workers 繼續在佇列上 wait
+//   - 所有 thread 在建構時就被建立
+//   - 每次 reset() 重新分配樹並喚醒 workers
+//   - 所有樹完成後，workers 進入睡眠等待下一次 reset
 //   - shutdown() + join_workers() 時才真正 join threads
 // ──────────────────────────────────────────────────────────
 
@@ -45,7 +45,8 @@ class SearchManager {
   // threads 建立後立即進入 pause wait 狀態
   // config      : 預設搜尋設定（reset 時可重新設定）
   // num_threads : CPU worker 執行緒數量（預設 8）
-  // max_batch   : 單個 buffer 的最大葉節點數（預設 480）
+  //              同時也是 Result Handler 的數量（1:1 配對）
+  // max_batch   : 單次 GPU 推論的最大葉節點數（預設 480）
   SearchManager(SearchConfig config,
                 int num_threads = 8,
                 int max_batch = 480);
@@ -54,7 +55,7 @@ class SearchManager {
   SearchManager& operator=(const SearchManager&) = delete;
 
   // ─── 生命週期 ───────────────────────────────────────
-  // 重置樹和 buffer，將新樹 ID 塞入佇列喚醒 workers
+  // 重置樹和狀態，將樹固定分配給各 worker 並喚醒所有 threads
   void reset(const std::vector<PhaseGameState>& root_states,
              SearchConfig config);
 
@@ -65,67 +66,66 @@ class SearchManager {
   void join_workers();
 
   // ─── Python 端專用介面 ────────────────────────────────
-  bool has_ready_batch() const;
 
+    // 從 ConcurrentQueue 取出一個批次（累積多個 EvalBatch）
+  // 從 queue 中儘可能取出所有 EvalBatch，合併成一個大 PackedBatch。
+  // max_batch   : 單次回傳的最大葉節點數（預設 480）
+  // timeout_ms  : 等待時間（預設 100ms，0 = non-blocking）
+  // 回傳 empty batch（batch_size=0）表示沒有資料
   struct PackedBatch {
-    int buffer_id = -1;
+    int buffer_id = -1;  // 保留相容性
     int batch_size = 0;
     const int32_t* node_ids = nullptr;
     const float* board_state_flat = nullptr;
     const float* global_features = nullptr;
     const uint8_t* legal_masks = nullptr;
     const int32_t* tree_ids = nullptr;
+    const int32_t* worker_ids = nullptr;  // 每個 leaf 對應的 worker_id
   };
-  PackedBatch get_ready_batch();
+  
+  PackedBatch dequeue_batch(int max_batch = 480, int timeout_ms = 100);
 
-  void submit_eval_batch(int buffer_id,
-                         const int32_t* node_ids,
-                         const float* priors,
-                         const float* values,
-                         int batch_size);
+      // 提交 GPU 推論結果
+  // worker_ids 陣列，每個 leaf 對應所屬的 worker_id，讓對應的 Result Handler 處理
+  void submit_leaf_evals(
+      const int32_t* worker_ids,
+      const int32_t* node_ids,
+      const int32_t* tree_ids,
+      const float* priors,
+      const float* values,
+      int batch_size);
 
   // ─── 結果取得 ───────────────────────────────────────
   bool is_complete() const;
   int completed_tree_count() const;
   int total_remaining_simulations() const;
-  std::string last_swap_reason() const;
   std::vector<SearchResult> finish_all();
+
+  // 內部批次大小常數（每 16 次模擬為一個單位）
+  static constexpr int kBatchIncrement = 16;
 
  private:
   // ─── 內部資料結構 ──────────────────────────────────
 
-  // 雙 buffer（依 multi_thread_logic.md 規劃）：
-  // 每個 buffer 有 write_index 和 active_writers 原子變數，
-  // 置於不同 cache line 避免 false sharing。
-  struct EvalBuffer {
-    // 預先分配的連續記憶體
-    std::vector<float> board_flat;       // [max_batch * kBoardFlatSize]
-    std::vector<float> global_feat;      // [max_batch * kGlobalFeatureDim]
-    std::vector<uint8_t> legal_mask;     // [max_batch * kActionCount]
-    std::vector<int32_t> node_ids;       // [max_batch]
-    std::vector<int32_t> tree_ids;       // [max_batch]
-
-    int capacity = 0;
-
-    // ── 原子變數（避免 false sharing） ──────────────
-    // write_index   ：下一個寫入位置（worker fetch_add 取得）
-    // active_writers：目前正在寫入的 worker 數量
-    // pending_count ：目前已累積的葉節點總數
-    //
-    // 每個原子變數置於獨立 cache line（64 bytes），
-    // 並用 padding 確保彼此不互相干擾，符合 multi_thread_logic.md 要求。
-    alignas(64) std::atomic<int> write_index{0};
-    char _pad1[64 - sizeof(std::atomic<int>)];
-    alignas(64) std::atomic<int> active_writers{0};
-    char _pad2[64 - sizeof(std::atomic<int>)];
-    alignas(64) std::atomic<int> pending_count{0};
-
-    bool eval_done = true;  // GPU 是否已處理完這個 buffer
+  // 從 SearchSession 模擬產出的葉節點資料（指標傳遞）
+  // simulate_single_step 會回傳一個 LeafData*（由 caller 負責 delete）
+  struct LeafData {
+    int node_id;
+    int tree_id;
+    float board_flat[kBoardFlatSize];
+    float global_feat[kGlobalFeatureDim];
+    uint8_t legal_mask[kActionCount];
   };
 
-  // GPU 送回但還沒寫回樹的結果。
+  // ConcurrentQueue 中的批次單位
+  struct EvalBatch {
+    int worker_id;
+    std::vector<LeafData*> leaves;  // 指標向量
+  };
+
+  // GPU 送回但還沒寫回樹的結果
   struct PendingEvalResult {
-    int buffer_id;
+    int buffer_id;  // 保留相容性
     int batch_size;
     std::vector<int32_t> node_ids;
     std::vector<int32_t> tree_ids;
@@ -139,116 +139,80 @@ class SearchManager {
   int max_batch_;
   int tree_count_;
   std::atomic<bool> stop_{false};
-  std::atomic<int> completed_count_{0};    // 已完成模擬的樹數量（問題 3 修復）
+  std::atomic<int> completed_count_{0};
 
   // 樹的管理
-  struct SearchTree {
+    struct SearchTree {
     PhaseGameState root_state;
     std::unique_ptr<SearchSession> session;
-    std::mutex mtx;                      // per-tree mutex（取代 atomic<bool> locked）
     bool completed = false;
-    std::atomic<bool> flushed_to_buffer{false}; // 最近一批 leaf 是否已 flush 進 buffer
     int tree_id = -1;
   };
   std::vector<std::unique_ptr<SearchTree>> trees_;
 
-  // ─── 樹 ID 佇列（依 md 規劃） ────────────────────
-  // 佇列內放著尚需模擬的樹 ID。
-  // worker 從中取出，若佇列為空則 wait。
-  // result_handler 處理完 GPU 結果後，若樹尚未完成則重新入隊。
-  std::queue<int> tree_queue_;
-  mutable std::mutex queue_mtx_;
-  std::condition_variable queue_cv_;
+  // ─── 固定分配：每個 worker 持有自己的活躍樹 ID 清單 ──
+  std::vector<std::vector<int>> assigned_trees_;  // [worker_id] -> list of tree IDs
 
-  // ─── 雙 buffer ─────────────────────────────────────
-  EvalBuffer buffers_[2];
-  std::atomic<int> active_buffer_{0};     // CPU 正在填入的 buffer 索引
-  std::atomic<bool> fillable_[2] = {true, false};      // buffer 是否可以填入
+  // ─── ConcurrentQueue（指標傳遞，零拷貝） ─────────
+  moodycamel::ConcurrentQueue<EvalBatch> eval_queue_;
 
-  // 原子交換鎖：避免多個 worker 同時 swap_buffer
-  std::atomic<bool> swapping_{false};
+    // ─── 每個 worker 的睡眠/喚醒機制（用 unique_ptr 繞過不可複製限制） ──
+  std::vector<std::unique_ptr<std::mutex>> worker_cv_mtx_;
+  std::vector<std::unique_ptr<std::condition_variable>> worker_cv_;
 
-  // 強制 swap 的時序控制
-  std::atomic<int64_t> last_swap_time_ms_{0};
-
-  // 記錄本次 swap 的呼叫來源（worker_loop, result_handler, submit_eval, timeout）
-  // 由呼叫點設定，try_swap_buffer() 成功時用它來記錄 last_swap_reason_
-  mutable std::atomic<const char*> swap_caller_{"unknown"};
-
-  // 執行緒池
-  std::vector<std::thread> pool_;
-  std::thread result_handler_;
+  // ─── 執行緒池 ─────────────────────────────────────
+  std::vector<std::thread> pool_;               // CPU workers
+  std::vector<std::thread> result_handlers_;     // 1:1 Result Handlers
   std::atomic<bool> result_handler_stop_{false};
 
-  // 最近一次 swap_buffer 的原因（供 Python 端日誌用）
-  mutable std::mutex swap_reason_mtx_;
-  std::string last_swap_reason_;
+  // ─── Python 搜尋完成通知 ──────────────────────────
+  mutable std::mutex search_done_mtx_;
+  std::condition_variable search_done_cv_;
+  bool search_done_ = false;
 
-  // 同步（Python 通知用）
-  mutable std::mutex cv_mtx_;
-  std::condition_variable batch_ready_cv_;
-  bool batch_ready_ = false;
+        // ─── 每個 Result Handler 專屬的 pending queue ──────
+  //  submit_leaf_evals 根據 worker_id 直接放進對應的 queue
+  //  每個 Result Handler 只等自己的 queue，不需競爭
+  //  使用 unique_ptr 繞過 mutex/condition_variable 不可複製限制
+  std::vector<std::unique_ptr<std::mutex>> per_worker_pending_mtx_;
+  std::vector<std::vector<PendingEvalResult>> per_worker_pending_results_;
+  std::vector<std::unique_ptr<std::condition_variable>> per_worker_pending_cv_;
 
-  // 同步（結果處理用）
-  mutable std::mutex results_mtx_;
-  std::condition_variable results_cv_;
-  std::vector<PendingEvalResult> pending_results_;
+    // ─── 累積葉節點數閥值（達到此值通知 Python） ────
+  std::atomic<int> accumulated_leaves_{0};
+
+        // ─── dequeue_batch 暫存區 ──
+  std::vector<int32_t> dequeued_node_ids_;
+  std::vector<int32_t> dequeued_tree_ids_;
+  std::vector<int32_t> dequeued_worker_ids_;
+  std::vector<float> dequeued_board_flat_;
+  std::vector<float> dequeued_global_feat_;
+  std::vector<uint8_t> dequeued_legal_mask_;
 
   // ─── 內部方法 ──────────────────────────────────────
 
-  // CPU worker 主迴圈
-  void worker_loop(int thread_id);
+  // CPU worker 主迴圈（固定分配樹 + 16次模擬 + 睡眠機制）
+  void worker_loop(int worker_id);
 
-  // 專用 GPU 結果處理執行緒主迴圈
-  void result_handler_loop();
+  // 1:1 配對的 Result Handler 主迴圈
+  void result_handler_loop(int worker_id);
 
-  // Thread-local buffer（連續記憶體，符合 multi_thread_logic.md 一次累積 leaf_batch_size 個 leaf）
-  // 用連續陣列取代離散 slots，讓 simulate_into_buffers 可以直接寫入
-  struct ThreadLocalBuffer {
-    std::vector<float> board_flat;     // [leaf_batch_size * kBoardFlatSize]
-    std::vector<float> global_feat;    // [leaf_batch_size * kGlobalFeatureDim]
-    std::vector<uint8_t> legal_mask;   // [leaf_batch_size * kActionCount]
-    std::vector<int32_t> node_ids;     // [leaf_batch_size]
-    std::vector<int32_t> tree_ids;     // [leaf_batch_size]
-    int count = 0;
-    int capacity = 0;
-  };
+  // 對一棵樹執行一次模擬步驟，回傳 LeafData*（若無則 nullptr）
+  // 呼叫方負責 delete
+  LeafData* simulate_single_step(int tree_id);
 
-  // 從佇列取得一棵樹（佇列空則 wait）
-  // 回傳樹 ID，若收到停止訊號則回傳 -1
-  int acquire_tree_from_queue();
+  // 檢查是否有「處在就緒狀態」的樹（未完成且無 pending leaves）
+  bool HasAnyReadyTree(const std::vector<int>& tree_ids) const;
 
-  // 在一棵樹上模擬 leaf_batch_size 次，填入 local buffer
-  void simulate_tree_into_local(int tree_id, ThreadLocalBuffer& local);
+    // 處理 GPU 推論結果（寫回樹、解除 pending、喚醒 worker）
+  void process_pending_eval_result(int tree_id, int node_id,
+                                   const float* priors, float value);
 
-  // 將 local buffer 的內容 flush 到 shared buffer
-  // 使用 write_index / active_writers 原子變數（不用 mutex）
-  void flush_local_to_shared(int thread_id, ThreadLocalBuffer& local, int tree_id);
-
-  // 嘗試 swap_buffer（原子交換鎖保護）
-  // 回傳 true 表示成功 swap，false 表示條件不滿足或已被其他 thread swap
-  bool try_swap_buffer();
-
-  // 處理 GPU 回傳的評估結果（寫回對應的樹）
-  void process_pending_results();
-
-  // 初始化 buffer 記憶體
-  void init_buffers();
-
-  // 將所有未完成的樹放入佇列（start_workers 時呼叫）
-  void enqueue_all_trees();
-
-  // 將一棵樹重新入隊（若未完成且無 pending leaves）
-  void reenqueue_tree_if_needed(int tree_id);
-
-  // 將一棵樹標記為完成，若所有樹都完成則觸發 shutdown 並通知 Python
+  // 將一棵樹標記為完成
   void complete_tree(SearchTree& tree);
 
-  // 輔助：取得目前毫秒時間
-  static int64_t now_ms();
-
-  // 檢查是否所有未完成的樹都已 flush 完在等 GPU
-  bool trees_all_stalled() const;
+  // 檢查是否所有樹已完成
+  bool all_trees_completed() const;
 };
 
 }  // namespace tzaar
