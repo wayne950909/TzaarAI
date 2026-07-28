@@ -51,6 +51,8 @@ def validate_constants() -> None:
     if ASYNC_MCTS_CFG.enabled:
         if ASYNC_MCTS_CFG.parallel_games <= 0:
             raise ValueError("ASYNC_PARALLEL_GAMES must be >= 1")
+        if ASYNC_MCTS_CFG.num_threads <= 0:
+            raise ValueError("ASYNC_NUM_THREADS must be >= 1")
         if ASYNC_MCTS_CFG.infer_max_batch <= 0:
             raise ValueError("ASYNC_INFER_MAX_BATCH must be >= 1")
         if ASYNC_MCTS_CFG.request_queue_size <= 0:

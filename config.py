@@ -101,9 +101,10 @@ MCTS_CFG = MCTSConfig()
 class AsyncMCTSConfig:
     """多 CPU worker + 共享 GPU worker 的非同步 pipeline"""
     enabled: bool = True
-    # 目前正式訓練使用的是 active game pool 大小，
-    # 不是文件最終目標中的固定 10-thread SearchManager pool。
-    parallel_games: int = 10
+    # 同時進行的 active game pool 大小（例如 200 局平行推進）
+    parallel_games: int = 200
+    # C++ SearchManager 的常駐 worker thread 數量（固定不變）
+    num_threads: int = 8
     # 單次 GPU forward 最多聚合多少個 leaf states。
     infer_max_batch: int = 480
     # GPU worker 最多等待多久，再把目前已收集到的 request 一起送進模型。

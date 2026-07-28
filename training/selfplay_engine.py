@@ -77,9 +77,10 @@ def log_runtime_mode() -> None:
     print(
         "[runtime] "
         f"backend={_cfg._ACTIVE_STATE_BACKEND} | "
-        f"selfplay_mode={mode} | "
+                f"selfplay_mode={mode} | "
         f"async_enabled={ASYNC_MCTS_CFG.enabled} | "
         f"parallel_games={ASYNC_MCTS_CFG.parallel_games} | "
+        f"num_threads={ASYNC_MCTS_CFG.num_threads} | "
         f"infer_max_batch={ASYNC_MCTS_CFG.infer_max_batch} | "
         f"infer_max_wait_ms={ASYNC_MCTS_CFG.infer_max_wait_ms} | "
         f"response_timeout_s={ASYNC_MCTS_CFG.response_timeout_s}"
