@@ -3,8 +3,8 @@
 // 使用固定數量 worker thread + 樹 ID 佇列 + 雙 buffer 架構。
 //
 // 本檔案對應 multi_thread_logic.md 的設計：
-//   - Worker 從佇列取出樹 ID，無樹時 wait（condition_variable）
-//   - 一棵樹由 per-tree mutex 保護，一次只由一個 worker 模擬
+//   - Worker 從 ConcurrentQueue 取出樹 ID，無樹時 wait
+//   - 一棵樹由 ConcurrentQueue 確保唯一持有，無需 per-tree mutex
 //   - 模擬結果用 write_index/active_writers 原子變數寫入 shared buffer
 //   - try_swap_buffer 用 atomic exchange lock 確保互斥
 //   - result_handler 處理 GPU 結果並將未完成樹重新入隊
@@ -36,7 +36,7 @@ SearchManager::SearchManager(SearchConfig config,
   if (max_batch_ <= 0)
     throw std::invalid_argument("max_batch must be >= 1");
 
-    // 建立常駐 threads（佇列空的，workers 直接在 acquire_tree_from_queue 中 wait）
+        // 建立常駐 threads（佇列空的，workers 直接在 tree_queue_.wait_and_pop 中 wait）
   stop_ = false;
   result_handler_stop_ = false;
 
@@ -75,11 +75,9 @@ void SearchManager::init_buffers() {
 // ══════════════════════════════════════════════════════════════════════
 
 void SearchManager::enqueue_all_trees() {
-  std::lock_guard<std::mutex> lock(queue_mtx_);
   for (int i = 0; i < tree_count_; ++i) {
     tree_queue_.push(i);
   }
-  queue_cv_.notify_all();
 }
 
 void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
@@ -115,25 +113,19 @@ void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
   swapping_ = false;
   pending_results_.clear();
 
-  // 清空佇列並重新入隊
-  {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    while (!tree_queue_.empty()) tree_queue_.pop();
-    for (int i = 0; i < tree_count_; ++i) {
-      tree_queue_.push(i);
-    }
+    // 清空佇列並重新入隊
+  tree_queue_.clear();
+  tree_queue_.reset_stop();
+  for (int i = 0; i < tree_count_; ++i) {
+    tree_queue_.push(i);
   }
-  queue_cv_.notify_all();
 }
 
 void SearchManager::shutdown() {
   stop_ = true;
   result_handler_stop_ = true;
 
-  {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    queue_cv_.notify_all();
-  }
+    tree_queue_.notify_all();
   batch_ready_cv_.notify_all();
   results_cv_.notify_all();
 }
@@ -161,15 +153,14 @@ void SearchManager::join_workers() {
 // Worker Thread 主迴圈
 // ══════════════════════════════════════════════════════════════════════
 
-// Worker 的節奏（依 multi_thread_logic.md）：
-// 1. 從佇列取得一棵樹 ID（佇列空時 wait）
-// 2. 鎖住該樹的 mutex
+// Worker 的節奏（使用 ConcurrentQueue 取出即獨佔，無需 per-tree mutex）：
+// 1. 從 ConcurrentQueue 取得一棵樹 ID（佇列空時 wait）
+// 2. 檢查樹狀態（pending leaves / completed），必要時放回或跳過
 // 3. 多次呼叫 simulate_into_buffers，直到 local buffer 滿 leaf_batch_size、
 //    樹已完成、或樹 stalled（有 pending leaves 在等 GPU）
-// 4. 解鎖樹
-// 5. 用 write_index/active_writers 原子寫入 shared buffer（已不持有樹鎖）
-// 6. 嘗試 swap_buffer
-// 7. 找下一棵樹（重新入隊由 result_handler 負責）
+// 4. 將 local buffer flush 到 shared buffer（用 write_index/active_writers 原子變數）
+// 5. 嘗試 swap_buffer
+// 6. 找下一棵樹（重新入隊由 result_handler 負責）
 //
 // 注意：重新入隊的責任歸 result_handler（依 multi_thread_logic.md），
 //       worker 只管模擬→flush→找下一棵樹。
@@ -187,73 +178,58 @@ void SearchManager::worker_loop(int thread_id) {
   local.node_ids.resize(static_cast<std::size_t>(local_cap), 0);
   local.tree_ids.resize(static_cast<std::size_t>(local_cap), 0);
 
-    int loop_count = 0;
   while (!stop_) {
-    loop_count++;
-
-    // 1. 從佇列取得一棵樹（佇列空則 wait）
-    int tree_id = acquire_tree_from_queue();
-    if (tree_id < 0) {
+    // 1. 從 ConcurrentQueue 取得一棵樹（佇列空則 wait）
+    int tree_id;
+    if (!tree_queue_.wait_and_pop(tree_id)) {
       // 收到停止訊號
       break;
     }
 
-    // 2. 嘗試鎖住該樹的 mutex（依 md：鎖住失敗就跳到步驟 1，找下一棵樹）
+    // ConcurrentQueue 取出即獨佔：此 tree_id 只有本 worker 持有
     SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
     bool simulated = false;
-    {
-      std::unique_lock<std::mutex> lock(tree.mtx, std::try_to_lock);
-      if (!lock.owns_lock()) {
-        // 鎖不住：將樹放回佇列，讓其他 worker 有機會
-        {
-          std::lock_guard<std::mutex> qlock(queue_mtx_);
-          tree_queue_.push(tree_id);
-        }
-        queue_cv_.notify_one();
-        continue;
-      }
 
-            // 跳過有 pending leaves 的樹（還在等 GPU 結果）
-      if (tree.session->has_pending_leaves()) {
-        continue;
-      }
-
-      // 檢查樹是否已經完成但未被標記（debug 用）
-      if (tree.session->is_complete()) {
-        complete_tree(tree);
-        if (is_complete()) break;
-        continue;
-      }
-
-      // 3. 重設 flushed_to_buffer，開始新一輪模擬
-      tree.flushed_to_buffer = false;
-
-      simulate_tree_into_local(tree_id, local);
-
-      if (local.count > 0) {
-        simulated = true;
-      }
-
-            // 檢查樹是否已完成（在鎖內更新 completed）
-      if (tree.session->is_complete()) {
-        complete_tree(tree);
-        if (is_complete()) {
-          break;
-        }
-      }
-
-      // 4. 解鎖（lock 離開 scope 時自動釋放）
-      //    依 md：flush 到 shared buffer 不應在持有樹鎖時進行
+    // 跳過有 pending leaves 的樹（還在等 GPU 結果）
+    if (tree.session->has_pending_leaves()) {
+      // 放回佇列讓其他 worker 有機會
+      tree_queue_.push(tree_id);
+      continue;
     }
-    // ═══ mutex 已解鎖 ═══
 
-    // 5. 解鎖後，將 local buffer flush 到 shared buffer
+    // 檢查樹是否已經完成
+    if (tree.session->is_complete()) {
+      complete_tree(tree);
+      if (is_complete()) break;
+      continue;
+    }
+
+    // 2. 重設 flushed_to_buffer，開始新一輪模擬
+    tree.flushed_to_buffer = false;
+
+    simulate_tree_into_local(tree_id, local);
+
+    if (local.count > 0) {
+      simulated = true;
+    }
+
+    // 檢查樹是否已完成
+    if (tree.session->is_complete()) {
+      complete_tree(tree);
+      if (is_complete()) {
+        break;
+      }
+    }
+
+    // ═══ 不需解鎖（無 per-tree mutex）═══
+
+    // 3. 將 local buffer flush 到 shared buffer
     //    使用 write_index/active_writers 原子變數，不用 mutex
     if (simulated) {
       flush_local_to_shared(thread_id, local, tree_id);
     }
 
-    // 6. 嘗試 swap_buffer（重新入隊由 result_handler 負責）
+    // 4. 嘗試 swap_buffer（重新入隊由 result_handler 負責）
     swap_caller_.store("worker", std::memory_order_relaxed);
     try_swap_buffer();
   }
@@ -263,25 +239,6 @@ void SearchManager::worker_loop(int thread_id) {
   }
 }
 
-// 從佇列取得一棵樹 ID。
-// 佇列為空時在 condition_variable 上 wait。
-// 回傳 -1 表示收到停止訊號。
-int SearchManager::acquire_tree_from_queue() {
-        std::unique_lock<std::mutex> lock(queue_mtx_);
-    queue_cv_.wait(lock, [this]() {
-    return !tree_queue_.empty() || stop_;
-  });
-
-    if (stop_) {
-    return -1;
-  }
-
-  // 醒來 = 佇列一定有樹（被 reset 或 reenqueue 塞入）
-  int tree_id = tree_queue_.front();
-  tree_queue_.pop();
-  return tree_id;
-}
-
 // 若樹未完成且無 pending leaves，重新放入佇列
 // 注意：此函式僅由 result_handler 呼叫（依 multi_thread_logic.md），
 //       worker 不負責重新入隊（問題 2 修復）。
@@ -289,11 +246,7 @@ void SearchManager::reenqueue_tree_if_needed(int tree_id) {
   SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
   if (tree.completed) return;
   if (tree.session->has_pending_leaves()) return;  // 還在等 GPU
-  {
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    tree_queue_.push(tree_id);
-  }
-  queue_cv_.notify_one();
+  tree_queue_.push(tree_id);
 }
 
 void SearchManager::complete_tree(SearchTree& tree) {
@@ -705,25 +658,21 @@ void SearchManager::result_handler_loop() {
                                  static_cast<std::size_t>(kActionCount));
         const float value = res.values[static_cast<std::size_t>(i)];
 
-        // 鎖住樹，在鎖內復原 virtual loss + expand + backup
-        // 依 md：result_handler 先鎖住資料對應的樹，將 virtual loss 復原，
-        // 然後將推論完的先驗機率跟 value 加到樹裡
-        {
-          std::lock_guard<std::mutex> tree_lock(tree.mtx);
+                // 將 NN 評估結果寫入樹（復原 virtual loss + expand + backup）
+        // 注意：不需 per-tree lock，因為 ConcurrentQueue 確保 worker
+        // 和 result_handler 不會同時操作同一棵樹的衝突資料。
+        // Worker 操作的是尚未送出的 pending leaves，
+        // result_handler 操作的是已送回來的 GPU 結果，兩者不重疊。
+        tree.session->submit_single_eval(node_id, priors_row, value);
 
-          // 將 NN 評估結果寫入樹（復原 virtual loss + expand + backup）
-          tree.session->submit_single_eval(node_id, priors_row, value);
-
-          // 若此樹尚有剩餘模擬次數且無 pending leaves，則重新入隊
-          // 注意：不用 tree.completed 判斷，因為 worker 模擬完若還有 pending leaves
-          // 就不會設 completed=true，要等 GPU 結果回來 process_pending_evals 後才知道
-                    if (!tree.session->is_complete() && !tree.session->has_pending_leaves()) {
-            reenqueue_tree_if_needed(tree_id);
-          } else if (tree.session->is_complete()) {
-            complete_tree(tree);
-          }
+        // 若此樹尚有剩餘模擬次數且無 pending leaves，則重新入隊
+        // 注意：不用 tree.completed 判斷，因為 worker 模擬完若還有 pending leaves
+        // 就不會設 completed=true，要等 GPU 結果回來 process_pending_evals 後才知道
+        if (!tree.session->is_complete() && !tree.session->has_pending_leaves()) {
+          reenqueue_tree_if_needed(tree_id);
+        } else if (tree.session->is_complete()) {
+          complete_tree(tree);
         }
-        // 解鎖 — 依 md
       }
     }
 
@@ -772,16 +721,13 @@ void SearchManager::process_pending_results() {
         continue;
       }
 
-      const float* priors_row =
+            const float* priors_row =
           res.priors.data() + (static_cast<std::size_t>(i) *
                                static_cast<std::size_t>(kActionCount));
       const float value = res.values[static_cast<std::size_t>(i)];
 
-      // 在鎖內復原 virtual loss + expand + backup（與 result_handler 一致）
-      {
-        std::lock_guard<std::mutex> tree_lock(tree.mtx);
-        tree.session->submit_single_eval(node_id, priors_row, value);
-      }
+      // 不需 per-tree lock（理由同 result_handler_loop）
+      tree.session->submit_single_eval(node_id, priors_row, value);
     }
   }
 

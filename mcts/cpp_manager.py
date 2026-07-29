@@ -94,7 +94,7 @@ class CppSearchManager:
         cfg.add_root_dirichlet_noise = bool(MCTS_CFG.use_root_dirichlet_noise)
         cfg.root_dirichlet_eps = float(MCTS_CFG.root_dirichlet_eps)
         cfg.root_dirichlet_alpha = float(MCTS_CFG.root_dirichlet_alpha)
-        cfg.min_batch_for_swap = int(MCTS_CFG.leaf_batch_size)
+        cfg.min_batch_for_swap = int(ASYNC_MCTS_CFG.min_batch_for_swap)
         cfg.flush_timeout_ms = int(ASYNC_MCTS_CFG.infer_max_wait_ms)
         return cfg
 

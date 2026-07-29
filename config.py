@@ -70,7 +70,7 @@ class MCTSConfig:
     """MCTS 搜尋引擎的超參數"""
     simulations: int = 600
     puct_c: float = 1.5
-    leaf_batch_size: int = 16
+    leaf_batch_size: int = 32
 
     # Root Dirichlet noise（訓練時啟用）
     use_root_dirichlet_noise: bool = True
@@ -104,16 +104,20 @@ class AsyncMCTSConfig:
     # 同時進行的 active game pool 大小（例如 200 局平行推進）
     parallel_games: int = 200
     # C++ SearchManager 的常駐 worker thread 數量（固定不變）
-    num_threads: int = 8
+    num_threads: int = 10
     # 單次 GPU forward 最多聚合多少個 leaf states。
-    infer_max_batch: int = 480
+    infer_max_batch: int = 6400
     # GPU worker 最多等待多久，再把目前已收集到的 request 一起送進模型。
     infer_max_wait_ms: float = 2.0
     # Python async worker request queue 的容量上限。
     request_queue_size: int = 30
-    # CPU worker 等待 GPU 回傳結果的超時秒數；
+        # CPU worker 等待 GPU 回傳結果的超時秒數；
     # 超時時目前訓練會在 selfplay engine 退回 sync-single。
     response_timeout_s: float = 30.0
+
+    # 累積多少 leaf 才送 GPU 做一次 batch forward
+    # 設為 0 則用 infer_max_batch 當 threshold
+    min_batch_for_swap: int = 0
 
 
 ASYNC_MCTS_CFG = AsyncMCTSConfig()

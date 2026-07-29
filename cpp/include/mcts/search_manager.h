@@ -6,13 +6,13 @@
 #include "mcts/config.h"
 #include "mcts/search.h"
 #include "features/cnn_builder.h"
+#include "mcts/concurrent_queue.h"
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <vector>
 
@@ -25,7 +25,7 @@ namespace tzaar {
 // 這個類別實作 multi_thread_logic.md 的規劃：
 //   - 固定數量 CPU worker threads
 //   - 一個佇列存放尚需模擬的樹 ID，worker 從中取出，無樹時 wait
-//   - 一棵樹只會由一個執行緒模擬（per-tree mutex）
+//   - 一棵樹只會由一個執行緒模擬（ConcurrentQueue 取出即獨佔）
 //   - 每個 worker 的 thread-local leaf buffer（leaf_batch_size 大小）
 //   - shared double buffer（write_index / active_writers 原子變數）
 //   - 原子交換鎖避免多 worker 同時 swap_buffer
@@ -145,20 +145,17 @@ class SearchManager {
   struct SearchTree {
     PhaseGameState root_state;
     std::unique_ptr<SearchSession> session;
-    std::mutex mtx;                      // per-tree mutex（取代 atomic<bool> locked）
     bool completed = false;
     std::atomic<bool> flushed_to_buffer{false}; // 最近一批 leaf 是否已 flush 進 buffer
     int tree_id = -1;
   };
   std::vector<std::unique_ptr<SearchTree>> trees_;
 
-  // ─── 樹 ID 佇列（依 md 規劃） ────────────────────
-  // 佇列內放著尚需模擬的樹 ID。
-  // worker 從中取出，若佇列為空則 wait。
-  // result_handler 處理完 GPU 結果後，若樹尚未完成則重新入隊。
-  std::queue<int> tree_queue_;
-  mutable std::mutex queue_mtx_;
-  std::condition_variable queue_cv_;
+    // ─── 樹 ID 並行佇列 ─────────────────────────────
+  // 存放尚需模擬的樹 ID。
+  // Worker 透過 wait_and_pop 取出（取出即獨佔，不需 per-tree lock）。
+  // result_handler 處理完 GPU 結果後，若樹未完成則 push 回去。
+  ConcurrentQueue<int> tree_queue_;
 
   // ─── 雙 buffer ─────────────────────────────────────
   EvalBuffer buffers_[2];
@@ -213,10 +210,6 @@ class SearchManager {
     int count = 0;
     int capacity = 0;
   };
-
-  // 從佇列取得一棵樹（佇列空則 wait）
-  // 回傳樹 ID，若收到停止訊號則回傳 -1
-  int acquire_tree_from_queue();
 
   // 在一棵樹上模擬 leaf_batch_size 次，填入 local buffer
   void simulate_tree_into_local(int tree_id, ThreadLocalBuffer& local);
