@@ -117,7 +117,7 @@ class AsyncMCTSConfig:
 
     # 累積多少 leaf 才送 GPU 做一次 batch forward
     # 設為 0 則用 infer_max_batch 當 threshold
-    min_batch_for_swap: int = 0
+    min_batch_for_swap: int = 100
 
 
 ASYNC_MCTS_CFG = AsyncMCTSConfig()

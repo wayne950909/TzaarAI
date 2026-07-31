@@ -64,6 +64,7 @@ from training.selfplay_engine import (
 from training.validation import validate_constants
 from mcts.cpp_manager import CppSearchManager
 
+import torch.cuda.nvtx as nvtx
 import debugpy  # type: ignore[import-untyped]
 
 
@@ -274,8 +275,9 @@ def run(title: str) -> None:
     }
     total_fresh_samples = 0
 
-    # ── 主訓練循環 ──────────────────────────────────────
+        # ── 主訓練循環 ──────────────────────────────────────
     for update_idx in range(start_update, total_updates):
+        nvtx.range_push(f"update_{update_idx}")
         update_start = time.perf_counter()
         inference_temperature = float(SELFPLAY_CFG.temp_low)
 
@@ -284,6 +286,7 @@ def run(title: str) -> None:
         # engine 內部會自行決定：
         # - 是否採用 async-batch
         # - 是否因錯誤而 fallback 到 sync-single
+        nvtx.range_push("selfplay")
         policy.eval()
         with torch.no_grad():
                         fresh_samples, games_played, n_new_samples, inference_temperature = _collect_selfplay_samples(
@@ -297,11 +300,13 @@ def run(title: str) -> None:
                 search_manager=search_manager,
             )
         total_fresh_samples += n_new_samples
+        nvtx.range_pop()  # selfplay
 
         # ── 訓練 ────────────────────────────────────────────
         # 資料來源可能是：
         # - 當前 update 的 fresh_samples
         # - replay buffer 抽樣
+        nvtx.range_push("training_step")
         policy.train()
 
         if REPLAY_CFG.enabled and fresh_samples:
@@ -324,6 +329,7 @@ def run(title: str) -> None:
         )
 
         metrics = train_on_samples(policy, optimizer, train_samples, device)
+        nvtx.range_pop()  # training_step
 
         # ── Gate ──────────────────────────────────────────
         update_accepted = True
@@ -342,6 +348,7 @@ def run(title: str) -> None:
                     env_cfg=env_cfg,
                     hp=hp,
                 )
+                nvtx.range_pop()  # gatekeeper
             gate_passed = gate_result.win_rate >= GATE_CFG.winrate_threshold
             if gate_passed:
                 print(f"[gate] PASSED | win_rate={gate_result.win_rate:.3f}")
@@ -406,6 +413,8 @@ def run(title: str) -> None:
                     max_samples=REPLAY_CFG.max_samples,
                     base_dir=ckpt_path.parent,
                 )
+
+                nvtx.range_pop()  # update_N
 
         update_elapsed = time.perf_counter() - update_start
         print(

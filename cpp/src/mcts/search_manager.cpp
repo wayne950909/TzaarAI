@@ -17,6 +17,14 @@
 #include <stdexcept>
 #include <mutex>
 
+// ─── NVTX Profiling ────────────────────────────────────
+#ifdef TZAAR_USE_NVTX
+#include <nvtx3/nvToolsExt.h>
+#else
+#define nvtxRangePushA(x)
+#define nvtxRangePop()
+#endif
+
 namespace tzaar {
 
 // ══════════════════════════════════════════════════════════════════════
@@ -234,9 +242,11 @@ void SearchManager::worker_loop(int thread_id) {
     try_swap_buffer();
   }
 
-  if (local.count > 0) {
+    if (local.count > 0) {
     flush_local_to_shared(thread_id, local, -1);
   }
+
+  nvtxRangePop();  // worker_N
 }
 
 // 若樹未完成且無 pending leaves，重新放入佇列
@@ -309,10 +319,11 @@ void SearchManager::simulate_tree_into_local(int tree_id,
 
     // simulate_into_buffers 回傳 0 表示 stalled（所有路徑都被 pending leaf 阻塞）
     // 或樹已 complete。跳出 while 迴圈，不要 busy loop。
-    if (n == 0) {
+        if (n == 0) {
       break;
     }
   }
+  nvtxRangePop();  // simulate_tree_into_local
 }
 
 // 將 local buffer 的內容 flush 到 shared buffer。
@@ -412,8 +423,10 @@ void SearchManager::flush_local_to_shared(int thread_id,
     trees_[static_cast<std::size_t>(tree_id)]->flushed_to_buffer = true;
   }
 
-  // 清空 local
+    // 清空 local
   local.count = 0;
+
+  nvtxRangePop();  // flush_to_shared
 
   // 檢查 swap 條件：
   // - pending_count >= swap_threshold 且
@@ -439,7 +452,10 @@ void SearchManager::flush_local_to_shared(int thread_id,
 // 6. 切換 active_buffer
 // 7. 將舊 buffer 送 GPU（設 eval_done=false，通知 Python）
 // 8. 釋放 swapping_
+
+
 bool SearchManager::try_swap_buffer() {
+  nvtxRangePushA("swap_buffer");
   // 1. 嘗試取得交換鎖
   bool expected = false;
   if (!swapping_.compare_exchange_strong(expected, true,
@@ -504,7 +520,7 @@ bool SearchManager::try_swap_buffer() {
   // 7. 將舊 buffer 送 GPU
   active_buf.eval_done = false;
 
-  {
+    {
     std::lock_guard<std::mutex> lock(cv_mtx_);
     batch_ready_ = true;
   }
@@ -513,6 +529,7 @@ bool SearchManager::try_swap_buffer() {
   // 8. 釋放交換鎖
   swapping_.store(false, std::memory_order_release);
 
+  nvtxRangePop();  // swap_buffer
   return true;
 }
 
@@ -674,15 +691,18 @@ void SearchManager::result_handler_loop() {
           complete_tree(tree);
         }
       }
-    }
+  }
 
     // 記憶體屏障：確保寫入對 worker 可見
     std::atomic_thread_fence(std::memory_order_release);
+
+    nvtxRangePop();  // result_handler_process_batch
 
         // 嘗試 swap_buffer
     swap_caller_.store("result_handler", std::memory_order_relaxed);
     try_swap_buffer();
   }
+  nvtxRangePop();  // result_handler_loop
 }
 
 // ══════════════════════════════════════════════════════════════════════

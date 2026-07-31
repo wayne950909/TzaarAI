@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
 
 import config as _cfg
 from config import ASYNC_MCTS_CFG, MCTS_CFG
@@ -169,7 +170,7 @@ class CppSearchManager:
                 "SearchManager not initialized; call reset_trees() first"
             )
 
-        # workers 已被 reset_trees() 喚醒，開始搜尋
+                # workers 已被 reset_trees() 喚醒，開始搜尋
         # 主事件迴圈
         loop_iter = 0
         total_batches_processed = 0
@@ -178,13 +179,16 @@ class CppSearchManager:
         next_progress_log = 10
 
         while not self._manager.is_complete():
+            nvtx.range_push("wait_for_batch")
             packed = self._manager.get_ready_batch()
+            nvtx.range_pop()
 
             buffer_id = int(packed["buffer_id"])
             batch_size = int(packed["batch_size"])
 
             if batch_size == 0 or buffer_id < 0:
                 loop_iter += 1
+                nvtx.range_push("idle_sleep")
                 if loop_iter % 100 == 0:
                     completed_trees = self._manager.completed_tree_count()
                     swap_reason = self._manager.last_swap_reason()
@@ -194,19 +198,23 @@ class CppSearchManager:
                         f"last_swap={swap_reason}"
                     )
                 time.sleep(0.001)
+                nvtx.range_pop()
                 continue
 
             loop_iter += 1
             total_batches_processed += 1
             total_leaves_evaluated += batch_size
 
+            nvtx.range_push("cpu_transfer_and_prep")
             # ── 從 packed buffer 取出資料 ──────────────
             node_ids_np = np.asarray(packed["node_ids"], dtype=np.int32).copy()
             tree_ids_np = np.asarray(packed["tree_ids"], dtype=np.int32).copy()
             boards_np = np.asarray(packed["board_state_flat"], dtype=np.float32).copy()
             globals_np = np.asarray(packed["global_features"], dtype=np.float32).copy()
             masks_np = np.asarray(packed["legal_masks"], dtype=np.uint8).copy()
+            nvtx.range_pop()
 
+            nvtx.range_push("gpu_forward")
             # ── GPU forward ────────────────────────────
             board_batch = (
                 torch.from_numpy(boards_np.reshape(-1, 12, 9, 9))
@@ -223,6 +231,9 @@ class CppSearchManager:
                 values = policy.forward_value(hidden).squeeze(-1)
 
             masked_logits = logits.masked_fill(~mask_batch, -1e9)
+            nvtx.range_pop()  # gpu_forward
+
+            nvtx.range_push("gpu_to_cpu_transfer")
             priors_np = (
                 torch.softmax(masked_logits, dim=-1)
                 .to(device="cpu", dtype=torch.float32)
@@ -234,7 +245,9 @@ class CppSearchManager:
                 .contiguous()
                 .numpy()
             )
+            nvtx.range_pop()  # gpu_to_cpu_transfer
 
+            nvtx.range_push("submit_eval")
             # ── 回寫結果 ──────────────────────────────
             self._manager.submit_eval_batch(
                 int(buffer_id),
@@ -242,6 +255,7 @@ class CppSearchManager:
                 priors_np,
                 values_np,
             )
+            nvtx.range_pop()  # submit_eval
 
             if total_batches_processed >= next_progress_log:
                 completed_trees = self._manager.completed_tree_count()

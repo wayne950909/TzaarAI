@@ -10,6 +10,15 @@
 #include <fstream>
 #include <mutex>
 
+// ─── NVTX Profiling ────────────────────────────────────
+#ifdef TZAAR_USE_NVTX
+#include <nvtx3/nvToolsExt.h>
+#else
+// No-op stubs when NVTX not available
+#define nvtxRangePushA(x)
+#define nvtxRangePop()
+#endif
+
 // 共用的 debug log（與 search_manager.cpp 寫入同一個檔案）
 static std::mutex g_search_log_mtx;
 static void search_log(const char* fmt, ...) {
@@ -223,6 +232,8 @@ int SearchSession::simulate_into_buffers(int chunk,
                                          int tree_id) {
     if (chunk <= 0) return 0;
 
+  nvtxRangePushA("simulate_into_buffers");
+
   int simulated_count = 0;
   const int max_attempts = chunk + 256;  // 預留給終端節點的重試空間
 
@@ -241,6 +252,7 @@ int SearchSession::simulate_into_buffers(int chunk,
     }
 
     // ── Selection：從 root 開始，避開已有 pending leaf 的子樹 ──
+    nvtxRangePushA("selection");
     int node_idx = root_node_index_;
     std::vector<int> path;
     path.reserve(128);
@@ -251,8 +263,11 @@ int SearchSession::simulate_into_buffers(int chunk,
 
       // 情況 A：終端節點 → backup，不產 leaf，跳出 while 讓外層重試
       if (node.is_terminal) {
+        nvtxRangePop();  // selection
+        nvtxRangePushA("backup_terminal");
         const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
         backup(path, leaf_value, node.to_play);
+        nvtxRangePop();  // backup_terminal
         simulations_processed_ += 1;
         break;
       }
@@ -261,7 +276,10 @@ int SearchSession::simulate_into_buffers(int chunk,
       if (node.expanded) {
         if (node.children.empty()) {
           // 已展開但無合法子節點（可能因為遊戲結束判斷不同步）
+          nvtxRangePop();  // selection
+          nvtxRangePushA("backup_terminal");
           backup(path, 0.0f, node.to_play);
+          nvtxRangePop();  // backup_terminal
           simulations_processed_ += 1;
           break;
         }
@@ -292,10 +310,14 @@ int SearchSession::simulate_into_buffers(int chunk,
         continue;
       }
 
-      // 情況 C：未展開葉節點
+            // 情況 C：未展開葉節點
+
+      nvtxRangePop();  // selection
 
       // 首次訪問：重建狀態
+      nvtxRangePushA("state_reconstruction");
       PhaseGameState state = reconstruct_state_for_node(node_idx);
+      nvtxRangePop();  // state_reconstruction
       node.to_play = state.current_player();
       node.is_terminal = state.is_done();
       node.winner = state.winner();
@@ -305,13 +327,16 @@ int SearchSession::simulate_into_buffers(int chunk,
         node.expanded = true;
         node.legal_mask_ready = true;
         node.cached_legal_mask.assign(static_cast<std::size_t>(kActionCount), static_cast<std::uint8_t>(0));
+        nvtxRangePushA("backup_terminal");
         const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
         backup(path, leaf_value, node.to_play);
+        nvtxRangePop();  // backup_terminal
         simulations_processed_ += 1;
         break;
       }
 
       // ─── 將 CNN 特徵寫入外部 buffer ─────────────────
+      nvtxRangePushA("cnn_feature_build");
       {
         const auto counts = state.game().piece_counts();
         const std::size_t offset = static_cast<std::size_t>(simulated_count);
@@ -321,6 +346,7 @@ int SearchSession::simulate_into_buffers(int chunk,
             board_out + (offset * static_cast<std::size_t>(kBoardFlatSize)),
             global_out + (offset * static_cast<std::size_t>(kGlobalFeatureDim)));
       }
+      nvtxRangePop();  // cnn_feature_build
 
       // ─── 合法遮罩寫入外部 buffer ────────────────────
       const std::vector<bool> legal = state.legal_mask();
@@ -354,10 +380,12 @@ int SearchSession::simulate_into_buffers(int chunk,
       nodes_[node_idx].expanded = true;
 
       // ─── Virtual loss ──────────────────────────────
+      nvtxRangePushA("virtual_loss");
       for (const int idx : path) {
         nodes_[idx].visit_count += 1;
         nodes_[idx].value_sum -= 1.0f;
       }
+      nvtxRangePop();  // virtual_loss
 
       // ─── 記錄 pending ──────────────────────────────
       pending_node_order_.push_back(node_idx);
@@ -370,8 +398,9 @@ int SearchSession::simulate_into_buffers(int chunk,
       simulations_processed_ += 1;
       break;
     }
-  }
+    }
 
+  nvtxRangePop();  // simulate_into_buffers
   return simulated_count;
 }
 
@@ -684,9 +713,10 @@ void SearchSession::backup(const std::vector<int>& path, float leaf_value, int l
     MctsNode& node = nodes_[idx];
     const int node_player = node.has_player ? node.to_play : leaf_to_play;
     const float value_for_node = (node_player == leaf_to_play) ? leaf_value : -leaf_value;
-    node.value_sum += value_for_node;
+        node.value_sum += value_for_node;
     node.visit_count += 1;
   }
+  nvtxRangePop();  // backup
 }
 
 // 當一批 pending eval 都到齊後：
@@ -706,7 +736,7 @@ void SearchSession::process_pending_evals() {
 
     auto path_it = pending_paths_.find(node_idx);
     for (const auto& path : path_it->second) {
-      // 還原 virtual loss
+            // 還原 virtual loss
       for (const int idx : path) {
         nodes_[idx].visit_count -= 1;
         nodes_[idx].value_sum += 1.0f;
@@ -718,6 +748,7 @@ void SearchSession::process_pending_evals() {
   pending_node_order_.clear();
   pending_paths_.clear();
   pending_eval_map_.clear();
+  nvtxRangePop();  // process_pending_evals
 }
 
 void SearchSession::expand_node(int node_idx, const std::vector<float>& priors) {
