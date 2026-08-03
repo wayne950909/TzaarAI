@@ -111,13 +111,21 @@ class AsyncMCTSConfig:
     infer_max_wait_ms: float = 2.0
     # Python async worker request queue 的容量上限。
     request_queue_size: int = 30
-        # CPU worker 等待 GPU 回傳結果的超時秒數；
+    # CPU worker 等待 GPU 回傳結果的超時秒數；
     # 超時時目前訓練會在 selfplay engine 退回 sync-single。
     response_timeout_s: float = 30.0
 
     # 累積多少 leaf 才送 GPU 做一次 batch forward
     # 設為 0 則用 infer_max_batch 當 threshold
-    min_batch_for_swap: int = 100
+    min_batch_for_swap: int = 1
+
+    # ── Worker-Local Double Buffer 參數 ──────────────────────
+    # 每個 worker 每側邊緩衝區的最大容量 = 樹數量 × 此值
+    # （adjust.md：buffer 最大容量 = 樹數量 * 32，填不滿）
+    buffer_capacity_per_tree: int = 32
+    # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
+    # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
+    ready_flush_leaves: int = 32
 
 
 ASYNC_MCTS_CFG = AsyncMCTSConfig()

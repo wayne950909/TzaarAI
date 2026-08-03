@@ -79,8 +79,10 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("add_root_dirichlet_noise", &tz::SearchConfig::add_root_dirichlet_noise)
     .def_readwrite("root_dirichlet_eps",       &tz::SearchConfig::root_dirichlet_eps)
     .def_readwrite("root_dirichlet_alpha",     &tz::SearchConfig::root_dirichlet_alpha)
-    .def_readwrite("min_batch_for_swap",       &tz::SearchConfig::min_batch_for_swap)
-    .def_readwrite("flush_timeout_ms",         &tz::SearchConfig::flush_timeout_ms);
+        .def_readwrite("min_batch_for_swap",       &tz::SearchConfig::min_batch_for_swap)
+    .def_readwrite("flush_timeout_ms",         &tz::SearchConfig::flush_timeout_ms)
+    .def_readwrite("buffer_capacity_per_tree", &tz::SearchConfig::buffer_capacity_per_tree)
+    .def_readwrite("ready_flush_leaves",       &tz::SearchConfig::ready_flush_leaves);
 
   // ─── SearchResult ─────────────────────────────────────
   py::class_<tz::SearchResult>(m, "SearchResult")
@@ -239,13 +241,12 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("has_ready_batch", &tz::SearchManager::has_ready_batch)
 
     // get_ready_batch: 回傳 dict 包含 numpy views（零拷貝）
-    .def("get_ready_batch",
+        .def("get_ready_batch",
          [](tz::SearchManager& mgr) {
            auto packed = mgr.get_ready_batch();
            py::dict out;
 
-           if (packed.batch_size == 0 || packed.buffer_id < 0) {
-             out["buffer_id"] = py::int_(-1);
+           if (packed.batch_size == 0) {
              out["batch_size"] = py::int_(0);
              return out;
            }
@@ -259,7 +260,6 @@ PYBIND11_MODULE(tzaar_cpp, m) {
            py::capsule glob_cap (packed.global_features,   [](void*) {});
            py::capsule tree_cap (packed.tree_ids,          [](void*) {});
 
-           out["buffer_id"] = py::int_(packed.buffer_id);
            out["batch_size"] = py::int_(packed.batch_size);
            out["node_ids"] = py::array_t<int32_t>({bsz}, packed.node_ids, ids_cap);
            out["tree_ids"] = py::array_t<int32_t>({bsz}, packed.tree_ids, tree_cap);
@@ -271,13 +271,13 @@ PYBIND11_MODULE(tzaar_cpp, m) {
                packed.board_state_flat, board_cap);
            out["global_features"] = py::array_t<float>(
                {bsz, static_cast<py::ssize_t>(tz::kGlobalFeatureDim)},
-               packed.global_features, glob_cap);
+                              packed.global_features, glob_cap);
            return out;
          })
 
     // submit_eval_batch
     .def("submit_eval_batch",
-         [](tz::SearchManager& mgr, int buffer_id,
+         [](tz::SearchManager& mgr,
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_ids,
             py::array_t<float, py::array::c_style | py::array::forcecast> priors,
             py::array_t<float, py::array::c_style | py::array::forcecast> values) {
@@ -296,14 +296,13 @@ PYBIND11_MODULE(tzaar_cpp, m) {
              throw std::invalid_argument("priors second dim must equal N_ACTIONS");
 
            mgr.submit_eval_batch(
-               buffer_id,
                static_cast<const int32_t*>(node_ids.request().ptr),
                static_cast<const float*>(priors.request().ptr),
                static_cast<const float*>(values.request().ptr),
                static_cast<int>(bsz));
          },
-         py::arg("buffer_id"), py::arg("node_ids"),
-         py::arg("priors"), py::arg("values"))
+         py::arg("node_ids"), py::arg("priors"),
+         py::arg("values"))
 
     .def("is_complete", &tz::SearchManager::is_complete)
     .def("completed_tree_count", &tz::SearchManager::completed_tree_count)

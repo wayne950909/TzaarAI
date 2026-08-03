@@ -17,6 +17,12 @@ struct SearchConfig {
   float root_dirichlet_alpha = 0.05f;
   int min_batch_for_swap = 0;    // 最小累積 leaf 數才送 GPU (0=用 max_batch)
   int flush_timeout_ms = 0;      // 強制送 GPU 的 timeout (0=不使用)
+
+  // Worker-Local Double Buffer 參數（對應 adjust.md）
+  // buffer 最大容量 = tree_count * buffer_capacity_per_tree（填不滿）
+  int buffer_capacity_per_tree = 32;
+  // 單側尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數（≠容量）
+  int ready_flush_leaves = 32;
 };
 
 struct SearchResult {
@@ -38,4 +44,5 @@ struct SearchResult {
 }  // namespace tzaar
 
 #endif  // TZAAR_MCTS_CONFIG_H_
+
 

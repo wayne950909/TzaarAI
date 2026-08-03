@@ -97,6 +97,9 @@ class CppSearchManager:
         cfg.root_dirichlet_alpha = float(MCTS_CFG.root_dirichlet_alpha)
         cfg.min_batch_for_swap = int(ASYNC_MCTS_CFG.min_batch_for_swap)
         cfg.flush_timeout_ms = int(ASYNC_MCTS_CFG.infer_max_wait_ms)
+        # adjust.md：緩衝區容量 = 樹數量 * buffer_capacity_per_tree，與資料量觸發值。
+        cfg.buffer_capacity_per_tree = int(ASYNC_MCTS_CFG.buffer_capacity_per_tree)
+        cfg.ready_flush_leaves = int(ASYNC_MCTS_CFG.ready_flush_leaves)
         return cfg
 
     def reset_trees(
@@ -183,10 +186,9 @@ class CppSearchManager:
             packed = self._manager.get_ready_batch()
             nvtx.range_pop()
 
-            buffer_id = int(packed["buffer_id"])
             batch_size = int(packed["batch_size"])
 
-            if batch_size == 0 or buffer_id < 0:
+            if batch_size == 0:
                 loop_iter += 1
                 nvtx.range_push("idle_sleep")
                 if loop_iter % 100 == 0:
@@ -250,7 +252,6 @@ class CppSearchManager:
             nvtx.range_push("submit_eval")
             # ── 回寫結果 ──────────────────────────────
             self._manager.submit_eval_batch(
-                int(buffer_id),
                 node_ids_np,
                 priors_np,
                 values_np,
