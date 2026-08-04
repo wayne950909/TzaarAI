@@ -27,6 +27,16 @@
 #define nvtxRangePop()
 #endif
 
+// ─── C++ Debug Log ─────────────────────────────────────
+// 具備「關閉即零成本」的可開關 logger（debug_log.h 提供）。
+// 關閉時呼叫端只做一次 relaxed atomic load（likely_disabled）即跳過，
+// 不格式化、不鎖、不寫檔，因此完全不打擾效能。
+#define TZAAR_DEBUG_LOG(...)                                     \
+  do {                                                           \
+    if (!DebugLogger::instance().likely_disabled())              \
+      DebugLogger::instance().log(__VA_ARGS__);                  \
+  } while (0)
+
 namespace tzaar {
 
 // ══════════════════════════════════════════════════════════════════════
@@ -146,6 +156,12 @@ void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
   config_ = std::move(config);
   tree_count_ = static_cast<int>(root_states.size());
 
+  // 依 config 設定 C++ debug logger 開關（config.py → SearchConfig → 此處）。
+  DebugLogger::instance().set_enabled(config_.debug_log_enabled);
+  if (config_.debug_log_enabled && !config_.debug_log_path.empty()) {
+    DebugLogger::instance().set_path(config_.debug_log_path);
+  }
+
   if (tree_count_ <= 0)
     throw std::invalid_argument("root_states must not be empty");
 
@@ -192,6 +208,9 @@ void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
   for (int i = 0; i < tree_count_; ++i) {
     tree_queue_.push(i);
   }
+  // 喚醒所有因佇列空而等待的 worker。尤其 tree_count < num_threads 時，
+  // push() 的 notify_one 喚不滿所有 worker，必須用 wake_all() 確保全部開工。
+  tree_queue_.wake_all();
 }
 
 void SearchManager::shutdown() {
@@ -234,51 +253,22 @@ void SearchManager::join_workers() {
 // 4. 若樹已完成則標記；全完成則將最後的 buffer 送出並結束。
 void SearchManager::worker_loop(int thread_id) {
   WorkerBuffers& wb = *worker_buffers_[static_cast<std::size_t>(thread_id)];
+
+  // Worker 常駐：永不因「本輪搜尋完成」而退出執行緒，只在 stop_（shutdown）時退出。
+  //「搜尋完成」由主執行緒 get_ready_batch() 依 completed_count_/tree_count_ 判定，
+  // worker 不需自行 return 回報完成。所有「拿不到樹」的情況統一由
+  // wait_for_simulable_tree() 阻塞等待，涵蓋：初始化空佇列 / 暫時空佇列 / 全部完成 / shutdown。
   while (!stop_) {
-    // ── 嘗試取得一棵可模擬樹 ──────────────────────────────
-    int tree_id = -1;
-    bool got_simulable = false;
-    while (tree_queue_.try_pop(tree_id)) {
-      SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
-
-      // 還在等 GPU：無法模擬。此樹由 result_handler 處理完後 reenqueue。
-      if (tree.session->has_pending_leaves()) continue;
-
-      // 已完整模擬：標記完成後試下一棵。
-      if (tree.session->is_complete()) {
-        complete_tree(tree);
-        if (is_complete()) {
-          // 全部完成 → 把殘留 active buffer 設 ready 送出，結束。
-          seal_ready(wb, true);
-          return;
-        }
-        continue;
-      }
-
-      got_simulable = true;
-      break;
-    }
-
-    if (!got_simulable) {
-      // 無法從佇列獲得可模擬樹（所有未完成樹都在等 GPU / 已完成）。
-      // adjust.md：執行緒無法從佇列獲得樹時，將正在寫入的 buffer 設為 ready。
-      seal_ready(wb, true);
-      if (is_complete()) return;
-
-      // 睡眠：等 result_handler 處理完一批後 reenqueue 喚醒。
-      int next;
-      if (tree_queue_.wait_and_pop(next)) {
-        continue;  // 有新樹可模擬（或該樹由下一輪處理）
-      }
-      return;  // stop
-    }
+    // 等到一棵「可模擬」的樹；回傳 -1 表示 stop（shutdown）。
+    const int tree_id = wait_for_simulable_tree(wb, thread_id);
+    if (tree_id < 0) break;
 
     // ── 模擬並寫入 active buffer ──────────────────────────
     simulate_tree_into_local(tree_id, wb);
 
     // ── 依 adjust.md 檢查是否設 active buffer 為 ready ──
     // 到達「一定資料量」且另一側不是 ready 時才會觸發（seal_ready 內部檢查）。
-    bool sealed = seal_ready(wb, false);
+    bool sealed = seal_ready(wb, thread_id, false);
 
     // adjust.md 狀況 1：若另一側 ready 且本側已達資料量，則不能設 ready，
     // 但也不能無止盡填下去。此時等待另一側被主執行緒收走（→狀況 2），
@@ -287,19 +277,85 @@ void SearchManager::worker_loop(int thread_id) {
         wb.bufs[wb.active_idx].count >= ready_flush_leaves_ &&
         wb.bufs[1 - wb.active_idx].is_ready.load(std::memory_order_acquire)) {
       wait_for_other_collected(wb, 1 - wb.active_idx);  // 等另一側被收走（true→false）
-      seal_ready(wb, false);
+      seal_ready(wb, thread_id, false);
     }
 
-    // ── 處理樹的完成狀態 ─────────────────────────────────
+    // ── 若這棵樹已完成則標記（不退出，回迴圈頂點再等下一棵）──
     SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
     if (tree.session->is_complete()) {
       complete_tree(tree);
-      if (is_complete()) {
-        seal_ready(wb, true);
-        return;
-      }
     }
   }
+}
+
+// ── 等待並取得一棵「可模擬」的樹 ──────────────────────────────
+// 與原本 worker_loop 的 try_pop 掃描語意一致：
+//   - 拿到「等 GPU」的樹 → 由 result_handler 之後 reenqueue，故忽略（繼續 pop）下一個
+//   - 拿到「已完成」的樹 → complete_tree 標記後繼續 pop 下一個
+//   - 拿到「可模擬」的樹 → 回傳其 id
+// 掃描不到可模擬樹 → 依 adjust.md 先把正在寫入的 buffer 設為 ready，
+// 再阻塞等待佇列。等待涵蓋：
+//   - 搜尋進行中：等 result_handler reenqueue 喚醒
+//   - reset 開播新搜尋：等 reset push() + wake_all() 喚醒
+//   - shutdown：notify_all() 設 stop_ → wait_and_pop 回傳 false → 回傳 -1
+int SearchManager::wait_for_simulable_tree(WorkerBuffers& wb, int thread_id) {
+  int tree_id = -1;
+
+  // 一次性掃描佇列，撈出可模擬樹（統一 helper 判定）
+  while (tree_queue_.try_pop(tree_id)) {
+    if (classify_popped_tree(tree_id, thread_id)) {
+      return tree_id;  // 可模擬
+    }
+  }
+
+  // 掃描不到可模擬樹 → 依 adjust.md：執行緒無法從佇列獲得樹時，
+  // 將正在寫入的 buffer 設為 ready。
+  seal_ready(wb, thread_id, true);
+
+  // 阻塞等佇列。
+  int next = -1;
+  if (!tree_queue_.wait_and_pop(next)) {
+    TZAAR_DEBUG_LOG("[worker-%d] wait_and_pop returned stop -> exiting",
+                    thread_id);
+    return -1;  // stop（shutdown）
+  }
+  // wait_and_pop 取出的樹同樣走統一 helper。
+  // 注意：不可在此直接 return wait_for_simulable_tree(...)，
+  // 否則 next（已彈出的一棵樹）會被丟棄而永不模擬。
+  if (classify_popped_tree(next, thread_id)) {
+    return next;  // 可模擬，直接回傳
+  }
+  // 取到非可模擬（等 GPU / 已完成）的樹 → 重新過濾等待。
+  // 這棵樹稍後由 result_handler 的 reenqueue_tree_if_needed 重新入隊。
+  return wait_for_simulable_tree(wb, thread_id);
+}
+
+// ── 取出樹後的統一判定 ──────────────────────────────────────
+// try_pop 掃描路徑與 wait_and_pop 路徑共用同一套「取出→判定→過濾」邏輯。
+// 回傳 true = 可模擬（呼叫端直接以該 tree_id 回傳模擬）；
+// 回傳 false = 已處理完畢（等 GPU / 已完成），呼叫端繼續尋找下一棵，
+//              該樹稍後由 result_handler 重新入隊。
+bool SearchManager::classify_popped_tree(int tree_id, int thread_id) {
+  SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
+
+  // 還在等 GPU：無法模擬。此樹由 result_handler 處理完後 reenqueue。
+  if (tree.session->has_pending_leaves()) {
+    TZAAR_DEBUG_LOG("[worker-%d] popped tree %d but SKIPPED (pending_gpu)",
+                    thread_id, tree_id);
+    return false;
+  }
+
+  // 已完整模擬：標記完成後試下一棵。
+  if (tree.session->is_complete()) {
+    complete_tree(tree);
+    TZAAR_DEBUG_LOG("[worker-%d] popped tree %d but COMPLETE",
+                    thread_id, tree_id);
+    return false;
+  }
+
+  TZAAR_DEBUG_LOG("[worker-%d] popped tree %d -> SIMULATE",
+                  thread_id, tree_id);
+  return true;  // 可模擬
 }
 
 // 若樹未完成且無 pending leaves，重新放入佇列
@@ -314,7 +370,10 @@ void SearchManager::complete_tree(SearchTree& tree) {
   if (tree.completed) return;  // 防止重複標記
 
   tree.completed = true;
-  completed_count_.fetch_add(1, std::memory_order_release);
+  const int completed = completed_count_.fetch_add(1, std::memory_order_release) + 1;
+
+  TZAAR_DEBUG_LOG("[main] tree %d COMPLETE (%d/%d)",
+                  tree.tree_id, completed, tree_count_);
 
   if (is_complete()) {
     {
@@ -398,7 +457,7 @@ void SearchManager::simulate_tree_into_local(int tree_id, WorkerBuffers& wb) {
 //
 // 回傳 true 表示成功封存並 flip；false 表示不符合條件（未封存）。
 
-bool SearchManager::seal_ready(WorkerBuffers& wb, bool force) {
+bool SearchManager::seal_ready(WorkerBuffers& wb, int thread_id, bool force) {
   LocalEvalBuffer& active = wb.bufs[wb.active_idx];
   if (active.count <= 0) return false;   // 無資料可送出
   if (active.is_ready.load(std::memory_order_acquire)) return false;
@@ -416,6 +475,8 @@ bool SearchManager::seal_ready(WorkerBuffers& wb, bool force) {
 
   // 設 ready（false→true，release 語意，確保先前寫入可見）
   active.is_ready.store(true, std::memory_order_release);
+  TZAAR_DEBUG_LOG("[worker-%d] buffer READY count=%d force=%d active_idx_before=%d",
+                  thread_id, active.count, force ? 1 : 0, wb.active_idx);
 
   // flip 到另一側
   wb.active_idx = 1 - wb.active_idx;
@@ -553,6 +614,11 @@ void SearchManager::result_handler_loop() {
     pending_results_.clear();
     lock.unlock();
 
+    int batch_leaves = 0;
+    for (const auto& res : results_to_process) {
+      batch_leaves += res.batch_size;
+    }
+
     for (auto& res : results_to_process) {
       for (int i = 0; i < res.batch_size; ++i) {
         const int tree_id = res.tree_ids[static_cast<std::size_t>(i)];
@@ -583,6 +649,9 @@ void SearchManager::result_handler_loop() {
         }
       }
     }
+
+    TZAAR_DEBUG_LOG("[handler] result_handler processed batch leaves=%d",
+                    batch_leaves);
 
     // 記憶體屏障：確保寫入對 worker 可見
     std::atomic_thread_fence(std::memory_order_release);
@@ -681,6 +750,9 @@ void SearchManager::aggregate_ready() {
       buf.is_ready.store(false, std::memory_order_release);
     }
   }
+
+  TZAAR_DEBUG_LOG("[main] get_ready_batch aggregated leaves=%d (batch_size)",
+                  agg_buf_.count);
 
   {
     std::lock_guard<std::mutex> lock(swap_reason_mtx_);

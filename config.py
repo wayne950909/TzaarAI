@@ -121,11 +121,19 @@ class AsyncMCTSConfig:
 
     # ── Worker-Local Double Buffer 參數 ──────────────────────
     # 每個 worker 每側邊緩衝區的最大容量 = 樹數量 × 此值
-    # （adjust.md：buffer 最大容量 = 樹數量 * 32，填不滿）
+        # （adjust.md：buffer 最大容量 = 樹數量 * 32，填不滿）
     buffer_capacity_per_tree: int = 32
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
-    ready_flush_leaves: int = 32
+    ready_flush_leaves: int = 16
+
+    # ── C++ SearchManager 內部 Debug Log ──────────────────
+    # 在 config.py 設定，經 cpp_manager._build_config 傳入 C++ SearchManager。
+    # 關閉時 C++ 端只做一次 relaxed atomic 檢查便跳過，完全不打擾效能。
+    # 開啟時會把「worker buffer ready / 主執行緒取資料 / result_handler 處理」
+    # 三類事件寫入 debug_log_path 指定的文字檔。
+    debug_log_enabled: bool = False
+    debug_log_path: str = "logs/cpp_debug.log"
 
 
 ASYNC_MCTS_CFG = AsyncMCTSConfig()

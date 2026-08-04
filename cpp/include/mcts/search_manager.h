@@ -7,6 +7,7 @@
 #include "mcts/search.h"
 #include "features/cnn_builder.h"
 #include "mcts/concurrent_queue.h"
+#include "mcts/debug_log.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -130,8 +131,10 @@ class SearchManager {
 
   void worker_loop(int thread_id);
   void result_handler_loop();
+  int wait_for_simulable_tree(WorkerBuffers& wb, int thread_id); // 等待並取得一棵「可模擬」樹 id；stop 時回傳 -1
+  bool classify_popped_tree(int tree_id, int thread_id); // 取出樹後判定：true=可模擬（回傳模擬）；false=已處理（等 GPU / 已完成）
   void simulate_tree_into_local(int tree_id, WorkerBuffers& wb);
-  bool seal_ready(WorkerBuffers& wb, bool force = false); // 依 adjust.md：設 active ready 並 flip；回傳是否成功封存
+  bool seal_ready(WorkerBuffers& wb, int thread_id, bool force = false); // 依 adjust.md：設 active ready 並 flip；回傳是否成功封存
   void wait_for_other_collected(WorkerBuffers& wb, int which); // 等待指定側 buffer 被主執行緒收走（is_ready→false）
   void init_buffers();
   void resize_buffer(LocalEvalBuffer& buf, int cap);  // 依指定容量重設單一 buffer

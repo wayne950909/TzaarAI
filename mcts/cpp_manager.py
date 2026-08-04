@@ -100,6 +100,9 @@ class CppSearchManager:
         # adjust.md：緩衝區容量 = 樹數量 * buffer_capacity_per_tree，與資料量觸發值。
         cfg.buffer_capacity_per_tree = int(ASYNC_MCTS_CFG.buffer_capacity_per_tree)
         cfg.ready_flush_leaves = int(ASYNC_MCTS_CFG.ready_flush_leaves)
+        # C++ SearchManager 內部 debug log 開關（config.py → SearchConfig）
+        cfg.debug_log_enabled = bool(ASYNC_MCTS_CFG.debug_log_enabled)
+        cfg.debug_log_path = str(ASYNC_MCTS_CFG.debug_log_path)
         return cfg
 
     def reset_trees(
@@ -173,7 +176,7 @@ class CppSearchManager:
                 "SearchManager not initialized; call reset_trees() first"
             )
 
-                # workers 已被 reset_trees() 喚醒，開始搜尋
+        # workers 已被 reset_trees() 喚醒，開始搜尋
         # 主事件迴圈
         loop_iter = 0
         total_batches_processed = 0

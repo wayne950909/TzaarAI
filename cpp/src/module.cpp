@@ -81,8 +81,10 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("root_dirichlet_alpha",     &tz::SearchConfig::root_dirichlet_alpha)
         .def_readwrite("min_batch_for_swap",       &tz::SearchConfig::min_batch_for_swap)
     .def_readwrite("flush_timeout_ms",         &tz::SearchConfig::flush_timeout_ms)
-    .def_readwrite("buffer_capacity_per_tree", &tz::SearchConfig::buffer_capacity_per_tree)
-    .def_readwrite("ready_flush_leaves",       &tz::SearchConfig::ready_flush_leaves);
+        .def_readwrite("buffer_capacity_per_tree", &tz::SearchConfig::buffer_capacity_per_tree)
+    .def_readwrite("ready_flush_leaves",       &tz::SearchConfig::ready_flush_leaves)
+    .def_readwrite("debug_log_enabled",        &tz::SearchConfig::debug_log_enabled)
+    .def_readwrite("debug_log_path",           &tz::SearchConfig::debug_log_path);
 
   // ─── SearchResult ─────────────────────────────────────
   py::class_<tz::SearchResult>(m, "SearchResult")

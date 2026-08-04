@@ -94,6 +94,13 @@ class ConcurrentQueue {
     stop_ = false;
   }
 
+  // 喚醒所有等待中的 wait_and_pop，但「不」設 stop。
+  // 用於 reset 開播新搜尋時，喚醒所有因佇列空而等待的 worker
+  //（fallback 給 push() 共用 notify_one 會喚醒不足的情形）。
+  void wake_all() {
+    cv_.notify_all();
+  }
+
  private:
   mutable std::mutex mtx_;
   std::condition_variable cv_;
@@ -104,3 +111,4 @@ class ConcurrentQueue {
 }  // namespace tzaar
 
 #endif  // TZAAR_MCTS_CONCURRENT_QUEUE_H_
+
