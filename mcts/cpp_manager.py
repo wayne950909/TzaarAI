@@ -287,7 +287,7 @@ class CppSearchManager:
             f"last_swap={swap_reason}"
         )
 
-        # ── 所有樹已完成，取回結果 ─────────────────────
+                        # ── 所有樹已完成，取回結果 ─────────────────────
         # workers 在空的佇列上 wait，等著下一次 reset
         t0 = time.perf_counter()
         raw_results = self._manager.finish_all()
@@ -330,7 +330,7 @@ class CppSearchManager:
                     "action_dim": action_dim,
                     "legal_mask": legal_mask.to(device="cpu"),
                     "visits": visits,
-                    "replay_board": replay_board,
+                                        "replay_board": replay_board,
                     "replay_global": replay_global,
                     "root_value": result.root_value,
                     "root_player": result.root_player,

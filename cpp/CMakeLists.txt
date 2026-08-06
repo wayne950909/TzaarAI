@@ -19,13 +19,13 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/../nvtx_include/nvtx3/nvToolsExt.h")
   message(STATUS "NVTX found (local): ${NVTX_INCLUDE_DIR}")
 elseif(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/include/nvtx3/nvToolsExt.h")
   # CUDA toolkit 中的 nvtx3
-    set(NVTX_INCLUDE_DIR "$ENV{CUDA_PATH}/include")
+  set(NVTX_INCLUDE_DIR "$ENV{CUDA_PATH}/include")
   message(STATUS "NVTX found (CUDA): ${NVTX_INCLUDE_DIR}")
 elseif(EXISTS "/usr/local/cuda/include/nvtx3/nvToolsExt.h")
   # Linux CUDA
-    set(NVTX_INCLUDE_DIR "/usr/local/cuda/include")
+  set(NVTX_INCLUDE_DIR "/usr/local/cuda/include")
   message(STATUS "NVTX found (CUDA Linux): ${NVTX_INCLUDE_DIR}")
-  endif()
+endif()
 
 if(NVTX_INCLUDE_DIR)
   include_directories(${NVTX_INCLUDE_DIR})
@@ -41,9 +41,9 @@ set(TZAAR_SOURCES
     src/core/board.cpp
     src/core/game.cpp
     src/core/action.cpp
-    src/state/phase_state.cpp
+        src/state/phase_state.cpp
     src/features/cnn_builder.cpp
-        src/mcts/search.cpp
+    src/mcts/search.cpp
     src/mcts/search_manager.cpp
     src/mcts/bench.cpp
 )

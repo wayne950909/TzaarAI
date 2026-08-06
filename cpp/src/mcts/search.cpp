@@ -17,6 +17,28 @@
 #endif
 
 namespace tzaar {
+namespace {
+
+// RAII 輔助：進入區塊時 push NVTX range，離開區塊（含 early-exit/return）時自動 pop。
+// 用於 simulate_into_buffers 的五階段量測，確保 push/pop 一定成對。
+struct NvtxRangeGuard {
+  explicit NvtxRangeGuard(const char* name) {
+#ifdef TZAAR_USE_NVTX
+    nvtxRangePushA(name);
+#else
+    (void)name;
+#endif
+  }
+  ~NvtxRangeGuard() {
+#ifdef TZAAR_USE_NVTX
+    nvtxRangePop();
+#endif
+  }
+  NvtxRangeGuard(const NvtxRangeGuard&) = delete;
+  NvtxRangeGuard& operator=(const NvtxRangeGuard&) = delete;
+};
+
+}  // namespace
 
 // ══════════════════════════════════════════════════════════════════════
 // 建構子
@@ -208,40 +230,40 @@ LeafSnapshot SearchSession::root_snapshot() {
 //   - 終端節點消耗模擬次數但不產出 leaf（backup 已內處理）
 //   - 所有路徑都被 pending leaf 阻塞時（stall）提前結束
 int SearchSession::simulate_into_buffers(int chunk,
-                                         float* board_out,
+                                                                                  float* board_out,
                                          float* global_out,
                                          uint8_t* mask_out,
                                          int32_t* node_ids_out,
                                          int32_t* tree_ids_out,
                                          int tree_id) {
-    if (chunk <= 0) return 0;
+  if (chunk <= 0) return 0;
 
-  nvtxRangePushA("simulate_into_buffers");
+  // 整個函式層級的 NVTX range（RAII）。早期 return（stall）時由析構自動 pop。
+  NvtxRangeGuard sim_guard("simulate_into_buffers");
 
   int simulated_count = 0;
   const int max_attempts = chunk + 256;  // 預留給終端節點的重試空間
 
-    for (int attempts = 0; attempts < max_attempts; ++attempts) {
-        if (simulated_count >= chunk) break;
+  for (int attempts = 0; attempts < max_attempts; ++attempts) {
+    if (simulated_count >= chunk) break;
     if (is_complete()) break;
 
-    // ── Selection：從 root 開始，避開已有 pending leaf 的子樹 ──
-    nvtxRangePushA("selection");
+    // ── 段1：樹狀走訪與選擇（walk + 簿記，範圍涵蓋整個迭代）──
+    // RAII guard 確保即使 terminal / stall / early-exit 也會成對 pop。
+    NvtxRangeGuard stage1("sib_stage1_selection");
+
     int node_idx = root_node_index_;
     std::vector<int> path;
     path.reserve(128);
-    path.push_back(node_idx);
+        path.push_back(node_idx);
 
     while (true) {
       MctsNode& node = nodes_[node_idx];
 
       // 情況 A：終端節點 → backup，不產 leaf，跳出 while 讓外層重試
       if (node.is_terminal) {
-        nvtxRangePop();  // selection
-        nvtxRangePushA("backup_terminal");
         const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
         backup(path, leaf_value, node.to_play);
-        nvtxRangePop();  // backup_terminal
         simulations_processed_ += 1;
         break;
       }
@@ -250,52 +272,48 @@ int SearchSession::simulate_into_buffers(int chunk,
       if (node.expanded) {
         if (node.children.empty()) {
           // 已展開但無合法子節點（可能因為遊戲結束判斷不同步）
-          nvtxRangePop();  // selection
-          nvtxRangePushA("backup_terminal");
           backup(path, 0.0f, node.to_play);
-          nvtxRangePop();  // backup_terminal
           simulations_processed_ += 1;
           break;
         }
-                                const int action = select_child_action(node_idx);
+        const int action = select_child_action(node_idx);
         // select_child_action 回傳 -1 代表所有子節點都有 pending leaf
         if (action < 0) {
           // 整棵樹已 stalled → 無法再產生新 leaf，回傳目前已累積的
-          return simulated_count;
+          return simulated_count;  // sib_stage1_selection 由 guard 析構時 pop
         }
         node_idx = node.children.at(action);
         path.push_back(node_idx);
-        continue;
+        continue;  // 仍在走訪，段1持續計時
       }
 
-            // 情況 C：未展開葉節點
+                              // 情況 C：未展開葉節點
+      // 走訪完成，段1到此（仍在外層 sib_stage1_selection 範圍內）
 
-      nvtxRangePop();  // selection
-
-      // 首次訪問：重建狀態
-      nvtxRangePushA("state_reconstruction");
-      PhaseGameState state = reconstruct_state_for_node(node_idx);
-      nvtxRangePop();  // state_reconstruction
-      node.to_play = state.current_player();
-      node.is_terminal = state.is_done();
-      node.winner = state.winner();
-      node.has_player = !node.is_terminal;
-
-      if (node.is_terminal) {
-        node.expanded = true;
-        node.legal_mask_ready = true;
-        node.cached_legal_mask.assign(static_cast<std::size_t>(kActionCount), static_cast<std::uint8_t>(0));
-        nvtxRangePushA("backup_terminal");
-        const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
-        backup(path, leaf_value, node.to_play);
-        nvtxRangePop();  // backup_terminal
-        simulations_processed_ += 1;
-        break;
-      }
-
-      // ─── 將 CNN 特徵寫入外部 buffer ─────────────────
-      nvtxRangePushA("cnn_feature_build");
+      // ── 段3：遊戲狀態複製與動作套用 ──────────────
+      PhaseGameState state;
       {
+        NvtxRangeGuard stage3("sib_stage3_state_clone");
+        state = reconstruct_state_for_node(node_idx);
+        node.to_play = state.current_player();
+        node.is_terminal = state.is_done();
+        node.winner = state.winner();
+        node.has_player = !node.is_terminal;
+
+        if (node.is_terminal) {
+          node.expanded = true;
+          node.legal_mask_ready = true;
+          node.cached_legal_mask.assign(static_cast<std::size_t>(kActionCount), static_cast<std::uint8_t>(0));
+          const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
+          backup(path, leaf_value, node.to_play);
+          simulations_processed_ += 1;
+          break;  // 跳出 while，外層 sib_stage1_selection 在此迭代結束時一併 pop
+        }
+      }  // sib_stage3_state_clone pop
+
+      // ── 段4：特徵序列化與寫入緩衝區（build_cnn_features_into）──
+      {
+        NvtxRangeGuard stage4("sib_stage4_feature_write");
         const auto counts = state.game().piece_counts();
         const std::size_t offset = static_cast<std::size_t>(simulated_count);
         build_cnn_features_into(
@@ -303,62 +321,58 @@ int SearchSession::simulate_into_buffers(int chunk,
             state.phase(), counts,
             board_out + (offset * static_cast<std::size_t>(kBoardFlatSize)),
             global_out + (offset * static_cast<std::size_t>(kGlobalFeatureDim)));
-      }
-      nvtxRangePop();  // cnn_feature_build
+      }  // sib_stage4_feature_write pop
 
-      // ─── 合法遮罩寫入外部 buffer ────────────────────
+      // ── 段5：合法動作遮罩生成與寫入（state.legal_mask()）──
       const std::vector<bool> legal = state.legal_mask();
-      node.cached_legal_mask.resize(static_cast<std::size_t>(kActionCount), 0);
       {
-        const std::size_t offset = static_cast<std::size_t>(simulated_count) * static_cast<std::size_t>(kActionCount);
+        NvtxRangeGuard stage5("sib_stage5_legal_mask");
+        node.cached_legal_mask.resize(static_cast<std::size_t>(kActionCount), 0);
+        const std::size_t mask_offset = static_cast<std::size_t>(simulated_count) * static_cast<std::size_t>(kActionCount);
         for (std::size_t j = 0; j < legal.size() && j < static_cast<std::size_t>(kActionCount); ++j) {
           const uint8_t v = legal[j] ? static_cast<std::uint8_t>(1) : static_cast<std::uint8_t>(0);
           node.cached_legal_mask[j] = v;
-          mask_out[offset + j] = v;
+          mask_out[mask_offset + j] = v;
         }
-      }
-      node.legal_mask_ready = true;
+        node.legal_mask_ready = true;
+      }  // sib_stage5_legal_mask pop
 
-      // ─── 建立子節點樁 ──────────────────────────────
+      // ── 段2：節點記憶體配置與物件建構 ──────────────
       // 先保留空間，避免 push_back 時 vector reallocation 使 reference 失效
-      nodes_.reserve(nodes_.size() + static_cast<std::size_t>(kActionCount));
-      for (int action = 0; action < kActionCount; ++action) {
-        if (!legal[static_cast<std::size_t>(action)]) continue;
-        const int new_idx = static_cast<int>(nodes_.size());
-        MctsNode child;
-        child.prior = 0.0f;
-        child.parent_idx = node_idx;
-        child.action_from_parent = action;
-        nodes_.push_back(std::move(child));
-        nodes_[node_idx].children[action] = new_idx;
-      }
+      {
+        NvtxRangeGuard stage2("sib_stage2_node_alloc");
+        nodes_.reserve(nodes_.size() + static_cast<std::size_t>(kActionCount));
+        for (int action = 0; action < kActionCount; ++action) {
+          if (!legal[static_cast<std::size_t>(action)]) continue;
+          const int new_idx = static_cast<int>(nodes_.size());
+          MctsNode child;
+          child.prior = 0.0f;
+          child.parent_idx = node_idx;
+          child.action_from_parent = action;
+          nodes_.push_back(std::move(child));
+          nodes_[node_idx].children[action] = new_idx;
+        }
+        nodes_[node_idx].expanded = true;
+      }  // sib_stage2_node_alloc pop
 
-      // ─── 標記節點已展開（關鍵！否則下次又會走到相同節點）──
-      // 用直接索引存取，避免 reference 可能失效的風險
-      nodes_[node_idx].expanded = true;
-
-      // ─── Virtual loss ──────────────────────────────
-      nvtxRangePushA("virtual_loss");
+      // ── Virtual loss + 記錄 pending（併入段1 sib_stage1_selection）──
       for (const int idx : path) {
         nodes_[idx].visit_count += 1;
         nodes_[idx].value_sum -= 1.0f;
       }
-      nvtxRangePop();  // virtual_loss
-
-      // ─── 記錄 pending ──────────────────────────────
       pending_node_order_.push_back(node_idx);
       node_ids_out[simulated_count] = static_cast<int32_t>(node_idx + 1);
-      if (tree_ids_out) {
+            if (tree_ids_out) {
         tree_ids_out[simulated_count] = static_cast<int32_t>(tree_id);
       }
       pending_paths_[node_idx].push_back(path);
+
       simulated_count++;
       simulations_processed_ += 1;
       break;
-    }
-    }
+    }  // 迭代結束，sib_stage1_selection 由 guard 析構時 pop
+  }
 
-  nvtxRangePop();  // simulate_into_buffers
   return simulated_count;
 }
 
@@ -579,14 +593,14 @@ void SearchSession::simulate_chunk(int chunk) {
       node.cached_legal_mask.resize(static_cast<std::size_t>(kActionCount), 0);
       const std::size_t offset_mask = batch_legal_mask_.size();
       batch_legal_mask_.resize(offset_mask + static_cast<std::size_t>(kActionCount), 0);
-      for (std::size_t j = 0; j < legal.size() && j < static_cast<std::size_t>(kActionCount); ++j) {
+            for (std::size_t j = 0; j < legal.size() && j < static_cast<std::size_t>(kActionCount); ++j) {
         const uint8_t v = legal[j] ? static_cast<std::uint8_t>(1) : static_cast<std::uint8_t>(0);
         node.cached_legal_mask[j] = v;
         batch_legal_mask_[offset_mask + j] = v;
       }
       node.legal_mask_ready = true;
 
-            // 建立子節點樁（僅記錄 parent+action，不 clone 狀態）
+      // 建立子節點樁（僅記錄 parent+action，不 clone 狀態）
       nodes_.reserve(nodes_.size() + static_cast<std::size_t>(kActionCount));
       for (int action = 0; action < kActionCount; ++action) {
         if (!legal[static_cast<std::size_t>(action)]) continue;
@@ -671,10 +685,9 @@ void SearchSession::backup(const std::vector<int>& path, float leaf_value, int l
     MctsNode& node = nodes_[idx];
     const int node_player = node.has_player ? node.to_play : leaf_to_play;
     const float value_for_node = (node_player == leaf_to_play) ? leaf_value : -leaf_value;
-        node.value_sum += value_for_node;
+    node.value_sum += value_for_node;
     node.visit_count += 1;
   }
-  nvtxRangePop();  // backup
 }
 
 // 當一批 pending eval 都到齊後：
@@ -689,12 +702,12 @@ void SearchSession::process_pending_evals() {
 
     expand_node(node_idx, eval_it->second.priors);
 
-    const int leaf_to_play = nodes_[node_idx].to_play;
+        const int leaf_to_play = nodes_[node_idx].to_play;
     const float leaf_value = eval_it->second.value;
 
     auto path_it = pending_paths_.find(node_idx);
     for (const auto& path : path_it->second) {
-            // 還原 virtual loss
+      // 還原 virtual loss
       for (const int idx : path) {
         nodes_[idx].visit_count -= 1;
         nodes_[idx].value_sum += 1.0f;
@@ -706,7 +719,6 @@ void SearchSession::process_pending_evals() {
   pending_node_order_.clear();
   pending_paths_.clear();
   pending_eval_map_.clear();
-  nvtxRangePop();  // process_pending_evals
 }
 
 void SearchSession::expand_node(int node_idx, const std::vector<float>& priors) {

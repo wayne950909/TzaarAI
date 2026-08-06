@@ -25,10 +25,10 @@ struct SearchConfig {
   // 單側尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數（≠容量）
   int ready_flush_leaves = 32;
 
-  // C++ SearchManager 內部 debug log 開關。
+            // C++ SearchManager 內部 debug log 開關。
   // 由 config.py 設定，經 cpp_manager._build_config 傳入。
   // 關閉時呼叫端只做一次 atomic 檢查即跳過，完全不打擾效能。
-  bool debug_log_enabled = false;
+    bool debug_log_enabled = false;
   std::string debug_log_path;
 };
 
@@ -51,4 +51,8 @@ struct SearchResult {
 }  // namespace tzaar
 
 #endif  // TZAAR_MCTS_CONFIG_H_
+
+
+
+
 

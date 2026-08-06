@@ -76,12 +76,12 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("simulations",              &tz::SearchConfig::simulations)
     .def_readwrite("leaf_batch_size",           &tz::SearchConfig::leaf_batch_size)
     .def_readwrite("puct_c",                   &tz::SearchConfig::puct_c)
-    .def_readwrite("add_root_dirichlet_noise", &tz::SearchConfig::add_root_dirichlet_noise)
+        .def_readwrite("add_root_dirichlet_noise", &tz::SearchConfig::add_root_dirichlet_noise)
     .def_readwrite("root_dirichlet_eps",       &tz::SearchConfig::root_dirichlet_eps)
     .def_readwrite("root_dirichlet_alpha",     &tz::SearchConfig::root_dirichlet_alpha)
-        .def_readwrite("min_batch_for_swap",       &tz::SearchConfig::min_batch_for_swap)
+    .def_readwrite("min_batch_for_swap",       &tz::SearchConfig::min_batch_for_swap)
     .def_readwrite("flush_timeout_ms",         &tz::SearchConfig::flush_timeout_ms)
-        .def_readwrite("buffer_capacity_per_tree", &tz::SearchConfig::buffer_capacity_per_tree)
+    .def_readwrite("buffer_capacity_per_tree", &tz::SearchConfig::buffer_capacity_per_tree)
     .def_readwrite("ready_flush_leaves",       &tz::SearchConfig::ready_flush_leaves)
     .def_readwrite("debug_log_enabled",        &tz::SearchConfig::debug_log_enabled)
     .def_readwrite("debug_log_path",           &tz::SearchConfig::debug_log_path);
@@ -242,8 +242,8 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("join_workers", &tz::SearchManager::join_workers)
     .def("has_ready_batch", &tz::SearchManager::has_ready_batch)
 
-    // get_ready_batch: 回傳 dict 包含 numpy views（零拷貝）
-        .def("get_ready_batch",
+        // get_ready_batch: 回傳 dict 包含 numpy views（零拷貝）
+    .def("get_ready_batch",
          [](tz::SearchManager& mgr) {
            auto packed = mgr.get_ready_batch();
            py::dict out;
@@ -268,12 +268,12 @@ PYBIND11_MODULE(tzaar_cpp, m) {
            out["legal_masks"] = py::array_t<uint8_t>(
                {bsz, static_cast<py::ssize_t>(tz::kActionCount)},
                packed.legal_masks, mask_cap);
-           out["board_state_flat"] = py::array_t<float>(
+                      out["board_state_flat"] = py::array_t<float>(
                {bsz, static_cast<py::ssize_t>(tz::kBoardFlatSize)},
                packed.board_state_flat, board_cap);
            out["global_features"] = py::array_t<float>(
                {bsz, static_cast<py::ssize_t>(tz::kGlobalFeatureDim)},
-                              packed.global_features, glob_cap);
+               packed.global_features, glob_cap);
            return out;
          })
 
@@ -306,7 +306,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
          py::arg("node_ids"), py::arg("priors"),
          py::arg("values"))
 
-    .def("is_complete", &tz::SearchManager::is_complete)
+            .def("is_complete", &tz::SearchManager::is_complete)
     .def("completed_tree_count", &tz::SearchManager::completed_tree_count)
     .def("last_swap_reason", &tz::SearchManager::last_swap_reason)
     .def("finish_all", &tz::SearchManager::finish_all)

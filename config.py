@@ -106,7 +106,7 @@ class AsyncMCTSConfig:
     # C++ SearchManager 的常駐 worker thread 數量（固定不變）
     num_threads: int = 10
     # 單次 GPU forward 最多聚合多少個 leaf states。
-    infer_max_batch: int = 6400
+    infer_max_batch: int = 12800
     # GPU worker 最多等待多久，再把目前已收集到的 request 一起送進模型。
     infer_max_wait_ms: float = 2.0
     # Python async worker request queue 的容量上限。
@@ -121,8 +121,8 @@ class AsyncMCTSConfig:
 
     # ── Worker-Local Double Buffer 參數 ──────────────────────
     # 每個 worker 每側邊緩衝區的最大容量 = 樹數量 × 此值
-        # （adjust.md：buffer 最大容量 = 樹數量 * 32，填不滿）
-    buffer_capacity_per_tree: int = 32
+    # （adjust.md：buffer 最大容量 = 樹數量 * 32，填不滿）
+    buffer_capacity_per_tree: int = 64
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
     ready_flush_leaves: int = 16
