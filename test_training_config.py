@@ -42,7 +42,7 @@ SELFPLAY_CFG.temp_low = 0.5
 SELFPLAY_CFG.temp_switch_decision = 5
 
 # MCTS
-MCTS_CFG.simulations = 128              # 極少模擬
+MCTS_CFG.simulations = 128         # 極少模擬
 MCTS_CFG.leaf_batch_size = 16
 MCTS_CFG.puct_c = 1.5
 MCTS_CFG.use_root_dirichlet_noise = False

@@ -81,6 +81,16 @@ class CppSearchManager:
         )
         self._n_trees = 0
 
+                # 整個訓練期間累積的各樹節點數統計
+        self.max_node_count = 0             # 所有搜尋批次中，單棵樹創建節點數的最大值
+        self.last_batch_max_node_count = 0  # 最近一次搜尋批次中，單棵樹創建節點數的最大值
+
+                # 整個訓練期間累積的各樹「節點最大合法步數量」統計
+        # （每棵樹所有節點中，單一節點的最大合法步數量）
+        self.max_node_legal_moves = 0
+        self.last_batch_max_node_legal_moves = 0
+
+
         print(
             f"[SearchManager] __init__: threads={num_threads}, "
             f"max_batch={max_batch}, timeout={response_timeout_s}s"
@@ -297,6 +307,34 @@ class CppSearchManager:
             f"in {finish_elapsed:.3f}s"
         )
 
+        # ── 統計這一批搜尋中「單棵樹節點數的最大值」並累積全程最大值 ──
+        if raw_results:
+            self.last_batch_max_node_count = max(
+                int(r.node_count) for r in raw_results
+            )
+            self.max_node_count = max(
+                self.max_node_count, self.last_batch_max_node_count
+            )
+            print(
+                f"[SearchManager] node-count | batch_trees={len(raw_results)}, "
+                f"batch_max_tree_nodes={self.last_batch_max_node_count}, "
+                f"overall_max_tree_nodes={self.max_node_count}"
+            )
+
+            # ── 統計「每棵樹所有節點中的最大合法步數量」並累積全程最大值 ──
+            self.last_batch_max_node_legal_moves = max(
+                int(r.max_node_legal_moves) for r in raw_results
+            )
+            self.max_node_legal_moves = max(
+                self.max_node_legal_moves,
+                self.last_batch_max_node_legal_moves,
+            )
+            print(
+                f"[SearchManager] node-legal-moves | batch_trees={len(raw_results)}, "
+                f"batch_max_tree_node_legal_moves={self.last_batch_max_node_legal_moves}, "
+                f"overall_max_tree_node_legal_moves={self.max_node_legal_moves}"
+            )
+
         outputs: List[Dict[str, Any]] = []
         for i, result in enumerate(raw_results):
             if not bool(result.is_complete):
@@ -332,10 +370,12 @@ class CppSearchManager:
                     "visits": visits,
                                         "replay_board": replay_board,
                     "replay_global": replay_global,
-                    "root_value": result.root_value,
+                                        "root_value": result.root_value,
                     "root_player": result.root_player,
                     "is_done": result.is_done,
                     "winner": result.winner,
+                    "node_count": int(result.node_count),
+                    "max_node_legal_moves": int(result.max_node_legal_moves),
                 }
             )
 

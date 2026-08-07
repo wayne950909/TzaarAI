@@ -42,6 +42,8 @@ struct SearchResult {
   int simulations_requested = 0;
   int simulations_processed = 0;
   int pending_leaf_count = 0;
+  int node_count = 0;               // 這棵樹搜尋結束後創建的所有節點數（含根節點）
+  int max_node_legal_moves = 0;     // 這棵樹所有節點中，單一節點的最大合法步數量
   float root_value = 0.0f;
   std::vector<std::uint8_t> legal_mask;
   std::vector<float> root_policy;
@@ -51,8 +53,4 @@ struct SearchResult {
 }  // namespace tzaar
 
 #endif  // TZAAR_MCTS_CONFIG_H_
-
-
-
-
 

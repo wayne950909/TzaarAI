@@ -1,4 +1,4 @@
-#include "mcts/search.h"
+﻿#include "mcts/search.h"
 #include "core/action.h"
 
 #include <algorithm>
@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-// ─── NVTX Profiling ────────────────────────────────────
+// ??? NVTX Profiling ????????????????????????????????????
 #ifdef TZAAR_USE_NVTX
 #include <nvtx3/nvToolsExt.h>
 #else
@@ -19,8 +19,8 @@
 namespace tzaar {
 namespace {
 
-// RAII 輔助：進入區塊時 push NVTX range，離開區塊（含 early-exit/return）時自動 pop。
-// 用於 simulate_into_buffers 的五階段量測，確保 push/pop 一定成對。
+// RAII 頛嚗脣?憛? push NVTX range嚗??憛???early-exit/return嚗??芸? pop??
+// ?冽 simulate_into_buffers ???挾?葫嚗Ⅱ靽?push/pop 銝摰?撠?
 struct NvtxRangeGuard {
   explicit NvtxRangeGuard(const char* name) {
 #ifdef TZAAR_USE_NVTX
@@ -40,15 +40,15 @@ struct NvtxRangeGuard {
 
 }  // namespace
 
-// ══════════════════════════════════════════════════════════════════════
-// 建構子
-// ══════════════════════════════════════════════════════════════════════
+// ??????????????????????????????????????????????????????????????????????
+// 撱箸?摮?
+// ??????????????????????????????????????????????????????????????????????
 
-// SearchSession 代表「單棵搜尋樹」。
-// 它本身不碰多執行緒調度，只專注在：
-// - 節點選擇
-// - 葉節點狀態重建
-// - pending eval 管理
+// SearchSession 隞?”?璉菜?撠邦??
+// 摰頨思?蝣啣??瑁?蝺矽摨佗??芸?瘜典嚗?
+// - 蝭暺??
+// - ??暺???撱?
+// - pending eval 蝞∠?
 // - backup / expand / root noise
 SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig config)
     : config_(std::move(config)), rng_(std::random_device{}()) {
@@ -74,8 +74,8 @@ SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig conf
 
   nodes_.push_back(std::move(root));
 
-  // 根節點 CNN 特徵快取。
-  // 之後所有葉節點 state 都可從這裡出發，沿動作序列重建。
+  // ?寧?暺?CNN ?孵噩敹怠???
+  // 銋????蝭暺?state ?賢敺ㄐ?箇嚗窒??摨??遣??
   root_board_flat_.resize(static_cast<std::size_t>(kBoardFlatSize), 0.0f);
   root_global_feat_.resize(static_cast<std::size_t>(kGlobalFeatureDim), 0.0f);
   if (!root_state_.is_done()) {
@@ -88,9 +88,9 @@ SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig conf
   }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// 公開 API
-// ══════════════════════════════════════════════════════════════════════
+// ??????????????????????????????????????????????????????????????????????
+// ?祇? API
+// ??????????????????????????????????????????????????????????????????????
 
 bool SearchSession::is_complete() const {
   return simulations_processed_ >= config_.simulations && !has_pending_leaves();
@@ -183,8 +183,9 @@ SearchResult SearchSession::finish() {
   result.is_complete = is_complete();
   result.needs_root_eval = has_pending_leaves();
   result.simulations_requested = config_.simulations;
-  result.simulations_processed = simulations_processed_;
+    result.simulations_processed = simulations_processed_;
   result.pending_leaf_count = static_cast<int>(pending_node_order_.size());
+  result.node_count = static_cast<int>(nodes_.size());  // ??蝯?敺璉菜邦??暺嚗?寧?暺?
   result.root_value = nodes_[root_node_index_].mean_value();
 
   MctsNode& root_node = nodes_[root_node_index_];
@@ -195,6 +196,21 @@ SearchResult SearchSession::finish() {
 
   result.legal_mask.assign(root_node.cached_legal_mask.begin(),
                            root_node.cached_legal_mask.end());
+
+  // Compute the maximum legal-move count over all nodes in this tree.
+  {
+    int max_legal_moves = 0;
+    for (const MctsNode& nd : nodes_) {
+      if (!nd.legal_mask_ready) continue;
+      int cnt = 0;
+      for (std::uint8_t v : nd.cached_legal_mask) {
+        if (v != 0) ++cnt;
+      }
+      if (cnt > max_legal_moves) max_legal_moves = cnt;
+    }
+    result.max_node_legal_moves = max_legal_moves;
+  }
+
 
   result.root_policy.assign(static_cast<std::size_t>(kActionCount), 0.0f);
   result.root_visits.assign(static_cast<std::size_t>(kActionCount), 0.0f);
@@ -220,15 +236,15 @@ LeafSnapshot SearchSession::root_snapshot() {
   return snapshot;
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// 供 SearchManager 使用的方法
-// ══════════════════════════════════════════════════════════════════════
+// ??????????????????????????????????????????????????????????????????????
+// 靘?SearchManager 雿輻?瘜?
+// ??????????????????????????????????????????????????????????????????????
 
-// 這是給 SearchManager 使用的「零配置批次模擬」介面。
-// 它會把待推論葉節點直接寫進外部 buffer，而不是先建立 Python 物件。
-// 注意：回傳值可能少於 chunk，因為：
-//   - 終端節點消耗模擬次數但不產出 leaf（backup 已內處理）
-//   - 所有路徑都被 pending leaf 阻塞時（stall）提前結束
+// ?蝯?SearchManager 雿輻??蔭?寞活璅⊥???Ｕ?
+// 摰????刻???暺?亙神?脣???buffer嚗??臬?撱箇? Python ?拐辣??
+// 瘜冽?嚗??喳澆?賢???chunk嚗??綽?
+//   - 蝯垢蝭暺??芋?祆活?訾?銝??leaf嚗ackup 撌脣??嚗?
+//   - ??楝敺鋡?pending leaf ?餃???stall嚗?????
 int SearchSession::simulate_into_buffers(int chunk,
                                                                                   float* board_out,
                                          float* global_out,
@@ -238,18 +254,18 @@ int SearchSession::simulate_into_buffers(int chunk,
                                          int tree_id) {
   if (chunk <= 0) return 0;
 
-  // 整個函式層級的 NVTX range（RAII）。早期 return（stall）時由析構自動 pop。
+  // ?游撘惜蝝? NVTX range嚗AII嚗??return嚗tall嚗??望?瑽??pop??
   NvtxRangeGuard sim_guard("simulate_into_buffers");
 
   int simulated_count = 0;
-  const int max_attempts = chunk + 256;  // 預留給終端節點的重試空間
+  const int max_attempts = chunk + 256;  // ??蝯衣?蝡舐?暺??岫蝛粹?
 
   for (int attempts = 0; attempts < max_attempts; ++attempts) {
     if (simulated_count >= chunk) break;
     if (is_complete()) break;
 
-    // ── 段1：樹狀走訪與選擇（walk + 簿記，範圍涵蓋整個迭代）──
-    // RAII guard 確保即使 terminal / stall / early-exit 也會成對 pop。
+    // ?? 畾?嚗邦?韏啗赤???walk + 蝪輯?嚗??項??翮隞????
+    // RAII guard 蝣箔??喃蝙 terminal / stall / early-exit 銋??? pop??
     NvtxRangeGuard stage1("sib_stage1_selection");
 
     int node_idx = root_node_index_;
@@ -260,7 +276,7 @@ int SearchSession::simulate_into_buffers(int chunk,
     while (true) {
       MctsNode& node = nodes_[node_idx];
 
-      // 情況 A：終端節點 → backup，不產 leaf，跳出 while 讓外層重試
+      // ?? A嚗?蝡舐?暺???backup嚗???leaf嚗歲??while 霈?撅日?閰?
       if (node.is_terminal) {
         const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
         backup(path, leaf_value, node.to_play);
@@ -268,29 +284,29 @@ int SearchSession::simulate_into_buffers(int chunk,
         break;
       }
 
-      // 情況 B：已展開節點 → selection 繼續往下
+      // ?? B嚗歇撅?蝭暺???selection 蝜潛?敺銝?
       if (node.expanded) {
         if (node.children.empty()) {
-          // 已展開但無合法子節點（可能因為遊戲結束判斷不同步）
+          // 撌脣????∪?瘜?蝭暺??航??蝯??斗銝?甇伐?
           backup(path, 0.0f, node.to_play);
           simulations_processed_ += 1;
           break;
         }
         const int action = select_child_action(node_idx);
-        // select_child_action 回傳 -1 代表所有子節點都有 pending leaf
+        // select_child_action ? -1 隞?”???蝭暺??pending leaf
         if (action < 0) {
-          // 整棵樹已 stalled → 無法再產生新 leaf，回傳目前已累積的
-          return simulated_count;  // sib_stage1_selection 由 guard 析構時 pop
+          // ?湔ㄤ璅孵歇 stalled ???⊥??? leaf嚗??喟?歇蝝舐???
+          return simulated_count;  // sib_stage1_selection ??guard ????pop
         }
         node_idx = node.children.at(action);
         path.push_back(node_idx);
-        continue;  // 仍在走訪，段1持續計時
+        continue;  // 隞韏啗赤嚗挾1??閮?
       }
 
-                              // 情況 C：未展開葉節點
-      // 走訪完成，段1到此（仍在外層 sib_stage1_selection 範圍內）
+                              // ?? C嚗撅???暺?
+      // 韏啗赤摰?嚗挾1?唳迨嚗??典?撅?sib_stage1_selection 蝭??改?
 
-      // ── 段3：遊戲狀態複製與動作套用 ──────────────
+      // ?? 畾?嚗??脩???鋆質???憟 ??????????????
       PhaseGameState state;
       {
         NvtxRangeGuard stage3("sib_stage3_state_clone");
@@ -307,11 +323,11 @@ int SearchSession::simulate_into_buffers(int chunk,
           const float leaf_value = terminal_value_for_current_player(node.winner, node.to_play);
           backup(path, leaf_value, node.to_play);
           simulations_processed_ += 1;
-          break;  // 跳出 while，外層 sib_stage1_selection 在此迭代結束時一併 pop
+          break;  // 頝喳 while嚗?撅?sib_stage1_selection ?冽迨餈凋誨蝯???雿?pop
         }
       }  // sib_stage3_state_clone pop
 
-      // ── 段4：特徵序列化與寫入緩衝區（build_cnn_features_into）──
+      // ?? 畾?嚗敺萄????神?亦楨銵?嚗uild_cnn_features_into嚗??
       {
         NvtxRangeGuard stage4("sib_stage4_feature_write");
         const auto counts = state.game().piece_counts();
@@ -323,7 +339,7 @@ int SearchSession::simulate_into_buffers(int chunk,
             global_out + (offset * static_cast<std::size_t>(kGlobalFeatureDim)));
       }  // sib_stage4_feature_write pop
 
-      // ── 段5：合法動作遮罩生成與寫入（state.legal_mask()）──
+      // ?? 畾?嚗?瘜?雿蝵拍???撖怠嚗tate.legal_mask()嚗??
       const std::vector<bool> legal = state.legal_mask();
       {
         NvtxRangeGuard stage5("sib_stage5_legal_mask");
@@ -337,8 +353,8 @@ int SearchSession::simulate_into_buffers(int chunk,
         node.legal_mask_ready = true;
       }  // sib_stage5_legal_mask pop
 
-      // ── 段2：節點記憶體配置與物件建構 ──────────────
-      // 先保留空間，避免 push_back 時 vector reallocation 使 reference 失效
+      // ?? 畾?嚗?暺??園??蔭?隞嗅遣瑽???????????????
+      // ???征???踹? push_back ??vector reallocation 雿?reference 憭望?
       {
         NvtxRangeGuard stage2("sib_stage2_node_alloc");
         nodes_.reserve(nodes_.size() + static_cast<std::size_t>(kActionCount));
@@ -355,7 +371,7 @@ int SearchSession::simulate_into_buffers(int chunk,
         nodes_[node_idx].expanded = true;
       }  // sib_stage2_node_alloc pop
 
-      // ── Virtual loss + 記錄 pending（併入段1 sib_stage1_selection）──
+      // ?? Virtual loss + 閮? pending嚗蔥?交挾1 sib_stage1_selection嚗??
       for (const int idx : path) {
         nodes_[idx].visit_count += 1;
         nodes_[idx].value_sum -= 1.0f;
@@ -370,7 +386,7 @@ int SearchSession::simulate_into_buffers(int chunk,
       simulated_count++;
       simulations_processed_ += 1;
       break;
-    }  // 迭代結束，sib_stage1_selection 由 guard 析構時 pop
+    }  // 餈凋誨蝯?嚗ib_stage1_selection ??guard ????pop
   }
 
   return simulated_count;
@@ -393,18 +409,18 @@ void SearchSession::submit_single_eval(int node_id,
 
   pending_eval_map_.emplace(node_idx, PendingEval{std::move(prior_row), value});
 
-  // 當所有 pending 都到齊時自動處理
+  // ?嗆???pending ?賢朣??芸???
   if (pending_eval_map_.size() == pending_node_order_.size()) {
     process_pending_evals();
   }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// 內部方法
-// ══════════════════════════════════════════════════════════════════════
+// ??????????????????????????????????????????????????????????????????????
+// ?折?寞?
+// ??????????????????????????????????????????????????????????????????????
 
-// 只記錄 parent/action，而不是在每個節點存完整 state。
-// 這樣可大量降低樹的記憶體成本。
+// ?芾???parent/action嚗??臬瘥?暺?摰 state??
+// ?見?臬之??雿邦???園????
 std::vector<int> SearchSession::collect_action_path_to_node(int node_idx) const {
   std::vector<int> reversed;
   int current = node_idx;
@@ -417,8 +433,8 @@ std::vector<int> SearchSession::collect_action_path_to_node(int node_idx) const 
   return reversed;
 }
 
-// 由 root_state_ + action path 重建任意節點局面。
-// 這正是 mctsLogic.md 中描述的「根狀態快取 + 動作序列重建」實作。
+// ??root_state_ + action path ?遣隞餅?蝭暺??Ｕ?
+// ?迤??mctsLogic.md 銝剜?餈啁????翰??+ ??摨??遣?祕雿?
 PhaseGameState SearchSession::reconstruct_state_for_node(int node_idx) const {
   PhaseGameState state = root_state_.clone();
   const std::vector<int> actions = collect_action_path_to_node(node_idx);
@@ -547,9 +563,9 @@ void SearchSession::simulate_chunk(int chunk) {
         continue;
       }
 
-      // 未展開葉節點
+      // ?芸???蝭暺?
       if (pending_paths_.count(node_idx) > 0) {
-        // 已在佇列中：應用 virtual loss
+        // 撌脣雿?銝哨?? virtual loss
         for (const int idx : path) {
           nodes_[idx].visit_count += 1;
           nodes_[idx].value_sum -= 1.0f;
@@ -558,7 +574,7 @@ void SearchSession::simulate_chunk(int chunk) {
         break;
       }
 
-      // 首次訪問：重建狀態一次
+      // 擐活閮芸?嚗?撱箇???甈?
       PhaseGameState state = reconstruct_state_for_node(node_idx);
       node.to_play = state.current_player();
       node.is_terminal = state.is_done();
@@ -574,7 +590,7 @@ void SearchSession::simulate_chunk(int chunk) {
         break;
       }
 
-      // 建構 CNN 特徵到連續批次緩衝區
+      // 撱箸? CNN ?孵噩?圈???寞活蝺抵??
       {
         const auto counts = state.game().piece_counts();
         const std::size_t offset_board = batch_board_flat_.size();
@@ -588,7 +604,7 @@ void SearchSession::simulate_chunk(int chunk) {
             batch_global_feat_.data() + offset_global);
       }
 
-      // 快取合法遮罩並填入批次緩衝區
+      // 敹怠????桃蔗銝血‵?交甈∠楨銵?
       const std::vector<bool> legal = state.legal_mask();
       node.cached_legal_mask.resize(static_cast<std::size_t>(kActionCount), 0);
       const std::size_t offset_mask = batch_legal_mask_.size();
@@ -600,20 +616,20 @@ void SearchSession::simulate_chunk(int chunk) {
       }
       node.legal_mask_ready = true;
 
-      // 建立子節點樁（僅記錄 parent+action，不 clone 狀態）
+      // 撱箇?摮?暺?嚗?閮? parent+action嚗? clone ???
       nodes_.reserve(nodes_.size() + static_cast<std::size_t>(kActionCount));
       for (int action = 0; action < kActionCount; ++action) {
         if (!legal[static_cast<std::size_t>(action)]) continue;
         const int new_idx = static_cast<int>(nodes_.size());
         MctsNode child;
-        child.prior = 0.0f;  // expand 時由 NN 輸出設定
+        child.prior = 0.0f;  // expand ? NN 頛詨閮剖?
         child.parent_idx = node_idx;
         child.action_from_parent = action;
         nodes_.push_back(std::move(child));
         nodes_[node_idx].children[action] = new_idx;
       }
 
-      // 加入 NN 批次佇列 — 應用 virtual loss
+      // ? NN ?寞活雿? ??? virtual loss
       for (const int idx : path) {
         nodes_[idx].visit_count += 1;
         nodes_[idx].value_sum -= 1.0f;
@@ -644,9 +660,9 @@ int SearchSession::select_child_action(int node_idx) {
     const int child_idx = pair.second;
     const int action = pair.first;
 
-    // ── 跳過底下已有 pending leaf 的子節點 ──────────
-    // 目的是讓同一棵樹在單次 simulate_into_buffers 呼叫中，
-    // 每次 selection 都走向不同的未展開節點，累積 leaf_batch_size 個 leaf
+    // ?? 頝喲?摨?撌脫? pending leaf ??蝭暺???????????
+    // ?桃??航???璉菜邦?典甈?simulate_into_buffers ?澆銝哨?
+    // 瘥活 selection ?質粥?????芸???暺?蝝舐? leaf_batch_size ??leaf
     if (has_pending_descendant(child_idx)) continue;
 
     const MctsNode& child = nodes_[child_idx];
@@ -669,7 +685,7 @@ int SearchSession::select_child_action(int node_idx) {
     }
   }
 
-  // ── 所有子節點都有 pending leaf → 無法 selection ──
+  // ?? ???蝭暺??pending leaf ???⊥? selection ??
   if (best_actions.empty()) {
     return -1;
   }
@@ -678,8 +694,8 @@ int SearchSession::select_child_action(int node_idx) {
   return best_actions[static_cast<std::size_t>(pick(rng_))];
 }
 
-// 反向傳播時，若節點玩家與 leaf_to_play 不同，就翻號。
-// 這對應文件中「玩家不同 value 要加負號」的規則。
+// ???單???亦?暺摰嗉? leaf_to_play 銝?嚗停蝧餉???
+// ????隞嗡葉?摰嗡???value 閬?鞎???閬???
 void SearchSession::backup(const std::vector<int>& path, float leaf_value, int leaf_to_play) {
   for (const int idx : path) {
     MctsNode& node = nodes_[idx];
@@ -690,10 +706,10 @@ void SearchSession::backup(const std::vector<int>& path, float leaf_value, int l
   }
 }
 
-// 當一批 pending eval 都到齊後：
-// 1. 先 expand 對應葉節點
-// 2. 對所有等待同一節點結果的 path 還原 virtual loss
-// 3. 再做真正 backup
+// ?嗡???pending eval ?賢朣?嚗?
+// 1. ??expand 撠???暺?
+// 2. 撠???敺?銝蝭暺??? path ?? virtual loss
+// 3. ???迤 backup
 void SearchSession::process_pending_evals() {
   for (const int node_idx : pending_node_order_) {
     auto eval_it = pending_eval_map_.find(node_idx);
@@ -707,7 +723,7 @@ void SearchSession::process_pending_evals() {
 
     auto path_it = pending_paths_.find(node_idx);
     for (const auto& path : path_it->second) {
-      // 還原 virtual loss
+      // ?? virtual loss
       for (const int idx : path) {
         nodes_[idx].visit_count -= 1;
         nodes_[idx].value_sum += 1.0f;
@@ -760,20 +776,20 @@ void SearchSession::expand_node(int node_idx, const std::vector<float>& priors) 
   }
 }
 
-// 遞迴檢查 node_idx 底下是否有 pending leaf。
-// 用於 simulate_into_buffers 中的 selection：避開已有 pending leaf 的子樹，
-// 讓每次 selection 都走向新的未展開節點。
+// ?艘瑼Ｘ node_idx 摨??臬??pending leaf??
+// ?冽 simulate_into_buffers 銝剔? selection嚗?歇??pending leaf ??璅對?
+// 霈?甈?selection ?質粥??撅?蝭暺?
 bool SearchSession::has_pending_descendant(int node_idx) const {
-  // 如果這個節點本身就在 pending 中（未展開的葉節點）
+  // 憒???暺頨怠停??pending 銝哨??芸?????暺?
   if (pending_paths_.find(node_idx) != pending_paths_.end()) return true;
 
   const MctsNode& node = nodes_[node_idx];
   if (!node.expanded) {
-    // 未展開且不在 pending 中 → 沒有 pending descendant
+    // ?芸???銝 pending 銝???瘝? pending descendant
     return false;
   }
 
-  // 已展開：遞迴檢查所有子節點
+  // 撌脣????艘瑼Ｘ???蝭暺?
   for (const auto& pair : node.children) {
     if (has_pending_descendant(pair.second)) return true;
   }
