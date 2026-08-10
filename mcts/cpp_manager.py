@@ -85,10 +85,14 @@ class CppSearchManager:
         self.max_node_count = 0             # 所有搜尋批次中，單棵樹創建節點數的最大值
         self.last_batch_max_node_count = 0  # 最近一次搜尋批次中，單棵樹創建節點數的最大值
 
-                # 整個訓練期間累積的各樹「節點最大合法步數量」統計
+        # 整個訓練期間累積的各樹「節點最大合法步數量」統計
         # （每棵樹所有節點中，單一節點的最大合法步數量）
         self.max_node_legal_moves = 0
         self.last_batch_max_node_legal_moves = 0
+
+        # 各搜尋批次中「所有樹節點數的總和」統計
+        self.last_batch_total_node_count = 0  # 最近一次搜尋批次中，所有樹節點數的總和
+        self.total_node_count = 0             # 整個訓練期間所有搜尋批次累積的節點數總和
 
 
         print(
@@ -319,6 +323,17 @@ class CppSearchManager:
                 f"[SearchManager] node-count | batch_trees={len(raw_results)}, "
                 f"batch_max_tree_nodes={self.last_batch_max_node_count}, "
                 f"overall_max_tree_nodes={self.max_node_count}"
+            )
+
+                        # ── 統計這一批搜尋中「所有樹節點數的總和」並累積全程總和 ──
+            self.last_batch_total_node_count = sum(
+                int(r.node_count) for r in raw_results
+            )
+            self.total_node_count += self.last_batch_total_node_count
+            print(
+                f"[SearchManager] node-total | batch_trees={len(raw_results)}, "
+                f"batch_total_tree_nodes={self.last_batch_total_node_count}, "
+                f"overall_total_tree_nodes={self.total_node_count}"
             )
 
             # ── 統計「每棵樹所有節點中的最大合法步數量」並累積全程最大值 ──

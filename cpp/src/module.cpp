@@ -1,4 +1,4 @@
-﻿#include <pybind11/pybind11.h>
+#include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
@@ -13,21 +13,21 @@
 namespace py = pybind11;
 namespace tz = tzaar;
 
-// ??????????????????????????????????????????????????????????????????????
-// pybind11 璅∠?嚗zaar_cpp
-// ??????????????????????????????????????????????????????????????????????
+// ══════════════════════════════════════════════════════════════════════
+// pybind11 模組：tzaar_cpp
+// ══════════════════════════════════════════════════════════════════════
 
 PYBIND11_MODULE(tzaar_cpp, m) {
   m.doc() = "Tzaar C++ rules engine bridge module";
 
-  // ??? 撣豢 ???????????????????????????????????????????????
+  // ─── 常數 ───────────────────────────────────────────────
   m.attr("N_ACTIONS")       = py::int_(tz::kActionCount);
   m.attr("PASS_ACTION_IDX") = py::int_(tz::kPassActionIdx);
   m.attr("CAPTURE_OFFSET")  = py::int_(tz::kCaptureOffset);
   m.attr("REINFORCE_OFFSET")= py::int_(tz::kReinforceOffset);
   m.attr("N_EDGE_ACTIONS")  = py::int_(tz::kEdgeActionCount);
 
-  // ??? ??蝺刻圾蝣????????????????????????????????????????
+  // ─── 動作編解碼 ───────────────────────────────────────
   m.def("encode_action_idx", &tz::encode_action_idx,
         py::arg("kind"), py::arg("edge_idx") = py::none(),
         "Encode (kind, edge_idx) into unified action index.");
@@ -55,7 +55,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
         },
         "Return generated fixed edge table as (src_idx, direction_idx) pairs.");
 
-  // ??? LeafSnapshot ???????????????????????????????????????
+  // ─── LeafSnapshot ───────────────────────────────────────
   py::class_<tz::LeafSnapshot>(m, "LeafSnapshot")
     .def(py::init<>())
     .def_readwrite("node_id",         &tz::LeafSnapshot::node_id)
@@ -70,7 +70,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("global_features", &tz::LeafSnapshot::global_features)
     .def_readwrite("legal_mask",      &tz::LeafSnapshot::legal_mask);
 
-  // ??? SearchConfig ?????????????????????????????????????
+  // ─── SearchConfig ─────────────────────────────────────
   py::class_<tz::SearchConfig>(m, "SearchConfig")
     .def(py::init<>())
     .def_readwrite("simulations",              &tz::SearchConfig::simulations)
@@ -86,7 +86,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("debug_log_enabled",        &tz::SearchConfig::debug_log_enabled)
     .def_readwrite("debug_log_path",           &tz::SearchConfig::debug_log_path);
 
-  // ??? SearchResult ?????????????????????????????????????
+  // ─── SearchResult ─────────────────────────────────────
   py::class_<tz::SearchResult>(m, "SearchResult")
     .def(py::init<>())
     .def_readwrite("root_node_id",          &tz::SearchResult::root_node_id)
@@ -105,7 +105,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def_readwrite("root_policy",           &tz::SearchResult::root_policy)
     .def_readwrite("root_visits",           &tz::SearchResult::root_visits);
 
-  // ??? PhaseGameState ????????????????????????????????????
+  // ─── PhaseGameState ────────────────────────────────────
   py::class_<tz::PhaseGameState>(m, "PhaseGameState")
     .def(py::init<>())
     .def("is_done",         &tz::PhaseGameState::is_done)
@@ -149,18 +149,18 @@ PYBIND11_MODULE(tzaar_cpp, m) {
            return out;
          });
 
-  // ??? SearchSession ?????????????????????????????????????
+  // ─── SearchSession ─────────────────────────────────────
   py::class_<tz::SearchSession>(m, "SearchSession")
     .def(py::init<const tz::PhaseGameState&, tz::SearchConfig>(),
          py::arg("root_state"), py::arg("config"))
     .def("config", &tz::SearchSession::config)
     .def("has_pending_leaves", &tz::SearchSession::has_pending_leaves)
 
-    // ??API嚗??LeafSnapshot ?”
+    // 舊 API：傳回 LeafSnapshot 列表
     .def("collect_pending_leaves", &tz::SearchSession::collect_pending_leaves,
          py::arg("max_batch"))
 
-    // Packed API嚗????numpy views ??dict嚗?瑁?嚗?
+    // Packed API：傳回包含 numpy views 的 dict（零拷貝）
     .def("collect_pending_leaves_packed",
          [](tz::SearchSession& session, int max_batch) {
            auto packed = session.collect_pending_leaves_packed(max_batch);
@@ -196,11 +196,11 @@ PYBIND11_MODULE(tzaar_cpp, m) {
          },
          py::arg("max_batch"))
 
-    // ?株?閰摯?漱
+    // 單葉評估提交
     .def("submit_leaf_eval", &tz::SearchSession::submit_leaf_eval,
          py::arg("node_id"), py::arg("priors"), py::arg("value"))
 
-    // ?寞活閰摯?漱
+    // 批次評估提交
     .def("submit_leaf_eval_batch",
          [](tz::SearchSession& session,
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> node_ids,
@@ -234,7 +234,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
          py::call_guard<py::gil_scoped_release>())
     .def("root_snapshot", &tz::SearchSession::root_snapshot);
 
-  // ??? SearchManager ?????????????????????????????????????
+  // ─── SearchManager ─────────────────────────────────────
   py::class_<tz::SearchManager>(m, "SearchManager")
     .def(py::init<tz::SearchConfig, int, int>(),
          py::arg("config"), py::arg("num_threads") = 8, py::arg("max_batch") = 480)
@@ -244,7 +244,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("join_workers", &tz::SearchManager::join_workers)
     .def("has_ready_batch", &tz::SearchManager::has_ready_batch)
 
-        // get_ready_batch: ? dict ? numpy views嚗?瑁?嚗?
+        // get_ready_batch: 回傳 dict 包含 numpy views（零拷貝）
     .def("get_ready_batch",
          [](tz::SearchManager& mgr) {
            auto packed = mgr.get_ready_batch();
@@ -315,7 +315,7 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("shutdown", &tz::SearchManager::shutdown)
     .def("total_remaining_simulations", &tz::SearchManager::total_remaining_simulations);
 
-  // ??? CpuBench嚗? CPU MCTS ?皜祈岫嚗?????????????????
+  // ─── CpuBench（純 CPU MCTS 效能測試） ────────────────
   py::class_<tz::CpuBenchResult>(m, "CpuBenchResult")
     .def(py::init<>())
     .def_readwrite("elapsed_seconds",      &tz::CpuBenchResult::elapsed_seconds)

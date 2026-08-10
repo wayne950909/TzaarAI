@@ -80,18 +80,21 @@ class SearchSession {
 
   struct MctsNode {
     float prior = 0.0f;
-    int parent_idx = -1;
+        int parent_idx = -1;
     int action_from_parent = -1;
-    int to_play = 0;
-    bool has_player = false;
-    bool is_terminal = false;
-    int winner = 0;
+    // ─── 子節點連續區塊（Flat Node Pool 的隱含合法性） ──
+    // 合法子節點落在 [children_base_idx, children_base_idx + children_count)
+    int children_base_idx = -1;
+    int children_count = 0;
+
     int visit_count = 0;
     float value_sum = 0.0f;
     bool expanded = false;
-    bool legal_mask_ready = false;
-    std::vector<std::uint8_t> cached_legal_mask;
-    std::unordered_map<int, int> children;
+
+    // ─── 標量狀態欄位（保留：熱路徑終端檢查與玩家翻號 O(1)） ──
+    int to_play = 0;
+    int winner = 0;
+    bool is_terminal = false;
 
     float mean_value() const {
       if (visit_count <= 0) return 0.0f;
@@ -99,14 +102,17 @@ class SearchSession {
     }
   };
 
-  static constexpr int root_node_index_ = 0;
+    static constexpr int root_node_index_ = 0;
+  static constexpr int kMaxNodesPerTree = 40000;   // 節點池容量上限
   SearchConfig config_;
   int root_node_id_ = 1;
   int simulations_processed_ = 0;
   bool root_noise_applied_ = false;
 
   PhaseGameState root_state_;
-  std::vector<MctsNode> nodes_;
+  // ─── 零動態分配 Flat Node Pool ─────────────────────
+  std::vector<MctsNode> nodes_;       // reserve(kMaxNodesPerTree) 後不再 reallocation
+  int next_free_node_idx_ = 1;        // 節點池分配指標（0 = root）
 
   // ─── Pending leaves 狀態 ──────────────────────────
   std::vector<int> pending_node_order_;

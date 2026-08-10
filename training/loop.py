@@ -463,7 +463,7 @@ def run(title: str) -> None:
             f"max_tree_nodes_last_batch={max_last}"
         )
 
-        # 每棵樹「所有節點中的最大合法步數量」的全程/最近批次最大值
+                # 每棵樹「所有節點中的最大合法步數量」的全程/最近批次最大值
         max_legal_any = getattr(search_manager, "max_node_legal_moves", 0)
         max_legal_last = getattr(
             search_manager, "last_batch_max_node_legal_moves", 0
@@ -472,6 +472,15 @@ def run(title: str) -> None:
             f"[node-legal-moves] training finished | "
             f"max_tree_node_legal_moves_any={max_legal_any} | "
             f"max_tree_node_legal_moves_last_batch={max_legal_last}"
+        )
+
+        # 所有樹節點數總和（最近批次／全程累積）
+        total_last = getattr(search_manager, "last_batch_total_node_count", 0)
+        total_any = getattr(search_manager, "total_node_count", 0)
+        print(
+            f"[node-total] training finished | "
+            f"last_batch_total_tree_nodes={total_last} | "
+            f"overall_total_tree_nodes={total_any}"
         )
 
     # ── 關閉 SearchManager（如已建立） ────────────────
