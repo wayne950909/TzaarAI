@@ -170,16 +170,33 @@ void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
   // 依樹數量調整每側緩衝區容量（adjust.md：容量 = 樹數量 * buffer_capacity_per_tree）
   resize_buffers(tree_count_);
 
-  // 重置 trees
-  trees_.clear();
-  trees_.reserve(static_cast<std::size_t>(tree_count_));
-  for (int i = 0; i < tree_count_; ++i) {
+  // 重用既有 SearchTree / SearchSession，保留其節點池記憶體（不釋放不重建）。
+  // 僅在樹數量變化時才增建或裁減：
+  //   - 樹數量只會變少：resize 裁掉多餘的（釋放對應的 SearchSession 節點池）。
+  //   - 若樹數量變多（防呆），補建新的 SearchSession。
+  const std::size_t existing = trees_.size();
+  const std::size_t desired = static_cast<std::size_t>(tree_count_);
+
+  // 對既有 trees 重用（呼叫 session->reset()，保留節點池）。
+  for (std::size_t i = 0; i < existing && i < desired; ++i) {
+    trees_[i]->root_state = root_states[i].clone();
+    trees_[i]->session->reset(root_states[i], config_);
+    trees_[i]->completed = false;
+    trees_[i]->tree_id = static_cast<int>(i);
+  }
+
+  // 樹數量增加（防呆）：補建新的 SearchTree + SearchSession。
+  for (std::size_t i = existing; i < desired; ++i) {
     auto tree = std::make_unique<SearchTree>();
-    tree->root_state = root_states[static_cast<std::size_t>(i)].clone();
-    tree->session = std::make_unique<SearchSession>(tree->root_state, config_);
-    tree->tree_id = i;
+    tree->root_state = root_states[i].clone();
+    tree->session = std::make_unique<SearchSession>(root_states[i], config_);
+    tree->completed = false;
+    tree->tree_id = static_cast<int>(i);
     trees_.push_back(std::move(tree));
   }
+
+  // 樹數量減少：裁掉多餘的部分（釋放對應 SearchSession 節點池）。
+  trees_.resize(desired);
 
   // 重置 worker-local buffers + 彙整暫存區的「狀態」。
   // 注意：不能呼叫 init_buffers()（那會 clear + 重建 worker_buffers_，

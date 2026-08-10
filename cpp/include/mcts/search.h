@@ -17,6 +17,11 @@ class SearchSession {
  public:
   SearchSession(const PhaseGameState& root_state, SearchConfig config);
 
+  // 重用既有 session（保留節點池記憶體，僅重設狀態）。
+  // 供 SearchManager 在每批搜尋間重複利用同一棵樹的 session，
+  // 避免每次重新 reserve/resize 節點池（kMaxNodesPerTree）。
+  void reset(const PhaseGameState& root_state, SearchConfig config);
+
   // ─── 唯讀查詢 ─────────────────────────────────────────
   SearchConfig config() const { return config_; }
   bool has_pending_leaves() const { return !pending_node_order_.empty(); }
@@ -132,6 +137,10 @@ class SearchSession {
   std::mt19937 rng_;
 
   // ─── 內部方法 ─────────────────────────────────────────
+  // 將節點池中單一 slot 完整重設為初始空值（手動逐欄賦值，避免創建臨時物件）。
+  // 用於「重用節點池而不整個 memset」：root 在 reset 時手動重設，
+  // 其餘槽位在每次被當作子節點 allocate 時也經由此函式覆蓋舊 search 殘留值。
+  void reset_node(MctsNode& node);
   std::vector<int> collect_action_path_to_node(int node_idx) const;
   PhaseGameState reconstruct_state_for_node(int node_idx) const;
   void update_node_metadata_from_state(int node_idx, const PhaseGameState& state);

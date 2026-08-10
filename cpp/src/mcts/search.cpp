@@ -53,20 +53,40 @@ struct NvtxRangeGuard {
 SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig config)
     : config_(std::move(config)), rng_(std::random_device{}()) {
 
-  if (config_.simulations < 0) throw std::invalid_argument("simulations must be >= 0");
-  if (config_.leaf_batch_size <= 0) throw std::invalid_argument("leaf_batch_size must be >= 1");
-  if (config_.puct_c <= 0.0f) throw std::invalid_argument("puct_c must be > 0");
-
-    root_state_ = root_state.clone();
-
   // 零動態分配 Flat Node Pool：一次 reserve 到位，之後不再 reallocation。
+  // reset() 只重設內容與狀態，不再觸發 reserve/resize。
   if (next_free_node_idx_ <= root_node_index_) next_free_node_idx_ = 1;
   nodes_.reserve(static_cast<std::size_t>(kMaxNodesPerTree));
   nodes_.resize(static_cast<std::size_t>(kMaxNodesPerTree));
 
-  // 根節點 slot 0
+  reset(root_state, config_);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 重用（重置）
+// ══════════════════════════════════════════════════════════════════════
+
+// 重用既有 session 進行新一輪搜尋，保留節點池記憶體（nodes_ 不釋放/不重建）。
+// 安全性保證：
+//   - root（slot 0）在此手動完整重設所有欄位。
+//   - root 以外的槽位：每次被當作子節點 allocate 時，經由 reset_node() 覆蓋舊值。
+//   - 未在下一次搜尋中 allocate 的槽位（殘留資料）不會被任何搜尋途徑觸及。
+// rng_ 刻意保留，跨搜尋延續隨機序列（少一次 random_device 開銷）。
+void SearchSession::reset(const PhaseGameState& root_state, SearchConfig config) {
+  if (config.simulations < 0) throw std::invalid_argument("simulations must be >= 0");
+  if (config.leaf_batch_size <= 0) throw std::invalid_argument("leaf_batch_size must be >= 1");
+  if (config.puct_c <= 0.0f) throw std::invalid_argument("puct_c must be > 0");
+
+  config_ = std::move(config);
+  root_state_ = root_state.clone();
+
+  // 節點池：只把分配指標指回 root 之後，不 memset 整池。
+  // 由 reset_node() 在每次 allocate 時覆蓋舊值。
+  next_free_node_idx_ = 1;
+
+  // 根節點 slot 0：手動完整重設。
   MctsNode& root = nodes_[root_node_index_];
-  root = MctsNode{};   // POD 清零，含 children_base_idx=-1, children_count=0
+  reset_node(root);
   root.prior = 1.0f;
   root.parent_idx = -1;
   root.action_from_parent = -1;
@@ -74,10 +94,9 @@ SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig conf
   root.is_terminal = root_state_.is_done();
   root.winner = root_state_.winner();
 
-  // 根節點 CNN 特徵快取。
-  // 之後所有葉節點 state 都可從這裡出發，沿動作序列重建。
-  root_board_flat_.resize(static_cast<std::size_t>(kBoardFlatSize), 0.0f);
-  root_global_feat_.resize(static_cast<std::size_t>(kGlobalFeatureDim), 0.0f);
+  // 根節點 CNN 特徵快取（尺寸固定，assign 更新內容）。
+  root_board_flat_.assign(static_cast<std::size_t>(kBoardFlatSize), 0.0f);
+  root_global_feat_.assign(static_cast<std::size_t>(kGlobalFeatureDim), 0.0f);
   if (!root_state_.is_done()) {
     const auto& board = root_state_.game().board();
     const auto counts = root_state_.game().piece_counts();
@@ -86,6 +105,17 @@ SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig conf
         root_state_.phase(), counts,
         root_board_flat_.data(), root_global_feat_.data());
   }
+
+  // 清空搜尋期間的暫態狀態。
+  simulations_processed_ = 0;
+  root_noise_applied_ = false;
+  pending_node_order_.clear();
+  pending_paths_.clear();
+  pending_eval_map_.clear();
+  batch_board_flat_.clear();
+  batch_global_feat_.clear();
+  batch_legal_mask_.clear();
+  batch_node_ids_.clear();
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -351,13 +381,13 @@ int SearchSession::simulate_into_buffers(int chunk,
                 MctsNode& parent = nodes_[node_idx];
         if (next_free_node_idx_ + kActionCount >= kMaxNodesPerTree)
           throw std::overflow_error("MCTS node pool exhausted (kMaxNodesPerTree)");
-        parent.children_base_idx = next_free_node_idx_;
+                parent.children_base_idx = next_free_node_idx_;
         parent.children_count = 0;
         for (int action = 0; action < kActionCount; ++action) {
           if (!legal[static_cast<std::size_t>(action)]) continue;
           MctsNode& child = nodes_[next_free_node_idx_++];
-          child = MctsNode{};   // POD 清零
-          child.prior = 0.0f;   // expand 時由 NN 輸出設定
+          reset_node(child);      // 手動整格覆蓋舊 value，avoid MctsNode{} 臨時物件
+          child.prior = 0.0f;     // expand 時由 NN 輸出設定
           child.parent_idx = node_idx;
           child.action_from_parent = action;
           parent.children_count++;
@@ -415,6 +445,26 @@ void SearchSession::submit_single_eval(int node_id,
 
 // 只記錄 parent/action，而不是在每個節點存完整 state。
 // 這樣可大量降低樹的記憶體成本。
+
+// 將節點池中單一 slot 完整重設為初始空值。
+// 手動逐欄賦值（不使用 MctsNode{} 臨時物件），避免不必要的建構/拷貝成本。
+// 每個欄位都必須明確重設，否則會殘留上一次 search 的舊值
+// （尤其 children_base_idx / children_count / expanded / visit_count /
+//  value_sum / is_terminal / to_play 等會影響路徑決策的欄位）。
+void SearchSession::reset_node(MctsNode& node) {
+  node.prior = 0.0f;
+  node.parent_idx = -1;
+  node.action_from_parent = -1;
+  node.children_base_idx = -1;
+  node.children_count = 0;
+  node.visit_count = 0;
+  node.value_sum = 0.0f;
+  node.expanded = false;
+  node.to_play = 0;
+  node.winner = 0;
+  node.is_terminal = false;
+}
+
 std::vector<int> SearchSession::collect_action_path_to_node(int node_idx) const {
   std::vector<int> reversed;
   int current = node_idx;
@@ -587,13 +637,13 @@ void SearchSession::simulate_chunk(int chunk) {
       // 建立子節點樁（Flat Node Pool 連續區塊，僅記錄 parent+action，不 clone 狀態）
       if (next_free_node_idx_ + kActionCount >= kMaxNodesPerTree)
         throw std::overflow_error("MCTS node pool exhausted (kMaxNodesPerTree)");
-      node.children_base_idx = next_free_node_idx_;
+            node.children_base_idx = next_free_node_idx_;
       node.children_count = 0;
       for (int action = 0; action < kActionCount; ++action) {
         if (!legal[static_cast<std::size_t>(action)]) continue;
         MctsNode& child = nodes_[next_free_node_idx_++];
-        child = MctsNode{};   // POD 清零
-        child.prior = 0.0f;   // expand 時由 NN 輸出設定
+        reset_node(child);      // 手動整格覆蓋舊 value，avoid MctsNode{} 臨時物件
+        child.prior = 0.0f;     // expand 時由 NN 輸出設定
         child.parent_idx = node_idx;
         child.action_from_parent = action;
         node.children_count++;

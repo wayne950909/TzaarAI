@@ -277,7 +277,6 @@ def run(title: str) -> None:
 
         # ── 主訓練循環 ──────────────────────────────────────
     for update_idx in range(start_update, total_updates):
-        nvtx.range_push(f"update_{update_idx}")
         update_start = time.perf_counter()
         inference_temperature = float(SELFPLAY_CFG.temp_low)
 
@@ -306,7 +305,7 @@ def run(title: str) -> None:
         # 資料來源可能是：
         # - 當前 update 的 fresh_samples
         # - replay buffer 抽樣
-        nvtx.range_push("training_step")
+        nvtx.range_push(f"update_{update_idx}")
         policy.train()
 
         if REPLAY_CFG.enabled and fresh_samples:
@@ -329,7 +328,7 @@ def run(title: str) -> None:
         )
 
         metrics = train_on_samples(policy, optimizer, train_samples, device)
-        nvtx.range_pop()  # training_step
+        nvtx.range_pop()  # update_{idx}
 
         # ── Gate ──────────────────────────────────────────
         update_accepted = True
@@ -347,8 +346,7 @@ def run(title: str) -> None:
                     game_cfg=None,
                     env_cfg=env_cfg,
                     hp=hp,
-                )
-                nvtx.range_pop()  # gatekeeper
+                                )
             gate_passed = gate_result.win_rate >= GATE_CFG.winrate_threshold
             if gate_passed:
                 print(f"[gate] PASSED | win_rate={gate_result.win_rate:.3f}")
@@ -411,10 +409,8 @@ def run(title: str) -> None:
                     replay_buffer=replay_buffer,
                     write_idx=replay_write_idx,
                     max_samples=REPLAY_CFG.max_samples,
-                    base_dir=ckpt_path.parent,
+                                        base_dir=ckpt_path.parent,
                 )
-
-                nvtx.range_pop()  # update_N
 
         update_elapsed = time.perf_counter() - update_start
         print(
