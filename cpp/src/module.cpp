@@ -8,7 +8,6 @@
 #include "mcts/config.h"
 #include "mcts/search.h"
 #include "mcts/search_manager.h"
-#include "mcts/bench.h"
 
 namespace py = pybind11;
 namespace tz = tzaar;
@@ -313,27 +312,5 @@ PYBIND11_MODULE(tzaar_cpp, m) {
     .def("last_swap_reason", &tz::SearchManager::last_swap_reason)
     .def("finish_all", &tz::SearchManager::finish_all)
     .def("shutdown", &tz::SearchManager::shutdown)
-    .def("total_remaining_simulations", &tz::SearchManager::total_remaining_simulations);
-
-  // ─── CpuBench（純 CPU MCTS 效能測試） ────────────────
-  py::class_<tz::CpuBenchResult>(m, "CpuBenchResult")
-    .def(py::init<>())
-    .def_readwrite("elapsed_seconds",      &tz::CpuBenchResult::elapsed_seconds)
-    .def_readwrite("num_trees",            &tz::CpuBenchResult::num_trees)
-    .def_readwrite("num_threads",          &tz::CpuBenchResult::num_threads)
-    .def_readwrite("simulations_per_tree", &tz::CpuBenchResult::simulations_per_tree)
-    .def_readwrite("total_simulations",    &tz::CpuBenchResult::total_simulations)
-    .def_readwrite("total_simulations_done", &tz::CpuBenchResult::total_simulations_done)
-    .def_readwrite("total_nodes_created",  &tz::CpuBenchResult::total_nodes_created)
-    .def_readwrite("sims_per_second",      &tz::CpuBenchResult::sims_per_second)
-    .def_readwrite("tree_simulations_done", &tz::CpuBenchResult::tree_simulations_done)
-    .def_readwrite("tree_node_counts",     &tz::CpuBenchResult::tree_node_counts);
-
-  m.def("run_cpu_bench", &tz::CpuBench::run,
-        py::arg("num_trees"), py::arg("num_threads"),
-        py::arg("simulations"), py::arg("leaf_batch_size") = 8,
-        "Run CPU-only MCTS benchmark. "
-        "Creates num_trees trees, uses num_threads workers, "
-        "each tree runs simulations times. "
-        "Returns CpuBenchResult with timing and stats.");
+        .def("total_remaining_simulations", &tz::SearchManager::total_remaining_simulations);
 }

@@ -52,7 +52,7 @@ CPP_BACKEND_REQUIRED = True
 class NetworkConfig:
     """PolicyNetCNNMin17 的超參數"""
     global_feature_dim: int = 12
-    dropout: float = 0.3
+    dropout: float = 0
     channels: int = 64
     num_res_blocks: int = 4
     fc_hidden: int = 512
@@ -68,7 +68,7 @@ NETWORK_CFG = NetworkConfig()
 @dataclass
 class MCTSConfig:
     """MCTS 搜尋引擎的超參數"""
-    simulations: int = 600
+    simulations: int = 256  
     puct_c: float = 1.5
     leaf_batch_size: int = 32
 
@@ -122,7 +122,7 @@ class AsyncMCTSConfig:
     # ── Worker-Local Double Buffer 參數 ──────────────────────
     # 每個 worker 每側邊緩衝區的最大容量 = 樹數量 × 此值
     # （adjust.md：buffer 最大容量 = 樹數量 * 32，填不滿）
-    buffer_capacity_per_tree: int = 64
+    buffer_capacity_per_tree: int = 16
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
     ready_flush_leaves: int = 16
@@ -148,7 +148,7 @@ class SelfPlayConfig:
     """自我對弈的動作採樣溫度排程"""
     temp_high: float = 1.0     # 前期探索溫度
     temp_low: float = 0.1      # 後期利用溫度
-    temp_switch_decision: int = 6  # 第幾步之後切換到低溫
+    temp_switch_decision: int = 8  # 第幾步之後切換到低溫
 
 
 SELFPLAY_CFG = SelfPlayConfig()
@@ -161,15 +161,15 @@ SELFPLAY_CFG = SelfPlayConfig()
 @dataclass
 class TrainingConfig:
     """訓練主迴圈的超參數"""
-    total_updates: int = 500
-    games_per_update: int = 150
+    total_updates: int = 100
+    games_per_update: int = 200
     selfplay_model_game_ratio: float = 1.0  # 純自我對弈比例 (0~1)
-    train_epochs_per_update: int = 10
-    optimization_passes_per_update: int = 1
+    train_epochs_per_update: int = 1
+    optimization_passes_per_update: int = 5
     batch_size: int = 128
     checkpoint_every_updates: int = 20
     log_every: int = 10
-    selfplay_progress_log_interval: int = 0  # <=0 停用進度log
+    selfplay_progress_log_interval: int = 1  # <=0 停用進度log
 
     # Resume 行為
     require_resume: bool = False
@@ -205,10 +205,10 @@ OPTIMIZER_CFG = OptimizerConfig()
 @dataclass
 class GatekeeperConfig:
     """Gatekeeper 評估的超參數"""
-    eval_games: int = 150
+    eval_games: int = 50
     winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
-    simulations_per_decision: int = 600  # 評估時的 MCTS 模擬數
+    simulations_per_decision: int = 256  # 評估時的 MCTS 模擬數
     eval_every_updates: int = 2        # 每 N 次更新執行一次
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True

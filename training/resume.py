@@ -88,6 +88,8 @@ def scan_latest_checkpoint_for_title(
 
 def load_or_init_policy(
     device: torch.device,
+    guard_title: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> Tuple[
     PolicyNetCNNMin17,
     torch.optim.Optimizer,
@@ -101,11 +103,22 @@ def load_or_init_policy(
     從 guard title 的最新檢查點載入權重（若存在），
     否則使用隨機初始化。
 
+    參數
+    ----
+    device : torch 裝置
+    guard_title : 守門員 checkpoint 的 title。
+        若為 None，使用 config.GUARD_TITLE。
+    title : candidate 的 checkpoint title（用於計算下一個可用的
+        checkpoint 索引）。若為 None，使用 config.TITLE。
+
     回傳
     ----
     (policy, optimizer, start_update, next_checkpoint_index,
      replay_buffer, replay_write_idx)
     """
+    guard_title = guard_title or GUARD_TITLE
+    title = title or TITLE
+
     policy = PolicyNetCNNMin17(
         global_feature_dim=NETWORK_CFG.global_feature_dim,
         dropout=NETWORK_CFG.dropout,
@@ -117,15 +130,15 @@ def load_or_init_policy(
     )
 
     start_update = 0
-    next_checkpoint_index = next_checkpoint_index_for_title(TITLE)
+    next_checkpoint_index = next_checkpoint_index_for_title(title)
     replay_buffer: List[PolicySample] = []
     replay_write_idx = 0
 
-    resume = scan_latest_checkpoint_for_title(GUARD_TITLE, str(device))
+    resume = scan_latest_checkpoint_for_title(guard_title, str(device))
     if resume is None:
         if TRAINING_CFG.require_resume:
             raise RuntimeError(
-                f"No guard checkpoint found for title '{GUARD_TITLE}'."
+                f"No guard checkpoint found for title '{guard_title}'."
             )
         print(
             "[resume] no guard checkpoint found, "
@@ -150,7 +163,7 @@ def load_or_init_policy(
 
     start_update = int(ckpt.get("update_idx", -1)) + 1
     replay_buffer, replay_write_idx = load_replay_snapshot(
-        title=GUARD_TITLE,
+        title=guard_title,
         checkpoint_index=None,
         max_samples=REPLAY_CFG.max_samples,
         base_dir=ckpt_path.parent,
@@ -165,16 +178,26 @@ def load_or_init_policy(
 def load_or_init_guard_policy(
     device: torch.device,
     fallback_policy: PolicyNetCNNMin17,
+    guard_title: Optional[str] = None,
 ) -> Tuple[PolicyNetCNNMin17, str]:
     """載入或初始化 guard 策略網路。
 
     若無 guard 檢查點，從 fallback_policy 複製權重。
+
+    參數
+    ----
+    device : torch 裝置
+    fallback_policy : 當沒有 guard checkpoint 時，以其權重 bootstrap。
+    guard_title : 守門員 checkpoint 的 title。
+        若為 None，使用 config.GUARD_TITLE。
     """
+    guard_title = guard_title or GUARD_TITLE
+
     guard = PolicyNetCNNMin17(
         global_feature_dim=NETWORK_CFG.global_feature_dim,
         dropout=NETWORK_CFG.dropout,
     ).to(device)
-    resume = scan_latest_checkpoint_for_title(GUARD_TITLE, str(device))
+    resume = scan_latest_checkpoint_for_title(guard_title, str(device))
     if resume is None:
         guard.load_state_dict(fallback_policy.state_dict(), strict=True)
         guard.eval()

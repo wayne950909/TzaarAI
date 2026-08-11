@@ -18,8 +18,11 @@ from core.env import TzaarEnv, EnvConfig
 from core.constants import WHITE, BLACK, PHASE_STEP_1, PHASE_STEP_2
 import config as _cfg
 
+
+
 from mcts import run_mcts
 from mcts.search import temperature_for_decision
+from mcts.cpp_manager import CppSearchManager
 
 
 @dataclass
@@ -50,32 +53,49 @@ def gate_keeper(
     game_cfg: Any,
     env_cfg: Any,
     hp: Optional[Any] = None,
+    search_manager: Optional[CppSearchManager] = None,
 ) -> GateResult:
     """執行 candidate vs guard 評估。
 
     candidate 和 guard 輪流先手，進行 n_games 局對戰。
     每步雙方均使用 MCTS 搜尋決定動作。
 
-    參數
-    ----
-    candidate : 被評估的候選網路
-    guard : 目前的守門員網路
-    n_games : 對戰局數
-    device : torch 裝置
-    gate_cfg : GatekeeperConfig 實例
-    game_cfg : 保留參數（未使用）
-    env_cfg : EnvConfig 實例
-    hp : 啟發式策略（未使用）
+    若傳入已建立的 search_manager（CppSearchManager，與 self-play 共用的
+    常駐 C++ worker pool），則所有局數會一次平行推進，同一個 SearchManager
+    的 num_threads 個 worker 執行緒同時搜尋多棵樹（reuse C++ 多執行緒），
+    並由本函式依 current_player 把各局分成 candidate 組 / guard 組，
+    分兩次 run_search（candidate 組餵 candidate、guard 組餵 guard）。
+    gate 只統計勝負，不蒐集 samples。
 
-    回傳
-    ----
-    GateResult（包含勝負統計）
+    若 search_manager 為 None、或平行路徑執行失敗，則自動 fallback 到
+    原本的同步（一次一局）迴圈。
     """
     _ = game_cfg, hp  # 保留參數供未來擴展
 
-    result = GateResult()
     simulations = int(gate_cfg.simulations_per_decision)
     temperature = float(gate_cfg.temperature)
+
+    # ── 平行路徑：重用 C++ SearchManager 的常駐 worker pool ──────
+    if search_manager is not None and _cfg._ACTIVE_STATE_BACKEND == "cpp":
+        try:
+            return _gate_keeper_parallel(
+                candidate,
+                guard,
+                n_games,
+                device,
+                simulations,
+                temperature,
+                env_cfg,
+                search_manager,
+            )
+        except Exception as exc:
+            print(
+                "[gate] CppSearchManager parallel gate failed; "
+                f"falling back to sync. {type(exc).__name__}: {exc}"
+            )
+
+    # ── 同步 fallback 路徑（一次一局）──────────────────────────
+    result = GateResult()
 
     for game_idx in range(n_games):
         env = TzaarEnv(env_cfg)
@@ -87,7 +107,6 @@ def gate_keeper(
             current_player = env.current_player
             policy = candidate if current_player == candidate_player else guard
 
-            obs = env.observe()
             root_state = _build_phase_state_from_env(env)
 
             with torch.no_grad():
@@ -99,34 +118,13 @@ def gate_keeper(
                     simulations=simulations,
                 )
 
-            # 根據訪問次數採樣（使用指定溫度）
-            probs = visits.clone()
-            legal = legal_mask[:visits.shape[0]]
-            legal_visits = probs.clone()
-            legal_visits[~legal] = 0.0
-
-            if legal_visits.sum().item() <= 0:
-                action_idx = int(torch.multinomial(legal.float(), 1).item())
-            elif temperature <= 1e-6:
-                action_idx = int(torch.argmax(legal_visits).item())
-            else:
-                adjusted = torch.pow(legal_visits, 1.0 / temperature)
-                adjusted[~legal] = 0.0
-                adjusted = adjusted / adjusted.sum().clamp_min(1e-8)
-                action_idx = int(torch.multinomial(adjusted, 1).item())
+            action_idx = _sample_action_from_visits(
+                visits, legal_mask, temperature
+            )
 
             env.step(action_idx)
 
-        gr = env.last_game_result
-        if gr is not None:
-            if gr.value == WHITE:
-                winner = WHITE
-            elif gr.value == BLACK:
-                winner = BLACK
-            else:
-                winner = 0
-        else:
-            winner = 0
+        winner = _winner_from_result(env.last_game_result)
 
         if winner == 0:
             result.draws += 1
@@ -143,6 +141,171 @@ def gate_keeper(
             )
 
     return result
+
+
+def _sample_action_from_visits(
+    visits: torch.Tensor,
+    legal_mask: torch.Tensor,
+    temperature: float,
+) -> int:
+    """根據 MCTS 訪問次數 + 溫度採樣一個動作索引。
+
+    temperature <= 1e-6 時退化成貪婪選取最大訪問數的動作。
+    """
+    legal = legal_mask[: visits.shape[0]]
+    legal_visits = visits.clone()
+    legal_visits[~legal] = 0.0
+
+    if legal_visits.sum().item() <= 0:
+        return int(torch.multinomial(legal.float(), 1).item())
+    if temperature <= 1e-6:
+        return int(torch.argmax(legal_visits).item())
+
+    adjusted = torch.pow(legal_visits, 1.0 / temperature)
+    adjusted[~legal] = 0.0
+    adjusted = adjusted / adjusted.sum().clamp_min(1e-8)
+    return int(torch.multinomial(adjusted, 1).item())
+
+
+def _winner_from_result(result: Any) -> int:
+    """把環境結果轉成 winner（WHITE / BLACK / 0=draw）。"""
+    if result is None:
+        return 0
+    if result.value == WHITE:
+        return WHITE
+    if result.value == BLACK:
+        return BLACK
+    return 0
+
+
+def _gate_keeper_parallel(
+    candidate: torch.nn.Module,
+    guard: torch.nn.Module,
+    n_games: int,
+    device: torch.device,
+    simulations: int,
+    temperature: float,
+    env_cfg: Any,
+    search_manager: CppSearchManager,
+) -> GateResult:
+    """平行 gate：重用 C++ SearchManager 常駐 worker pool。
+
+    所有 n_games 局同時 active，每一輪決策：
+      1. 依 env.current_player 把 active 局分成 candidate 組 / guard 組。
+      2. 對每組各呼叫 reset_trees() + run_search(policy)。
+         - candidate 組餵 candidate，guard 組餵 guard。
+      3. 對每局用回傳的 visits 採樣動作 → env.step()。
+      4. 結束的局統計勝負並移除；未完的留在下一輪。
+
+    gate 只統計勝負，不建構/回傳任何 PolicySample。
+    """
+    result = GateResult()
+
+    # 建立 active 局池。candidate 與 guard 輪流先手。
+    active: list = []
+    for i in range(n_games):
+        env = TzaarEnv(env_cfg)
+        env.reset()
+        active.append(
+            {
+                "env": env,
+                "candidate_player": WHITE if i % 2 == 0 else BLACK,
+            }
+        )
+
+    completed = 0
+    while completed < n_games:
+        # 依 current_player 分組
+        candidate_entries: list = []
+        guard_entries: list = []
+        for entry in active:
+            if entry["env"].current_player == entry["candidate_player"]:
+                candidate_entries.append(entry)
+            else:
+                guard_entries.append(entry)
+
+        # candidate 組搜尋
+        candidate_outputs = _run_parallel_batch(
+            candidate_entries, candidate, device, simulations, search_manager
+        )
+        # guard 組搜尋
+        guard_outputs = _run_parallel_batch(
+            guard_entries, guard, device, simulations, search_manager
+        )
+        all_outputs = {**candidate_outputs, **guard_outputs}
+
+        survivors: list = []
+        for entry in candidate_entries + guard_entries:
+            out = all_outputs.get(id(entry))
+            if out is None:
+                raise RuntimeError("missing parallel search output for a game")
+            visits = out["visits"]
+            legal_mask = out["legal_mask"]
+
+            action_idx = _sample_action_from_visits(
+                visits, legal_mask, temperature
+            )
+            env = entry["env"]
+            env.step(action_idx)
+
+            if env.game_in_progress:
+                survivors.append(entry)
+            else:
+                winner = _winner_from_result(env.last_game_result)
+                if winner == 0:
+                    result.draws += 1
+                elif winner == entry["candidate_player"]:
+                    result.candidate_wins += 1
+                else:
+                    result.guard_wins += 1
+                completed += 1
+
+                if completed % 10 == 0 or completed == n_games:
+                    print(
+                        f"  [gate][parallel] completed {completed}/{n_games}: "
+                        f"candidate={result.candidate_wins} "
+                        f"guard={result.guard_wins} "
+                        f"draw={result.draws} win_rate={result.win_rate:.3f}"
+                    )
+
+        active = survivors
+
+    return result
+
+
+def _run_parallel_batch(
+    entries: list,
+    policy: torch.nn.Module,
+    device: torch.device,
+    simulations: int,
+    search_manager: CppSearchManager,
+) -> Dict[int, Any]:
+    """對一組 root states 執行一次 C++ SearchManager 平行搜尋。
+
+    entries 必須為同一組（全由 candidate 或全由 guard 掌控），
+    因為 C++ SearchManager 一次 run_search 只能套單一 policy。
+
+    回傳 { id(entry): output_dict }。
+    """
+    if not entries:
+        return {}
+
+    root_states = [_build_phase_state_from_env(entry["env"]) for entry in entries]
+
+    search_manager.reset_trees(
+        root_states,
+        simulations=simulations,
+        apply_dirichlet_noise=False,  # gate 不做探索雜訊
+    )
+    outputs = search_manager.run_search(policy, device)
+
+    if len(outputs) != len(entries):
+        raise RuntimeError(
+            "SearchManager output count mismatch: "
+            f"{len(outputs)} vs {len(entries)}"
+        )
+
+    return {id(entries[i]): outputs[i] for i in range(len(entries))}
 
 
 def _build_phase_state_from_env(env: TzaarEnv) -> Any:

@@ -98,15 +98,25 @@ class CppSearchManager:
         print(
             f"[SearchManager] __init__: threads={num_threads}, "
             f"max_batch={max_batch}, timeout={response_timeout_s}s"
-        )
+                )
 
-    def _build_config(self, simulations: int) -> Any:
-        """建立 SearchConfig。"""
+    def _build_config(self, simulations: int, apply_dirichlet_noise: bool = True) -> Any:
+        """建立 SearchConfig。
+
+        參數
+        ----
+        simulations : 每棵樹的模擬次數
+        apply_dirichlet_noise : 是否在根節點加上 Dirichlet 探索雜訊。
+            self-play 預設開（配合 MCTS_CFG.use_root_dirichlet_noise），
+            gate 評估時關閉（傳 False）。
+        """
         cfg = self._module.SearchConfig()
         cfg.simulations = int(simulations)
         cfg.leaf_batch_size = int(MCTS_CFG.leaf_batch_size)
         cfg.puct_c = float(MCTS_CFG.puct_c)
-        cfg.add_root_dirichlet_noise = bool(MCTS_CFG.use_root_dirichlet_noise)
+        cfg.add_root_dirichlet_noise = bool(
+            apply_dirichlet_noise and MCTS_CFG.use_root_dirichlet_noise
+        )
         cfg.root_dirichlet_eps = float(MCTS_CFG.root_dirichlet_eps)
         cfg.root_dirichlet_alpha = float(MCTS_CFG.root_dirichlet_alpha)
         cfg.min_batch_for_swap = int(ASYNC_MCTS_CFG.min_batch_for_swap)
@@ -123,6 +133,7 @@ class CppSearchManager:
         self,
         root_states: List[Any],
         simulations: int = 600,
+        apply_dirichlet_noise: bool = True,
     ) -> None:
         """重置所有搜尋樹（保留 worker pool）。
 
@@ -130,6 +141,9 @@ class CppSearchManager:
         ----
         root_states : 每棵樹的根狀態（CppPhaseGameStateAdapter 列表）
         simulations : 每棵樹的模擬次數
+        apply_dirichlet_noise : 是否在根節點加上 Dirichlet 探索雜訊。
+            self-play 預設開（配合 MCTS_CFG.use_root_dirichlet_noise）。
+            gate 評估時請傳 False 以關閉探索雜訊，決定更貼近純評估。
         """
         if not root_states:
             raise ValueError("root_states must not be empty")
@@ -142,7 +156,7 @@ class CppSearchManager:
                 )
 
         # 建立 SearchConfig
-        cfg = self._build_config(simulations)
+        cfg = self._build_config(simulations, apply_dirichlet_noise)
         self._config = cfg
 
         inner_states = [s._inner for s in root_states]

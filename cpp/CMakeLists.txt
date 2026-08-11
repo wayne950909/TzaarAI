@@ -45,7 +45,6 @@ set(TZAAR_SOURCES
     src/features/cnn_builder.cpp
     src/mcts/search.cpp
     src/mcts/search_manager.cpp
-    src/mcts/bench.cpp
 )
 
 set(TZAAR_INCLUDE_DIRS

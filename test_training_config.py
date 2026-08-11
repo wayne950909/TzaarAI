@@ -27,28 +27,28 @@ from config import (
 
 # ─── 測試用極小參數 ─────────────────────────────────────
 print("=" * 60)
-print("C++ 重構測試 — 小參數訓練驗證")
+print("王柏崴你好")
 print("=" * 60)
 
 # 訓練配置
-TRAINING_CFG.total_updates = 1          # 只做 2 個 update
+TRAINING_CFG.total_updates = 6          # 只做 2 個 update
 TRAINING_CFG.games_per_update = 200      # 每輪 5 場遊戲
 TRAINING_CFG.log_every = 1
 TRAINING_CFG.checkpoint_every_updates = 10  # 測試時不存
 
 # Self-play
 SELFPLAY_CFG.temp_high = 1.0
-SELFPLAY_CFG.temp_low = 0.5
-SELFPLAY_CFG.temp_switch_decision = 5
+SELFPLAY_CFG.temp_low = 0.1
+SELFPLAY_CFG.temp_switch_decision = 8
 
 # MCTS
-MCTS_CFG.simulations = 128         # 極少模擬
+MCTS_CFG.simulations = 256         # 極少模擬
 MCTS_CFG.leaf_batch_size = 16
 MCTS_CFG.puct_c = 1.5
-MCTS_CFG.use_root_dirichlet_noise = False
+MCTS_CFG.use_root_dirichlet_noise = True
 
 # Gate — 測試時跳過（設為極大值）
-GATE_CFG.eval_every_updates = 999
+GATE_CFG.eval_every_updates = 2
 
 print("\n訓練參數：")
 print(f"  total_updates = {TRAINING_CFG.total_updates}")

@@ -239,19 +239,46 @@ def run(title: str) -> None:
             )
             search_manager = None
 
-    # ── 載入/初始化政策網路 ────────────────────────────
+        # ── 載入/初始化政策網路 ────────────────────────────
     # 這裡開始進入正式訓練 lifecycle：
     # backend 已決定、裝置已準備好，接下來所有流程都使用同一組 policy / optimizer。
+    #
+    # guard_title 由 candidate 的 title 推導而來，確保「訓練 + 存檔 + resume」
+    # 使用一致的命名，避免 guard checkpoint 散落在不同 title 下而找不到。
+    guard_title = f"{title}_guard"
+
     start_time = time.perf_counter()
-    policy, optimizer, start_update, next_ckpt_idx, replay_buffer, replay_write_idx = (
-        load_or_init_policy(device)
+    policy, optimizer, start_update, _, replay_buffer, replay_write_idx = (
+        load_or_init_policy(device, guard_title=guard_title, title=title)
     )
     optimizer_to(optimizer, device)
     policy.train()
 
-    guard_policy, guard_source = load_or_init_guard_policy(device, policy)
+    guard_policy, guard_source = load_or_init_guard_policy(
+        device, policy, guard_title=guard_title
+    )
     guard_policy.eval()
-    print(f"[guard] source = {guard_source}")
+    print(f"[guard] title = {guard_title} | source = {guard_source}")
+
+        # 追蹤 guard checkpoint 的下一個可用 index。若目前還沒有任何 guard
+    # checkpoint，先把目前（candidate）權重存成初始 guard，這樣後續 resume
+    # 才能直接接續強化，而不會每次從隨機權重重開新局。
+    existing_guard = train_module.list_checkpoints(title=guard_title)
+    next_guard_ckpt_idx = (
+        max(item.index for item in existing_guard) + 1 if existing_guard else 0
+    )
+    if not existing_guard:
+        train_module.save_checkpoint(
+            title=guard_title,
+            policy=guard_policy,
+            optimizer=optimizer,
+            update_idx=max(0, start_update - 1),
+            samples_in_update=0,
+            inference_temperature=float(SELFPLAY_CFG.temp_low),
+            checkpoint_index=int(next_guard_ckpt_idx),
+        )
+        next_guard_ckpt_idx += 1
+        print(f"[guard] bootstrapped initial guard checkpoint under {guard_title}")
 
     env_cfg = EnvConfig(max_steps=TRAINING_GAME_STEPS)
     total_updates = TRAINING_CFG.total_updates
@@ -316,18 +343,30 @@ def run(title: str) -> None:
                 fresh_samples,
             )
 
-        train_samples = select_train_samples(fresh_samples, replay_buffer)
+                # ── GRADIENT PASS 迴圈 ─────────────────────────────
+        # 每次 pass 都用 select_train_samples 重新抽樣，再執行完整
+        # (train_epochs_per_update × batch_size) 訓練。
+        # metrics 取最後一次 pass 的結果作為該 update 的代表性 metrics。
+        n_passes = max(1, int(TRAINING_CFG.optimization_passes_per_update))
+        train_samples: list = []
+        metrics: Dict[str, float] = {}
+        action_kind_mass = [0.0, 0.0, 0.0]
+        kind_legal_counts = [0, 0, 0]
+        phase2_count = 0
+        for pass_idx in range(n_passes):
+            # 每次 pass 都重新抽樣（有放回/無放回取最近樣本）
+            train_samples = select_train_samples(fresh_samples, replay_buffer)
 
-        # 動作類型統計
-        action_kind_mass: list[float] = [0.0, 0.0, 0.0]
-        kind_legal_counts: list[int] = [0, 0, 0]
-        phase2_count = accumulate_kind_stats(
-            train_samples,
-            action_kind_mass,
-            kind_legal_counts,
-        )
+            # 動作類型統計（每次重新抽樣後重新累計）
+            action_kind_mass = [0.0, 0.0, 0.0]
+            kind_legal_counts = [0, 0, 0]
+            phase2_count = accumulate_kind_stats(
+                train_samples,
+                action_kind_mass,
+                kind_legal_counts,
+            )
 
-        metrics = train_on_samples(policy, optimizer, train_samples, device)
+            metrics = train_on_samples(policy, optimizer, train_samples, device)
         nvtx.range_pop()  # update_{idx}
 
         # ── Gate ──────────────────────────────────────────
@@ -346,12 +385,37 @@ def run(title: str) -> None:
                     game_cfg=None,
                     env_cfg=env_cfg,
                     hp=hp,
+                    search_manager=search_manager,
                                 )
-            gate_passed = gate_result.win_rate >= GATE_CFG.winrate_threshold
+                gate_passed = gate_result.win_rate >= GATE_CFG.winrate_threshold
             if gate_passed:
                 print(f"[gate] PASSED | win_rate={gate_result.win_rate:.3f}")
                 guard_policy.load_state_dict(policy.state_dict(), strict=True)
                 guard_policy.eval()
+                                                                # candidate 通過 gate → 把目前的權重存成一個 guard checkpoint。
+                # 這是「guard 唯一會寫入磁碟」的時機，讓後續 resume 能接續強化。
+                train_module.save_checkpoint(
+                    title=guard_title,
+                    policy=guard_policy,
+                    optimizer=optimizer,
+                    update_idx=update_idx,
+                    samples_in_update=len(fresh_samples),
+                    inference_temperature=inference_temperature,
+                    checkpoint_index=int(next_guard_ckpt_idx),
+                )
+                next_guard_ckpt_idx += 1
+                print(f"[guard] saved promoted guard checkpoint: {guard_title}")
+                # gate 通過時也一併保存 replay buffer，讓 resume 能還原
+                # 當前 self-play 累積的資料，而不只是權重。
+                if REPLAY_CFG.enabled and replay_buffer:
+                    save_replay_snapshot_async(
+                        title=guard_title,
+                        checkpoint_index=None,
+                        update_idx=update_idx,
+                        replay_buffer=replay_buffer,
+                        write_idx=replay_write_idx,
+                        max_samples=REPLAY_CFG.max_samples,
+                    )
             else:
                 print(
                     f"[gate] FAILED | win_rate={gate_result.win_rate:.3f} "
@@ -386,32 +450,6 @@ def run(title: str) -> None:
                 f"sps={sps_total:.0f}"
             )
 
-        # ── Checkpoint ──────────────────────────────────
-        ckpt_saved = False
-        if (update_idx % TRAINING_CFG.checkpoint_every_updates == 0) or update_idx >= total_updates - 1:
-            ckpt_path = train_module.save_checkpoint(
-                title=title,
-                policy=policy,
-                optimizer=optimizer,
-                update_idx=update_idx,
-                samples_in_update=samples_in_update,
-                inference_temperature=inference_temperature,
-                checkpoint_index=int(next_ckpt_idx),
-            )
-            next_ckpt_idx += 1
-            ckpt_saved = True
-
-            if REPLAY_CFG.enabled and fresh_samples:
-                save_replay_snapshot_async(
-                    title=title,
-                    checkpoint_index=None,
-                    update_idx=update_idx,
-                    replay_buffer=replay_buffer,
-                    write_idx=replay_write_idx,
-                    max_samples=REPLAY_CFG.max_samples,
-                                        base_dir=ckpt_path.parent,
-                )
-
         update_elapsed = time.perf_counter() - update_start
         print(
             f"  [{update_idx}] update took {update_elapsed:.2f}s "
@@ -420,27 +458,7 @@ def run(title: str) -> None:
             f"n_train={len(train_samples)}"
         )
 
-        # ── 訓練結束 ──────────────────────────────────────
-    final_ckpt = train_module.save_checkpoint(
-        title=title,
-        policy=policy,
-        optimizer=optimizer,
-        update_idx=total_updates - 1,
-        samples_in_update=0,
-        inference_temperature=float(SELFPLAY_CFG.temp_low),
-        checkpoint_index=int(next_ckpt_idx),
-    )
-    if REPLAY_CFG.enabled and replay_buffer:
-        save_replay_snapshot_async(
-            title=title,
-            checkpoint_index=None,
-            update_idx=total_updates - 1,
-            replay_buffer=replay_buffer,
-            write_idx=replay_write_idx,
-            max_samples=REPLAY_CFG.max_samples,
-            base_dir=final_ckpt.parent,
-                )
-
+                # ── 訓練結束 ──────────────────────────────────────
     elapsed_total = time.perf_counter() - start_time
     print(f"[done] total time: {elapsed_total:.1f}s")
     print(f"[done] total fresh samples generated: {total_fresh_samples}")
