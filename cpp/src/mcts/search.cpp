@@ -213,9 +213,8 @@ SearchResult SearchSession::finish() {
   result.is_complete = is_complete();
   result.needs_root_eval = has_pending_leaves();
   result.simulations_requested = config_.simulations;
-    result.simulations_processed = simulations_processed_;
-    result.pending_leaf_count = static_cast<int>(pending_node_order_.size());
-  result.node_count = next_free_node_idx_;  // 搜尋結束後整棵樹的節點數（含根節點）
+  result.simulations_processed = simulations_processed_;
+  result.pending_leaf_count = static_cast<int>(pending_node_order_.size());
   result.root_value = nodes_[root_node_index_].mean_value();
 
     // 根節點 legal mask：臨時產生，不長期佔用節點空間。
@@ -223,18 +222,6 @@ SearchResult SearchSession::finish() {
     PhaseGameState tmp = root_state_.clone();
     const std::vector<bool> m = tmp.legal_mask();
     result.legal_mask.assign(m.begin(), m.end());
-  }
-
-    // 統計這棵樹所有節點的最大合法步數量。
-  // 合法步數 = children_count（Flat Pool 隱含），零額外開銷。
-  {
-    int max_legal_moves = 0;
-    for (int i = 0; i < next_free_node_idx_; ++i) {
-      const MctsNode& nd = nodes_[i];
-      if (!nd.expanded) continue;
-      if (nd.children_count > max_legal_moves) max_legal_moves = nd.children_count;
-    }
-    result.max_node_legal_moves = max_legal_moves;
   }
 
   result.root_policy.assign(static_cast<std::size_t>(kActionCount), 0.0f);

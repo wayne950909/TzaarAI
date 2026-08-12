@@ -314,6 +314,7 @@ def run(title: str) -> None:
         # - 是否因錯誤而 fallback 到 sync-single
         nvtx.range_push("selfplay")
         policy.eval()
+        sp_t0 = time.perf_counter()
         with torch.no_grad():
                         fresh_samples, games_played, n_new_samples, inference_temperature = _collect_selfplay_samples(
                 policy,
@@ -325,6 +326,15 @@ def run(title: str) -> None:
                 _rng_seed_offset,
                 search_manager=search_manager,
             )
+        sp_elapsed = time.perf_counter() - sp_t0
+        avg_steps = (n_new_samples / games_played) if games_played > 0 else 0.0
+        print(
+            f"[self-play] update {update_idx} done | "
+            f"games={games_played} | "
+            f"time={sp_elapsed:.2f}s | "
+            f"samples={n_new_samples} | "
+            f"avg_steps={avg_steps:.1f}"
+        )
         total_fresh_samples += n_new_samples
         nvtx.range_pop()  # selfplay
 
@@ -463,39 +473,7 @@ def run(title: str) -> None:
     print(f"[done] total time: {elapsed_total:.1f}s")
     print(f"[done] total fresh samples generated: {total_fresh_samples}")
 
-    # ── 輸出「每棵樹節點數的最大值」 ─────────────────────
-    # 訓練全程每個 update 都會用 CppSearchManager 平行搜尋多棵樹
-    # （例如一次 200 棵）。這裡印出：
-    #   - max_tree_nodes_any   整個訓練所有被搜尋的樹之中，單棵樹創建節點數的最大值
-    #   - max_tree_nodes_last  最近一次搜尋批次（最後一批樹）的單棵樹節點數最大值
-    if search_manager is not None:
-        max_any = getattr(search_manager, "max_node_count", 0)
-        max_last = getattr(search_manager, "last_batch_max_node_count", 0)
-        print(
-            f"[node-count] training finished | "
-            f"max_tree_nodes_any={max_any} | "
-            f"max_tree_nodes_last_batch={max_last}"
-        )
-
-                # 每棵樹「所有節點中的最大合法步數量」的全程/最近批次最大值
-        max_legal_any = getattr(search_manager, "max_node_legal_moves", 0)
-        max_legal_last = getattr(
-            search_manager, "last_batch_max_node_legal_moves", 0
-        )
-        print(
-            f"[node-legal-moves] training finished | "
-            f"max_tree_node_legal_moves_any={max_legal_any} | "
-            f"max_tree_node_legal_moves_last_batch={max_legal_last}"
-        )
-
-        # 所有樹節點數總和（最近批次／全程累積）
-        total_last = getattr(search_manager, "last_batch_total_node_count", 0)
-        total_any = getattr(search_manager, "total_node_count", 0)
-        print(
-            f"[node-total] training finished | "
-            f"last_batch_total_tree_nodes={total_last} | "
-            f"overall_total_tree_nodes={total_any}"
-        )
+        # ── 所有樹節點數等統計（已移除；見 git history）──
 
     # ── 關閉 SearchManager（如已建立） ────────────────
     if search_manager is not None:

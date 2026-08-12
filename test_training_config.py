@@ -31,7 +31,7 @@ print("王柏崴你好")
 print("=" * 60)
 
 # 訓練配置
-TRAINING_CFG.total_updates = 6          # 只做 2 個 update
+TRAINING_CFG.total_updates = 20          # 只做 2 個 update
 TRAINING_CFG.games_per_update = 200      # 每輪 5 場遊戲
 TRAINING_CFG.log_every = 1
 TRAINING_CFG.checkpoint_every_updates = 10  # 測試時不存

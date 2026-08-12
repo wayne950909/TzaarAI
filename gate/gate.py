@@ -133,13 +133,6 @@ def gate_keeper(
         else:
             result.guard_wins += 1
 
-        if (game_idx + 1) % 10 == 0 or game_idx == n_games - 1:
-            print(
-                f"  [gate] game {game_idx + 1}/{n_games}: "
-                f"candidate={result.candidate_wins} guard={result.guard_wins} "
-                f"draw={result.draws} win_rate={result.win_rate:.3f}"
-            )
-
     return result
 
 
@@ -259,14 +252,6 @@ def _gate_keeper_parallel(
                 else:
                     result.guard_wins += 1
                 completed += 1
-
-                if completed % 10 == 0 or completed == n_games:
-                    print(
-                        f"  [gate][parallel] completed {completed}/{n_games}: "
-                        f"candidate={result.candidate_wins} "
-                        f"guard={result.guard_wins} "
-                        f"draw={result.draws} win_rate={result.win_rate:.3f}"
-                    )
 
         active = survivors
 

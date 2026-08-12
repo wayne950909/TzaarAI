@@ -27,7 +27,7 @@ mcts/cpp_manager.py — C++ SearchManager Python 包裝
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
@@ -80,25 +80,6 @@ class CppSearchManager:
             self._max_batch,
         )
         self._n_trees = 0
-
-                # 整個訓練期間累積的各樹節點數統計
-        self.max_node_count = 0             # 所有搜尋批次中，單棵樹創建節點數的最大值
-        self.last_batch_max_node_count = 0  # 最近一次搜尋批次中，單棵樹創建節點數的最大值
-
-        # 整個訓練期間累積的各樹「節點最大合法步數量」統計
-        # （每棵樹所有節點中，單一節點的最大合法步數量）
-        self.max_node_legal_moves = 0
-        self.last_batch_max_node_legal_moves = 0
-
-        # 各搜尋批次中「所有樹節點數的總和」統計
-        self.last_batch_total_node_count = 0  # 最近一次搜尋批次中，所有樹節點數的總和
-        self.total_node_count = 0             # 整個訓練期間所有搜尋批次累積的節點數總和
-
-
-        print(
-            f"[SearchManager] __init__: threads={num_threads}, "
-            f"max_batch={max_batch}, timeout={response_timeout_s}s"
-                )
 
     def _build_config(self, simulations: int, apply_dirichlet_noise: bool = True) -> Any:
         """建立 SearchConfig。
@@ -160,9 +141,7 @@ class CppSearchManager:
         self._config = cfg
 
         inner_states = [s._inner for s in root_states]
-        t0 = time.perf_counter()
         self._manager.reset(inner_states, cfg)
-        elapsed = time.perf_counter() - t0
         self._state_list = list(root_states)
         self._n_trees = len(root_states)
 
@@ -204,14 +183,8 @@ class CppSearchManager:
                 "SearchManager not initialized; call reset_trees() first"
             )
 
-        # workers 已被 reset_trees() 喚醒，開始搜尋
+                # workers 已被 reset_trees() 喚醒，開始搜尋
         # 主事件迴圈
-        loop_iter = 0
-        total_batches_processed = 0
-        total_leaves_evaluated = 0
-        t_start = time.perf_counter()
-        next_progress_log = 10
-
         while not self._manager.is_complete():
             nvtx.range_push("wait_for_batch")
             packed = self._manager.get_ready_batch()
@@ -220,23 +193,10 @@ class CppSearchManager:
             batch_size = int(packed["batch_size"])
 
             if batch_size == 0:
-                loop_iter += 1
                 nvtx.range_push("idle_sleep")
-                if loop_iter % 100 == 0:
-                    completed_trees = self._manager.completed_tree_count()
-                    swap_reason = self._manager.last_swap_reason()
-                    print(
-                        f"  [SearchManager]  idle loop={loop_iter}, "
-                        f"trees_completed={completed_trees}/{self._n_trees}, "
-                        f"last_swap={swap_reason}"
-                    )
                 time.sleep(0.001)
                 nvtx.range_pop()
                 continue
-
-            loop_iter += 1
-            total_batches_processed += 1
-            total_leaves_evaluated += batch_size
 
             nvtx.range_push("cpu_transfer_and_prep")
             # ── 從 packed buffer 取出資料 ──────────────
@@ -289,80 +249,10 @@ class CppSearchManager:
             )
             nvtx.range_pop()  # submit_eval
 
-            if total_batches_processed >= next_progress_log:
-                completed_trees = self._manager.completed_tree_count()
-                remaining = self._manager.total_remaining_simulations()
-                total_sims = self._n_trees * self._config.simulations
-                swap_reason = self._manager.last_swap_reason()
-                elapsed = time.perf_counter() - t_start
-                print(
-                    f"  [SearchManager]  batches={total_batches_processed}, "
-                    f"leaves={total_leaves_evaluated}, "
-                    f"trees_completed={completed_trees}/{self._n_trees}, "
-                    f"remaining={remaining}/{total_sims}, "
-                    f"swap={swap_reason}, "
-                    f"elapsed={elapsed:.1f}s"
-                )
-                next_progress_log = total_batches_processed * 2
-
-        elapsed_total = time.perf_counter() - t_start
-        swap_reason = self._manager.last_swap_reason()
-        print(
-            f"[SearchManager] search done: "
-            f"{total_batches_processed} batches, "
-            f"{total_leaves_evaluated} leaves, "
-            f"elapsed={elapsed_total:.3f}s, "
-            f"last_swap={swap_reason}"
-        )
 
                         # ── 所有樹已完成，取回結果 ─────────────────────
         # workers 在空的佇列上 wait，等著下一次 reset
-        t0 = time.perf_counter()
         raw_results = self._manager.finish_all()
-        finish_elapsed = time.perf_counter() - t0
-        print(
-            f"[SearchManager] finish_all(): {len(raw_results)} results "
-            f"in {finish_elapsed:.3f}s"
-        )
-
-        # ── 統計這一批搜尋中「單棵樹節點數的最大值」並累積全程最大值 ──
-        if raw_results:
-            self.last_batch_max_node_count = max(
-                int(r.node_count) for r in raw_results
-            )
-            self.max_node_count = max(
-                self.max_node_count, self.last_batch_max_node_count
-            )
-            print(
-                f"[SearchManager] node-count | batch_trees={len(raw_results)}, "
-                f"batch_max_tree_nodes={self.last_batch_max_node_count}, "
-                f"overall_max_tree_nodes={self.max_node_count}"
-            )
-
-                        # ── 統計這一批搜尋中「所有樹節點數的總和」並累積全程總和 ──
-            self.last_batch_total_node_count = sum(
-                int(r.node_count) for r in raw_results
-            )
-            self.total_node_count += self.last_batch_total_node_count
-            print(
-                f"[SearchManager] node-total | batch_trees={len(raw_results)}, "
-                f"batch_total_tree_nodes={self.last_batch_total_node_count}, "
-                f"overall_total_tree_nodes={self.total_node_count}"
-            )
-
-            # ── 統計「每棵樹所有節點中的最大合法步數量」並累積全程最大值 ──
-            self.last_batch_max_node_legal_moves = max(
-                int(r.max_node_legal_moves) for r in raw_results
-            )
-            self.max_node_legal_moves = max(
-                self.max_node_legal_moves,
-                self.last_batch_max_node_legal_moves,
-            )
-            print(
-                f"[SearchManager] node-legal-moves | batch_trees={len(raw_results)}, "
-                f"batch_max_tree_node_legal_moves={self.last_batch_max_node_legal_moves}, "
-                f"overall_max_tree_node_legal_moves={self.max_node_legal_moves}"
-            )
 
         outputs: List[Dict[str, Any]] = []
         for i, result in enumerate(raw_results):
@@ -400,11 +290,9 @@ class CppSearchManager:
                                         "replay_board": replay_board,
                     "replay_global": replay_global,
                                         "root_value": result.root_value,
-                    "root_player": result.root_player,
-                    "is_done": result.is_done,
-                    "winner": result.winner,
-                    "node_count": int(result.node_count),
-                    "max_node_legal_moves": int(result.max_node_legal_moves),
+                                        "root_player": result.root_player,
+                                        "is_done": result.is_done,
+                                        "winner": result.winner,
                 }
             )
 
