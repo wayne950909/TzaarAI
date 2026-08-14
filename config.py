@@ -102,7 +102,7 @@ class AsyncMCTSConfig:
     """多 CPU worker + 共享 GPU worker 的非同步 pipeline"""
     enabled: bool = True
     # 同時進行的 active game pool 大小（例如 200 局平行推進）
-    parallel_games: int = 200
+    parallel_games: int = 400
     # C++ SearchManager 的常駐 worker thread 數量（固定不變）
     num_threads: int = 10
     # 單次 GPU forward 最多聚合多少個 leaf states。
@@ -125,7 +125,7 @@ class AsyncMCTSConfig:
     buffer_capacity_per_tree: int = 16
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
-    ready_flush_leaves: int = 16
+    ready_flush_leaves: int = 64
 
     # ── C++ SearchManager 內部 Debug Log ──────────────────
     # 在 config.py 設定，經 cpp_manager._build_config 傳入 C++ SearchManager。
@@ -161,8 +161,8 @@ SELFPLAY_CFG = SelfPlayConfig()
 @dataclass
 class TrainingConfig:
     """訓練主迴圈的超參數"""
-    total_updates: int = 100
-    games_per_update: int = 200
+    total_updates: int = 200
+    games_per_update: int = 400
     selfplay_model_game_ratio: float = 1.0  # 純自我對弈比例 (0~1)
     train_epochs_per_update: int = 1
     optimization_passes_per_update: int = 5
@@ -205,11 +205,11 @@ OPTIMIZER_CFG = OptimizerConfig()
 @dataclass
 class GatekeeperConfig:
     """Gatekeeper 評估的超參數"""
-    eval_games: int = 50
+    eval_games: int = 100
     winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
-    simulations_per_decision: int = 256  # 評估時的 MCTS 模擬數
-    eval_every_updates: int = 2        # 每 N 次更新執行一次
+    simulations_per_decision: int = 400  # 評估時的 MCTS 模擬數
+    eval_every_updates: int = 1        # 每 N 次更新執行一次
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True
 

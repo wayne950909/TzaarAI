@@ -73,7 +73,7 @@ class SearchSession {
   // 提交單一節點的評估結果（供 SearchManager 使用）
   // 與 submit_leaf_eval 不同，不會觸發 process_pending_evals
   // 而是將結果暫存，等所有 pending 都到齊後自動處理
-  void submit_single_eval(int node_id,
+  bool submit_single_eval(int node_id,
                           const float* priors,
                           float value);
 
@@ -107,8 +107,8 @@ class SearchSession {
     }
   };
 
-    static constexpr int root_node_index_ = 0;
-  static constexpr int kMaxNodesPerTree = 50000;   // 節點池容量上限
+  static constexpr int root_node_index_ = 0;
+  static constexpr int kMaxNodesPerTree = 65000;   // 節點池容量上限
   SearchConfig config_;
   int root_node_id_ = 1;
   int simulations_processed_ = 0;

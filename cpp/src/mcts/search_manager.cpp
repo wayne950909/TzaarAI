@@ -281,7 +281,7 @@ void SearchManager::worker_loop(int thread_id) {
     if (tree_id < 0) break;
 
     // ── 模擬並寫入 active buffer ──────────────────────────
-    simulate_tree_into_local(tree_id, wb);
+    int n = simulate_tree_into_local(tree_id, wb);
 
     // ── 依 adjust.md 檢查是否設 active buffer 為 ready ──
     // 到達「一定資料量」且另一側不是 ready 時才會觸發（seal_ready 內部檢查）。
@@ -324,12 +324,21 @@ int SearchManager::wait_for_simulable_tree(WorkerBuffers& wb, int thread_id) {
       return tree_id;  // 可模擬
     }
   }
-
-  // 掃描不到可模擬樹 → 依 adjust.md：執行緒無法從佇列獲得樹時，
+    // 掃描不到可模擬樹 → 依 adjust.md：執行緒無法從佇列獲得樹時，
   // 將正在寫入的 buffer 設為 ready。
   seal_ready(wb, thread_id, true);
 
-  // 阻塞等佇列。
+    // 阻塞等佇列（此為 worker「沒事做」的等待點）：若之後長時間不再有
+  // 任何 worker/handler/main 日誌輸出，多半是此處沒等到 reenqueue → 卡住。
+  // 同時檢查本 worker 兩個 buffer 是否仍有資料（count>0）與 is_ready 狀態。
+  TZAAR_DEBUG_LOG("[worker-%d] no simulable tree -> wait | buf0 has_data=%d ready=%d count=%d | buf1 has_data=%d ready=%d count=%d",
+                  thread_id,
+                  wb.bufs[0].count > 0 ? 1 : 0,
+                  wb.bufs[0].is_ready.load(std::memory_order_acquire) ? 1 : 0,
+                  wb.bufs[0].count,
+                  wb.bufs[1].count > 0 ? 1 : 0,
+                  wb.bufs[1].is_ready.load(std::memory_order_acquire) ? 1 : 0,
+                  wb.bufs[1].count);
   int next = -1;
   if (!tree_queue_.wait_and_pop(next)) {
     TZAAR_DEBUG_LOG("[worker-%d] wait_and_pop returned stop -> exiting",
@@ -353,25 +362,20 @@ int SearchManager::wait_for_simulable_tree(WorkerBuffers& wb, int thread_id) {
 // 回傳 false = 已處理完畢（等 GPU / 已完成），呼叫端繼續尋找下一棵，
 //              該樹稍後由 result_handler 重新入隊。
 bool SearchManager::classify_popped_tree(int tree_id, int thread_id) {
+  (void)thread_id;  // 精簡 log 後不再使用，保留簽名以免改動呼叫端
   SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
 
   // 還在等 GPU：無法模擬。此樹由 result_handler 處理完後 reenqueue。
   if (tree.session->has_pending_leaves()) {
-    TZAAR_DEBUG_LOG("[worker-%d] popped tree %d but SKIPPED (pending_gpu)",
-                    thread_id, tree_id);
     return false;
   }
 
   // 已完整模擬：標記完成後試下一棵。
   if (tree.session->is_complete()) {
     complete_tree(tree);
-    TZAAR_DEBUG_LOG("[worker-%d] popped tree %d but COMPLETE",
-                    thread_id, tree_id);
     return false;
   }
 
-  TZAAR_DEBUG_LOG("[worker-%d] popped tree %d -> SIMULATE",
-                  thread_id, tree_id);
   return true;  // 可模擬
 }
 
@@ -386,11 +390,26 @@ void SearchManager::reenqueue_tree_if_needed(int tree_id) {
 void SearchManager::complete_tree(SearchTree& tree) {
   if (tree.completed) return;  // 防止重複標記
 
-  tree.completed = true;
+    tree.completed = true;
   const int completed = completed_count_.fetch_add(1, std::memory_order_release) + 1;
 
   TZAAR_DEBUG_LOG("[main] tree %d COMPLETE (%d/%d)",
                   tree.tree_id, completed, tree_count_);
+
+  // 偵測「差最後一棵」：當某棵樹完成後，完成數正好是 tree_count_-1，
+  // 表示剩最後一棵尚未 complete。找出它並輸出狀態，協助判斷卡住原因。
+  if (completed == tree_count_ - 1) {
+    for (const auto& tree_ptr : trees_) {
+      if (tree_ptr->completed) continue;
+      const int requested = tree_ptr->session->simulations_requested();
+      const int processed = tree_ptr->session->simulations_processed();
+      TZAAR_DEBUG_LOG("[main] LAST-REMAINING tree %d pending=%d remaining_sims=%d (req=%d proc=%d)",
+                      tree_ptr->tree_id,
+                      tree_ptr->session->has_pending_leaves() ? 1 : 0,
+                      requested - processed,
+                      requested, processed);
+    }
+  }
 
   if (is_complete()) {
     {
@@ -404,29 +423,14 @@ void SearchManager::complete_tree(SearchTree& tree) {
 // ══════════════════════════════════════════════════════════════════════
 // 模擬並寫入 worker 專屬 active buffer
 // ══════════════════════════════════════════════════════════════════════
-
-void SearchManager::simulate_tree_into_local(int tree_id, WorkerBuffers& wb) {
+// return 產出的數量
+int SearchManager::simulate_tree_into_local(int tree_id, WorkerBuffers& wb) {
   SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
   auto& session = tree.session;
 
   LocalEvalBuffer& buf = wb.bufs[wb.active_idx];
 
-  // adjust.md：buffer 最大容量是「硬上限」（填不滿），但 is_ready 的觸發是
-  // 「到達一定資料量」。此處把單次寫入目標設為 ready_flush_leaves_，
-  // 讓 worker 一到資料量就交由 worker_loop 觸發 seal_ready（不填滿容量）。
-  const int fill_target = std::min(local_capacity_, ready_flush_leaves_);
-
-  // 在同一棵樹上持續模擬，直到：
-  //   - active buffer 到達資料量（count >= fill_target）
-  //   - 樹的模擬次數已耗盡（is_complete）
-  //   - 樹 stalled（simulate_into_buffers 回傳 0 且有 pending leaves）
-  while (buf.count < fill_target) {
-    if (session->is_complete()) break;
-    if (session->has_pending_leaves()) break;
-
-    const int remaining_cap = fill_target - buf.count;
-    const int chunk = std::min(config_.leaf_batch_size, remaining_cap);
-    if (chunk <= 0) break;
+    const int chunk = config_.leaf_batch_size;
 
     // 計算要寫入 active buffer 的位置偏移
     float* board_ptr = buf.board_flat.data() +
@@ -441,7 +445,7 @@ void SearchManager::simulate_tree_into_local(int tree_id, WorkerBuffers& wb) {
     int32_t* node_ptr = buf.node_ids.data() + static_cast<std::size_t>(buf.count);
     int32_t* tree_ptr = buf.tree_ids.data() + static_cast<std::size_t>(buf.count);
 
-    int n = session->simulate_into_buffers(
+    int n = session->simulate_into_buffers( //產出最多chunk個，最少0個
         chunk,
         board_ptr, global_ptr, mask_ptr,
         node_ptr, tree_ptr,
@@ -450,13 +454,7 @@ void SearchManager::simulate_tree_into_local(int tree_id, WorkerBuffers& wb) {
     if (n > 0) {
       buf.count += n;
     }
-
-    // simulate_into_buffers 回傳 0 表示 stalled 或樹已 complete。
-    // 跳出 while 迴圈，不要 busy loop。
-    if (n == 0) {
-      break;
-    }
-  }
+    return n;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -494,7 +492,13 @@ bool SearchManager::seal_ready(WorkerBuffers& wb, int thread_id, bool force) {
   active.is_ready.store(true, std::memory_order_release);
   TZAAR_DEBUG_LOG("[worker-%d] buffer READY count=%d force=%d active_idx_before=%d",
                   thread_id, active.count, force ? 1 : 0, wb.active_idx);
-
+  // 通知主執行緒有就緒資料
+  {
+    std::lock_guard<std::mutex> lock(cv_mtx_);
+    batch_ready_ = true;
+  }
+  batch_ready_cv_.notify_one();
+  
   // flip 到另一側
   wb.active_idx = 1 - wb.active_idx;
   LocalEvalBuffer& next = wb.bufs[wb.active_idx];
@@ -502,26 +506,34 @@ bool SearchManager::seal_ready(WorkerBuffers& wb, int thread_id, bool force) {
   // 等 flip 後的新 active（= 另一側）被主執行緒收走清空後才可重寫。
   wait_for_other_collected(wb, wb.active_idx);
   next.count = 0;
-
-  // 通知主執行緒有就緒資料
-  {
-    std::lock_guard<std::mutex> lock(cv_mtx_);
-    batch_ready_ = true;
-  }
-  batch_ready_cv_.notify_one();
   return true;
 }
 
 // 等待指定側 buffer 被主執行緒收走清空（is_ready true→false）。
+// 這是「運作中卡住」最可能發生的點：若主執行緒從未收走此 buffer，
+// worker 會在此無限 spin。因此加入時間型 hang 偵測（單次等待超過閾值
+// 只警告一次，避免洗版），一旦觸發即代表主/worker 同步出問題。
 void SearchManager::wait_for_other_collected(WorkerBuffers& wb, int which) {
   LocalEvalBuffer& tgt = wb.bufs[which];
   int spin = 0;
+  const auto start = std::chrono::steady_clock::now();
+  bool warned = false;
   while (tgt.is_ready.load(std::memory_order_acquire)) {
     std::this_thread::yield();
     if (++spin > 10000) {
       // 長時間等待仍未被收走，交還 CPU 避免吃滿核心
       std::this_thread::sleep_for(std::chrono::microseconds(100));
       spin = 0;
+      // hang 偵測：等待超過 1 秒仍未被收走 → 極可能卡住（只警告一次）
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+      if (!warned && ms > 1000) {
+        warned = true;
+        TZAAR_DEBUG_LOG("[hang?] worker waits >%lldms for buf[%d] to be "
+                        "collected (main may be stuck)",
+                        static_cast<long long>(ms), which);
+      }
     }
   }
 }
@@ -551,14 +563,18 @@ SearchManager::PackedBatch SearchManager::get_ready_batch() {
     std::unique_lock<std::mutex> lock(cv_mtx_);
     // 依 adjust.md：主執行緒偵測到 worker 設 ready 的 buffer 後即可收走彙整。
     // 等到「任一 worker buffer 就緒」或「搜尋完成」才喚醒。
-    batch_ready_cv_.wait(lock, [this]() {
+        batch_ready_cv_.wait(lock, [this]() {
       return has_ready_batch() ||
              (completed_count_.load(std::memory_order_acquire) >= tree_count_ &&
               batch_ready_);
     });
-    if (has_ready_batch()) {
+    // 記錄喚醒原因：1=有就緒 buffer 可彙整；0=搜尋完成（batch_ready）
+    const bool woke_ready = has_ready_batch();
+    if (woke_ready) {
       batch_ready_ = false;
     }
+    TZAAR_DEBUG_LOG("[main] get_ready_batch woke ready=%d (trees=%d/%d)",
+                    woke_ready ? 1 : 0, completed_tree_count(), tree_count_);
   }
 
   // 彙整各就緒 worker buffer 到 agg_buf_
@@ -642,6 +658,8 @@ void SearchManager::result_handler_loop() {
         const int node_id = res.node_ids[static_cast<std::size_t>(i)];
 
         if (tree_id < 0 || tree_id >= tree_count_) {
+          TZAAR_DEBUG_LOG("[ERROR] Invalid tree_id received: %d, current tree_count: %d", 
+                    tree_id, tree_count_);
           continue;
         }
         SearchTree& tree = *trees_[static_cast<std::size_t>(tree_id)];
@@ -657,12 +675,21 @@ void SearchManager::result_handler_loop() {
         // 將 NN 評估結果寫入樹（復原 virtual loss + expand + backup）
         // Worker 操作的是尚未送出的 pending leaves，
         // result_handler 操作的是已送回來的 GPU 結果，兩者不重疊。
-        tree.session->submit_single_eval(node_id, priors_row, value);
+        bool process = tree.session->submit_single_eval(node_id, priors_row, value);
 
-        if (!tree.session->is_complete() && !tree.session->has_pending_leaves()) {
-          reenqueue_tree_if_needed(tree_id);
-        } else if (tree.session->is_complete()) {
-          complete_tree(tree);
+                // 只依「剩餘模擬次數」判定：不再檢查 has_pending_leaves。
+        // 剩餘次數用盡 → 標記完成；否則（可能仍在等 GPU）統一重新入隊，
+        // reenqueue_tree_if_needed 內部仍會擋掉「還在等 GPU」的樹，
+        // 待該樹的 pending leaves 全數處理完後才會真正回到佇列。
+
+        if(process){
+          const bool sims_done = tree.session->simulations_processed() >=
+                        tree.session->simulations_requested();
+          if (sims_done) {
+            complete_tree(tree);
+          } else {
+            reenqueue_tree_if_needed(tree_id);
+          }
         }
       }
     }

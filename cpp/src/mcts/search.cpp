@@ -1,5 +1,6 @@
 #include "mcts/search.h"
 #include "core/action.h"
+#include "mcts/debug_log.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,16 @@
 #define nvtxRangePushA(x)
 #define nvtxRangePop()
 #endif
+
+// ─── C++ Debug Log ─────────────────────────────────────
+// 具備「關閉即零成本」的可開關 logger（debug_log.h 提供）。
+// 關閉時呼叫端只做一次 relaxed atomic load（likely_disabled）即跳過，
+// 不格式化、不鎖、不寫檔，因此完全不打擾效能。
+#define TZAAR_DEBUG_LOG(...)                                     \
+  do {                                                           \
+    if (!DebugLogger::instance().likely_disabled())              \
+      DebugLogger::instance().log(__VA_ARGS__);                  \
+  } while (0)
 
 namespace tzaar {
 namespace {
@@ -271,11 +282,11 @@ int SearchSession::simulate_into_buffers(int chunk,
   NvtxRangeGuard sim_guard("simulate_into_buffers");
 
   int simulated_count = 0;
-  const int max_attempts = chunk + 256;  // 預留給終端節點的重試空間
+  const int max_attempts = chunk + 400;  // 預留給終端節點的重試空間
 
   for (int attempts = 0; attempts < max_attempts; ++attempts) {
     if (simulated_count >= chunk) break;
-    if (is_complete()) break;
+    if (simulations_processed_ >= config_.simulations) break;
 
     // ── 段1：樹狀走訪與選擇（walk + 簿記，範圍涵蓋整個迭代）──
     // RAII guard 確保即使 terminal / stall / early-exit 也會成對 pop。
@@ -336,6 +347,36 @@ int SearchSession::simulate_into_buffers(int chunk,
           break;  // 跳出 while，外層 sib_stage1_selection 在此迭代結束時一併 pop
         }
       }  // sib_stage3_state_clone pop
+
+            // ── 生成本節點合法動作遮罩（計數用；真正的寫入在段5）──
+      // 診斷：若 node.is_terminal 為 false（搜尋認為局面未結束），
+      // 但合法動作數量為 0（局面實際上無步可下），代表「終局判斷漏掉」
+      // 或「重建出的局面與實際遊戲不一致」——這正是可能造成整棵樹
+      // 卡住（無法模擬、剩餘模擬次數不減）的關鍵原因。
+      {
+        // 在呼叫 legal_mask()「之前」先記錄原始 phase/player，避免
+        // legal_mask() 內部把局勢判定為終局（並把 stage 改為 Done）干擾診斷資訊。
+        const std::string dbg_phase_before = state.phase();
+        const int dbg_player = state.current_player();
+        const int dbg_turn = state.turn_number();
+        const int dbg_winner = state.winner();
+        const int dbg_done_node = node.is_terminal ? 1 : 0;
+
+        const std::vector<bool> dbg_legal = state.legal_mask();
+        int dbg_legal_count = 0;
+        for (std::size_t j = 0; j < dbg_legal.size(); ++j) {
+          if (dbg_legal[j]) dbg_legal_count++;
+        }
+        if (dbg_legal_count == 0) {
+          TZAAR_DEBUG_LOG(
+              "[mcts/simulate] TREE %d | node_idx=%d | phase_before=%s | "
+              "current_player=%d | turn=%d | node.is_terminal=%d | "
+              "winner=%d | NO-LEGAL-MOVES=%d !!! "
+              "(搜尋判定未終局，但重建局面無合法步子 -> 疑似終局判斷漏判或重建不一致)",
+              tree_id, node_idx, dbg_phase_before.c_str(),
+              dbg_player, dbg_turn, dbg_done_node, dbg_winner, 1);
+        }
+      }
 
       // ── 段4：特徵序列化與寫入緩衝區（build_cnn_features_into）──
       {
@@ -400,10 +441,21 @@ int SearchSession::simulate_into_buffers(int chunk,
     }  // 迭代結束，sib_stage1_selection 由 guard 析構時 pop
   }
 
+  // 診斷：這次呼叫完全沒有產生任何 leaf。這可能是本次 tree 被「丟掉」的徵兆。
+  //   - 若本樹其實還沒 complete，卻回傳 0 → 需要追查是 is_complete() 提前成立，
+  //     還是 selection 全部被 pending/無合法子節點卡住。
+  if (simulated_count == 0) {
+    TZAAR_DEBUG_LOG(
+        "[mcts/simulate] TREE %d | simulate_into_buffers ch=%d RETURNED 0 "
+        "(proc=%d/%d | pending=%d) -> 此樹可能被丟掉/卡住",
+        tree_id, chunk, simulations_processed_, config_.simulations,
+        static_cast<int>(pending_node_order_.size()));
+  }
+
   return simulated_count;
 }
 
-void SearchSession::submit_single_eval(int node_id,
+bool SearchSession::submit_single_eval(int node_id,
                                        const float* priors,
                                        float value) {
   const int node_idx = node_id - 1;
@@ -423,7 +475,9 @@ void SearchSession::submit_single_eval(int node_id,
   // 當所有 pending 都到齊時自動處理
   if (pending_eval_map_.size() == pending_node_order_.size()) {
     process_pending_evals();
+    return true;
   }
+  return false;
 }
 
 // ══════════════════════════════════════════════════════════════════════
