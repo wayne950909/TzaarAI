@@ -51,12 +51,12 @@ CPP_BACKEND_REQUIRED = True
 @dataclass
 class NetworkConfig:
     """PolicyNetCNNMin17 的超參數"""
-    global_feature_dim: int = 12
-    dropout: float = 0
-    channels: int = 64
-    num_res_blocks: int = 4
-    fc_hidden: int = 512
-    fc_hidden_2: int = 256
+    global_feature_dim: int = 12     # 保留（介面相容），head 已不再使用
+    dropout: float = 0               # value 隱藏層的 dropout 比率
+    channels: int = 64               # CNN 分支通道數
+    num_res_blocks: int = 8          # 殘差區塊數（想加深 ResNet 直接改這裡）
+    fc_hidden_2: int = 256           # value network 隱藏層維度（162 -> 256 -> 1）
+    compress_channels: int = 2       # CNN 輸出壓縮至的通道數（2*9*9 = 162）
 
 
 NETWORK_CFG = NetworkConfig()
@@ -120,9 +120,8 @@ class AsyncMCTSConfig:
     min_batch_for_swap: int = 1
 
     # ── Worker-Local Double Buffer 參數 ──────────────────────
-    # 每個 worker 每側邊緩衝區的最大容量 = 樹數量 × 此值
-    # （adjust.md：buffer 最大容量 = 樹數量 * 32，填不滿）
-    buffer_capacity_per_tree: int = 16
+    # 每個 worker 每側邊緩衝區的最大容量（leaf 數，定值，不再乘樹數量）
+    local_capacity: int = 2000
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
     ready_flush_leaves: int = 64
@@ -208,7 +207,7 @@ class GatekeeperConfig:
     eval_games: int = 100
     winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
-    simulations_per_decision: int = 400  # 評估時的 MCTS 模擬數
+    simulations_per_decision: int = 256  # 評估時的 MCTS 模擬數
     eval_every_updates: int = 1        # 每 N 次更新執行一次
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True
@@ -225,7 +224,7 @@ GATE_CFG = GatekeeperConfig()
 class ReplayConfig:
     """Replay Buffer 設定"""
     enabled: bool = True
-    max_samples: int = 50000
+    max_samples: int = 200000
     train_samples_per_update: int = 8192
     min_train_samples: int = 256
     snapshot_version: int = 1

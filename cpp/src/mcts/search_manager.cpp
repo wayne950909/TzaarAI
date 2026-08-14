@@ -78,10 +78,9 @@ SearchManager::SearchManager(SearchConfig config,
 // ══════════════════════════════════════════════════════════════════════
 
 void SearchManager::init_buffers() {
-  // 建構時尚無樹數量，先以預設單側容量建立 worker-buffers。
-  // 真正的容量會在建構後第一次 reset() 依樹數量重設（resize_buffers）。
+  // 建構時尚無樹數量，先以 config.local_capacity 定值建立 worker-buffers。
   if (local_capacity_ <= 0)
-    local_capacity_ = std::max(1, config_.buffer_capacity_per_tree);
+    local_capacity_ = std::max(1, config_.local_capacity);
 
     worker_buffers_.clear();
   worker_buffers_.reserve(static_cast<std::size_t>(num_threads_));
@@ -131,13 +130,12 @@ void SearchManager::resize_buffer(LocalEvalBuffer& buf, int cap) {
   buf.is_ready.store(false, std::memory_order_relaxed);
 }
 
-// 依樹數量調整每側緩衝區容量：容量 = tree_count * buffer_capacity_per_tree。
+// 依 config.local_capacity 定值調整每側緩衝區容量（不再乘樹數量）。
 // 執行緒中快取的 WorkerBuffers& 參考指向 vector<unique_ptr> 的元素，
 // 此處僅 resize 內部 LocalEvalBuffer 的 vector，不回重建 worker_buffers_，
 // 因此執行緒持有的參考不會失效。
-void SearchManager::resize_buffers(int tree_count) {
-  local_capacity_ = std::max(1, tree_count) *
-                    std::max(1, config_.buffer_capacity_per_tree);
+void SearchManager::resize_buffers(int /*tree_count*/) {
+  local_capacity_ = std::max(1, config_.local_capacity);
   for (auto& wb_ptr : worker_buffers_) {
     WorkerBuffers& wb = *wb_ptr;
     for (int b = 0; b < 2; ++b) {
@@ -167,7 +165,7 @@ void SearchManager::reset(const std::vector<PhaseGameState>& root_states,
 
   ready_flush_leaves_ = std::max(1, config_.ready_flush_leaves);
 
-  // 依樹數量調整每側緩衝區容量（adjust.md：容量 = 樹數量 * buffer_capacity_per_tree）
+  // 依 config.local_capacity 定值調整每側緩衝區容量
   resize_buffers(tree_count_);
 
   // 重用既有 SearchTree / SearchSession，保留其節點池記憶體（不釋放不重建）。
@@ -263,38 +261,20 @@ void SearchManager::join_workers() {
 // ══════════════════════════════════════════════════════════════════════
 
 // Worker 的節奏（依 adjust.md 實作 worker-local double buffer 狀態機）：
-// 1. 嘗試從佇列取得一棵「可模擬」的樹；拿不到（全體樹 stalled / 都在等 GPU）
-//    → 依 adjust.md「無法從佇列獲得樹時將正在寫入的 buffer 設為 ready」→ seal + 睡眠。
-// 2. 在同一棵樹上模擬，直接寫入本 worker 的 active buffer。
-// 3. 依 adjust.md 條件檢查是否把 active buffer 設為 ready（須兩側都 false 且達資料量）。
-// 4. 若樹已完成則標記；全完成則將最後的 buffer 送出並結束。
 void SearchManager::worker_loop(int thread_id) {
   WorkerBuffers& wb = *worker_buffers_[static_cast<std::size_t>(thread_id)];
 
-  // Worker 常駐：永不因「本輪搜尋完成」而退出執行緒，只在 stop_（shutdown）時退出。
-  //「搜尋完成」由主執行緒 get_ready_batch() 依 completed_count_/tree_count_ 判定，
-  // worker 不需自行 return 回報完成。所有「拿不到樹」的情況統一由
-  // wait_for_simulable_tree() 阻塞等待，涵蓋：初始化空佇列 / 暫時空佇列 / 全部完成 / shutdown。
   while (!stop_) {
-    // 等到一棵「可模擬」的樹；回傳 -1 表示 stop（shutdown）。
     const int tree_id = wait_for_simulable_tree(wb, thread_id);
     if (tree_id < 0) break;
 
     // ── 模擬並寫入 active buffer ──────────────────────────
     int n = simulate_tree_into_local(tree_id, wb);
 
-    // ── 依 adjust.md 檢查是否設 active buffer 為 ready ──
-    // 到達「一定資料量」且另一側不是 ready 時才會觸發（seal_ready 內部檢查）。
-    bool sealed = seal_ready(wb, thread_id, false);
-
-    // adjust.md 狀況 1：若另一側 ready 且本側已達資料量，則不能設 ready，
-    // 但也不能無止盡填下去。此時等待另一側被主執行緒收走（→狀況 2），
-    // 再重試封存。（此處尚未 flip，要等的是另一側 1-active_idx）
-    if (!sealed &&
-        wb.bufs[wb.active_idx].count >= ready_flush_leaves_ &&
-        wb.bufs[1 - wb.active_idx].is_ready.load(std::memory_order_acquire)) {
-      wait_for_other_collected(wb, 1 - wb.active_idx);  // 等另一側被收走（true→false）
-      seal_ready(wb, thread_id, false);
+    //兩個false，然後到達閥值read_flush_leaves
+    if (wb.bufs[wb.active_idx].count >= ready_flush_leaves_ &&
+        !wb.bufs[1 - wb.active_idx].is_ready.load(std::memory_order_acquire)) {
+      seal_ready(wb, thread_id);
     }
 
     // ── 若這棵樹已完成則標記（不退出，回迴圈頂點再等下一棵）──
@@ -306,15 +286,6 @@ void SearchManager::worker_loop(int thread_id) {
 }
 
 // ── 等待並取得一棵「可模擬」的樹 ──────────────────────────────
-// 與原本 worker_loop 的 try_pop 掃描語意一致：
-//   - 拿到「等 GPU」的樹 → 由 result_handler 之後 reenqueue，故忽略（繼續 pop）下一個
-//   - 拿到「已完成」的樹 → complete_tree 標記後繼續 pop 下一個
-//   - 拿到「可模擬」的樹 → 回傳其 id
-// 掃描不到可模擬樹 → 依 adjust.md 先把正在寫入的 buffer 設為 ready，
-// 再阻塞等待佇列。等待涵蓋：
-//   - 搜尋進行中：等 result_handler reenqueue 喚醒
-//   - reset 開播新搜尋：等 reset push() + wake_all() 喚醒
-//   - shutdown：notify_all() 設 stop_ → wait_and_pop 回傳 false → 回傳 -1
 int SearchManager::wait_for_simulable_tree(WorkerBuffers& wb, int thread_id) {
   int tree_id = -1;
 
@@ -324,21 +295,13 @@ int SearchManager::wait_for_simulable_tree(WorkerBuffers& wb, int thread_id) {
       return tree_id;  // 可模擬
     }
   }
-    // 掃描不到可模擬樹 → 依 adjust.md：執行緒無法從佇列獲得樹時，
-  // 將正在寫入的 buffer 設為 ready。
-  seal_ready(wb, thread_id, true);
 
-    // 阻塞等佇列（此為 worker「沒事做」的等待點）：若之後長時間不再有
-  // 任何 worker/handler/main 日誌輸出，多半是此處沒等到 reenqueue → 卡住。
-  // 同時檢查本 worker 兩個 buffer 是否仍有資料（count>0）與 is_ready 狀態。
-  TZAAR_DEBUG_LOG("[worker-%d] no simulable tree -> wait | buf0 has_data=%d ready=%d count=%d | buf1 has_data=%d ready=%d count=%d",
-                  thread_id,
-                  wb.bufs[0].count > 0 ? 1 : 0,
-                  wb.bufs[0].is_ready.load(std::memory_order_acquire) ? 1 : 0,
-                  wb.bufs[0].count,
-                  wb.bufs[1].count > 0 ? 1 : 0,
-                  wb.bufs[1].is_ready.load(std::memory_order_acquire) ? 1 : 0,
-                  wb.bufs[1].count);
+  if(wb.bufs[wb.active_idx].count > 0){
+    //沒有樹可以拿，強制封裝現在的buffer
+    seal_ready(wb, thread_id);
+    wait_for_collected(wb, wb.active_idx);
+  }
+
   int next = -1;
   if (!tree_queue_.wait_and_pop(next)) {
     TZAAR_DEBUG_LOG("[worker-%d] wait_and_pop returned stop -> exiting",
@@ -472,26 +435,10 @@ int SearchManager::simulate_tree_into_local(int tree_id, WorkerBuffers& wb) {
 //
 // 回傳 true 表示成功封存並 flip；false 表示不符合條件（未封存）。
 
-bool SearchManager::seal_ready(WorkerBuffers& wb, int thread_id, bool force) {
+bool SearchManager::seal_ready(WorkerBuffers& wb, int thread_id) {
   LocalEvalBuffer& active = wb.bufs[wb.active_idx];
-  if (active.count <= 0) return false;   // 無資料可送出
-  if (active.is_ready.load(std::memory_order_acquire)) return false;
 
-  LocalEvalBuffer& other = wb.bufs[1 - wb.active_idx];
-  const bool other_ready = other.is_ready.load(std::memory_order_acquire);
-
-  if (!force) {
-    // adjust.md 前提：兩側都必須 false，且「沒有其他 ready 的 buffer」。
-    if (other_ready) return false;                          // 狀況 1：繼續填
-    if (active.count < ready_flush_leaves_) return false;   // 未達一定資料量
-  }
-  // force：全體樹 stalled / 無法取得樹。即使另一側也 ready 仍封存，
-  // 主執行緒會收走兩側。
-
-  // 設 ready（false→true，release 語意，確保先前寫入可見）
   active.is_ready.store(true, std::memory_order_release);
-  TZAAR_DEBUG_LOG("[worker-%d] buffer READY count=%d force=%d active_idx_before=%d",
-                  thread_id, active.count, force ? 1 : 0, wb.active_idx);
   // 通知主執行緒有就緒資料
   {
     std::lock_guard<std::mutex> lock(cv_mtx_);
@@ -501,11 +448,7 @@ bool SearchManager::seal_ready(WorkerBuffers& wb, int thread_id, bool force) {
   
   // flip 到另一側
   wb.active_idx = 1 - wb.active_idx;
-  LocalEvalBuffer& next = wb.bufs[wb.active_idx];
 
-  // 等 flip 後的新 active（= 另一側）被主執行緒收走清空後才可重寫。
-  wait_for_other_collected(wb, wb.active_idx);
-  next.count = 0;
   return true;
 }
 
@@ -513,7 +456,7 @@ bool SearchManager::seal_ready(WorkerBuffers& wb, int thread_id, bool force) {
 // 這是「運作中卡住」最可能發生的點：若主執行緒從未收走此 buffer，
 // worker 會在此無限 spin。因此加入時間型 hang 偵測（單次等待超過閾值
 // 只警告一次，避免洗版），一旦觸發即代表主/worker 同步出問題。
-void SearchManager::wait_for_other_collected(WorkerBuffers& wb, int which) {
+void SearchManager::wait_for_collected(WorkerBuffers& wb, int which) {
   LocalEvalBuffer& tgt = wb.bufs[which];
   int spin = 0;
   const auto start = std::chrono::steady_clock::now();

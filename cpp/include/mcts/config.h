@@ -20,8 +20,8 @@ struct SearchConfig {
   int flush_timeout_ms = 0;      // 強制送 GPU 的 timeout (0=不使用)
 
   // Worker-Local Double Buffer 參數（對應 adjust.md）
-  // buffer 最大容量 = tree_count * buffer_capacity_per_tree（填不滿）
-  int buffer_capacity_per_tree = 32;
+  // buffer 最大容量（leaf 數，定值，直接由 config.py 指定，不再乘樹數量）
+  int local_capacity = 32;
   // 單側尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數（≠容量）
   int ready_flush_leaves = 32;
 

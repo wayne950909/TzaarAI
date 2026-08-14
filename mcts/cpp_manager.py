@@ -102,8 +102,8 @@ class CppSearchManager:
         cfg.root_dirichlet_alpha = float(MCTS_CFG.root_dirichlet_alpha)
         cfg.min_batch_for_swap = int(ASYNC_MCTS_CFG.min_batch_for_swap)
         cfg.flush_timeout_ms = int(ASYNC_MCTS_CFG.infer_max_wait_ms)
-        # adjust.md：緩衝區容量 = 樹數量 * buffer_capacity_per_tree，與資料量觸發值。
-        cfg.buffer_capacity_per_tree = int(ASYNC_MCTS_CFG.buffer_capacity_per_tree)
+        # adjust.md：緩衝區容量 = 定值 local_capacity（不再乘樹數量），與資料量觸發值。
+        cfg.local_capacity = int(ASYNC_MCTS_CFG.local_capacity)
         cfg.ready_flush_leaves = int(ASYNC_MCTS_CFG.ready_flush_leaves)
         # C++ SearchManager 內部 debug log 開關（config.py → SearchConfig）
         cfg.debug_log_enabled = bool(ASYNC_MCTS_CFG.debug_log_enabled)

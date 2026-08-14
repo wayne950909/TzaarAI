@@ -110,7 +110,7 @@ class SearchManager {
   ConcurrentQueue<int> tree_queue_;
 
   std::vector<std::unique_ptr<WorkerBuffers>> worker_buffers_;
-  int local_capacity_ = 0;      // 每側邊緩衝區容量 = tree_count * buffer_capacity_per_tree
+  int local_capacity_ = 0;      // 每側邊緩衝區容量 = config.local_capacity（定值）
   int ready_flush_leaves_ = 0;  // 單側到達此 leaf 數即觸發 ready（adjust.md 的「一定資料量」）
   AggregateBuffer agg_buf_;
 
@@ -134,8 +134,8 @@ class SearchManager {
   int wait_for_simulable_tree(WorkerBuffers& wb, int thread_id); // 等待並取得一棵「可模擬」樹 id；stop 時回傳 -1
   bool classify_popped_tree(int tree_id, int thread_id); // 取出樹後判定：true=可模擬（回傳模擬）；false=已處理（等 GPU / 已完成）
   int simulate_tree_into_local(int tree_id, WorkerBuffers& wb);
-  bool seal_ready(WorkerBuffers& wb, int thread_id, bool force = false); // 依 adjust.md：設 active ready 並 flip；回傳是否成功封存
-  void wait_for_other_collected(WorkerBuffers& wb, int which); // 等待指定側 buffer 被主執行緒收走（is_ready→false）
+  bool seal_ready(WorkerBuffers& wb, int thread_id); // 依 adjust.md：設 active ready 並 flip；回傳是否成功封存
+  void wait_for_collected(WorkerBuffers& wb, int which); // 等待指定側 buffer 被主執行緒收走（is_ready→false）
   void init_buffers();
   void resize_buffer(LocalEvalBuffer& buf, int cap);  // 依指定容量重設單一 buffer
   void resize_buffers(int tree_count);      // 依樹數量調整每側容量
