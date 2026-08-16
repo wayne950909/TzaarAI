@@ -62,13 +62,17 @@ class SearchSession {
   // board_out / global_out / mask_out / node_ids_out 是外部預分配的連續記憶體
   // tree_id 會寫入 tree_ids_out（如果非 null）
   // 回傳實際模擬的葉節點數量
+    // path_buffer：呼叫端（SearchManager 的執行緒）提供的重用容器。
+  // 執行緒可預先 reserve 容量並跨多次呼叫/多次 run_search 重用，
+  // 避免 simulate_into_buffers 每次迭代重新配置 path（heap 熱點）。
   int simulate_into_buffers(int chunk,
                             float* board_out,
                             float* global_out,
                             uint8_t* mask_out,
                             int32_t* node_ids_out,
                             int32_t* tree_ids_out,
-                            int tree_id);
+                            int tree_id,
+                            std::vector<int>& path_buffer);
 
   // 提交單一節點的評估結果（供 SearchManager 使用）
   // 與 submit_leaf_eval 不同，不會觸發 process_pending_evals

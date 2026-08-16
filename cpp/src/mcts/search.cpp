@@ -270,12 +270,13 @@ LeafSnapshot SearchSession::root_snapshot() {
 //   - 終端節點消耗模擬次數但不產出 leaf（backup 已內處理）
 //   - 所有路徑都被 pending leaf 阻塞時（stall）提前結束
 int SearchSession::simulate_into_buffers(int chunk,
-                                                                                  float* board_out,
+                                         float* board_out,
                                          float* global_out,
                                          uint8_t* mask_out,
                                          int32_t* node_ids_out,
                                          int32_t* tree_ids_out,
-                                         int tree_id) {
+                                         int tree_id,
+                                         std::vector<int>& path_buffer) {
   if (chunk <= 0) return 0;
 
   // 整個函式層級的 NVTX range（RAII）。早期 return（stall）時由析構自動 pop。
@@ -290,11 +291,14 @@ int SearchSession::simulate_into_buffers(int chunk,
 
     // ── 段1：樹狀走訪與選擇（walk + 簿記，範圍涵蓋整個迭代）──
     // RAII guard 確保即使 terminal / stall / early-exit 也會成對 pop。
-    NvtxRangeGuard stage1("sib_stage1_selection");
+        NvtxRangeGuard stage1("sib_stage1_selection");
 
     int node_idx = root_node_index_;
-    std::vector<int> path;
-    path.reserve(128);
+    // 重用呼叫端提供的執行緒級容器（capacity 跨多次呼叫/多次 run_search 保留），
+    // 避免每次迭代重新配置 std::vector<int>（heap 熱點）。
+    std::vector<int>& path = path_buffer;
+    path.clear();
+    path.reserve(128);   // capacity 已足夠時為 no-op；深度異常時才有一次 realloc
     path.push_back(node_idx);
 
     while (true) {

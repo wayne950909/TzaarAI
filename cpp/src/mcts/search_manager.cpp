@@ -84,10 +84,13 @@ void SearchManager::init_buffers() {
 
     worker_buffers_.clear();
   worker_buffers_.reserve(static_cast<std::size_t>(num_threads_));
-  for (int w = 0; w < num_threads_; ++w) {
+    for (int w = 0; w < num_threads_; ++w) {
     auto wb_ptr = std::make_unique<WorkerBuffers>();
     WorkerBuffers& wb = *wb_ptr;
     wb.active_idx = 0;
+    // 預先配置執行緒級 path 容器的最大深度容量（128）。
+    // 之後每次呼叫僅 clear() 重用，跨多次 run_search 不再重新配置。
+    wb.path.reserve(128);
     for (int b = 0; b < 2; ++b) {
       resize_buffer(wb.bufs[b], local_capacity_);
     }
@@ -408,11 +411,12 @@ int SearchManager::simulate_tree_into_local(int tree_id, WorkerBuffers& wb) {
     int32_t* node_ptr = buf.node_ids.data() + static_cast<std::size_t>(buf.count);
     int32_t* tree_ptr = buf.tree_ids.data() + static_cast<std::size_t>(buf.count);
 
-    int n = session->simulate_into_buffers( //產出最多chunk個，最少0個
+        int n = session->simulate_into_buffers( //產出最多chunk個，最少0個
         chunk,
         board_ptr, global_ptr, mask_ptr,
         node_ptr, tree_ptr,
-        tree_id);
+        tree_id,
+        wb.path);  // 重用執行緒級 path 容器，避免每次呼叫重新配置 heap
 
     if (n > 0) {
       buf.count += n;

@@ -70,9 +70,13 @@ class SearchManager {
     std::atomic<bool> is_ready{false};
   };
 
-  struct WorkerBuffers {
+    struct WorkerBuffers {
     LocalEvalBuffer bufs[2];
     int active_idx = 0;
+    // 執行緒專屬、跨多次呼叫/多次 run_search 重用、shutdown 才釋放的
+    // path 容器，供 simulate_into_buffers 重用以避免重複 heap 配置。
+    // 容量僅在 init_buffers 預先 reserve 一次，之後重複 clear() 重用。
+    std::vector<int> path;
   };
 
   struct AggregateBuffer {
