@@ -1,0 +1,1432 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TZAAR - 抽象策略遊戲</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;900&display=swap');
+        body { 
+            background-color: #d4a017; /* 芥末黃背景 */
+            font-family: 'Noto Sans TC', sans-serif;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        canvas { 
+            cursor: pointer;
+            touch-action: none;
+            filter: drop-shadow(0 15px 35px rgba(0,0,0,0.4));
+        }
+        .ui-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 20px;
+        }
+        .interactive { pointer-events: auto; }
+        .glass { 
+            background: rgba(255, 255, 255, 0.2); 
+            backdrop-filter: blur(15px); 
+            border: 1px solid rgba(255, 255, 255, 0.4); 
+            border-radius: 28px; 
+        }
+        .btn-fancy {
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+        .btn-fancy:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.2); }
+        .stats-dock {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+            z-index: 2;
+        }
+        .stats-dock::before {
+            content: '';
+            position: absolute;
+            top: calc(50% - 50vh);
+            width: 240px;
+            height: 100vh;
+            transform: none;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.28s ease, transform 0.28s ease, filter 0.28s ease;
+            filter: blur(18px);
+        }
+        .stats-dock.left {
+            left: 20px;
+        }
+        .stats-dock.right {
+            right: 20px;
+        }
+        .stats-dock.left::before {
+            left: -72px;
+            background: linear-gradient(90deg, rgba(255, 255, 255, 0.95) 0%, rgba(255, 255, 255, 0.55) 28%, rgba(255, 255, 255, 0.18) 56%, rgba(255, 255, 255, 0.04) 78%, rgba(255, 255, 255, 0) 100%);
+        }
+        .stats-dock.right::before {
+            right: -72px;
+            background: linear-gradient(270deg, rgba(12, 12, 12, 0.98) 0%, rgba(20, 20, 20, 0.68) 28%, rgba(28, 28, 28, 0.24) 56%, rgba(28, 28, 28, 0.08) 78%, rgba(28, 28, 28, 0) 100%);
+        }
+        .stats-dock.active::before {
+            opacity: 1;
+            filter: blur(26px);
+        }
+        .player-panel {
+            position: relative;
+            width: min(220px, calc(50vw - 40px));
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            transition: transform 0.25s ease, box-shadow 0.25s ease, background 0.25s ease, border-color 0.25s ease;
+        }
+        .player-panel.active {
+            transform: translateY(-4px) scale(1.08);
+            box-shadow: 0 22px 54px rgba(0, 0, 0, 0.24);
+        }
+        .player-panel.white.active {
+            background: rgba(255, 255, 255, 0.38);
+            border-color: rgba(255, 255, 255, 0.72);
+        }
+        .player-panel.black.active {
+            background: rgba(255, 245, 220, 0.42);
+            border-color: rgba(60, 32, 18, 0.72);
+        }
+        .player-stats {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        @media (max-width: 700px), (max-height: 780px) {
+            .ui-overlay {
+                padding: 14px;
+            }
+            .stats-dock.left {
+                left: 12px;
+            }
+            .stats-dock.right {
+                right: 12px;
+            }
+            .player-panel {
+                width: min(180px, calc(50vw - 20px));
+                padding: 14px;
+                gap: 10px;
+            }
+            .stats-dock::before {
+                width: 150px;
+                height: 100vh;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="tzaarBoard"></canvas>
+
+    <div class="ui-overlay">
+        <!-- 頂部資訊 -->
+        <div class="flex justify-between items-start">
+            <div class="glass p-6 interactive">
+                <h1 class="text-4xl font-black text-amber-950 tracking-tighter italic">TZAAR</h1>
+                <div id="status-line" class="mt-2 text-xs font-black text-amber-900/70 uppercase tracking-widest">
+                    等待開始...
+                </div>
+            </div>
+            
+                        <div class="flex gap-3 interactive items-center flex-wrap justify-end">
+                            <label class="text-[10px] font-black text-amber-900/80 uppercase tracking-wider">AI 代走模型
+                                <select id="ai-model" class="w-44 px-2 py-2 rounded-xl bg-white/80 border border-amber-300 font-bold text-xs"></select>
+                            </label>
+                            <label class="text-[10px] font-black text-amber-900/80 uppercase tracking-wider ml-1">模擬次數
+                                <input id="ai-sims" type="number" min="1" value="200" class="w-20 px-2 py-2 rounded-xl bg-white/80 border border-amber-300 font-bold text-xs text-center">
+                            </label>
+                                                        <button id="ai-move-btn" class="px-6 py-4 bg-amber-200/80 text-amber-950 font-black rounded-2xl btn-fancy text-xs">
+                                AI 代走當前回合
+                            </button>
+                            <label class="text-[10px] font-black text-amber-900/80 uppercase tracking-wider">對手
+                                <select id="opponent-type" class="w-24 px-2 py-2 rounded-xl bg-white/80 border border-amber-300 font-bold text-xs">
+                                    <option value="human">雙人對戰</option>
+                                    <option value="ai">人機對戰</option>
+                                </select>
+                            </label>
+                            <label class="text-[10px] font-black text-amber-900/80 uppercase tracking-wider">人類執色
+                                <select id="user-color" class="w-24 px-2 py-2 rounded-xl bg-white/80 border border-amber-300 font-bold text-xs">
+                                    <option value="White">執白</option>
+                                    <option value="Black">執黑</option>
+                                </select>
+                            </label>
+                            <label class="text-[10px] font-black text-amber-900/80 uppercase tracking-wider">AI 走法
+                                <select id="ai-mode" class="w-20 px-2 py-2 rounded-xl bg-white/80 border border-amber-300 font-bold text-xs">
+                                    <option value="stochastic">機率</option>
+                                    <option value="greedy">貪婪</option>
+                                </select>
+                            </label>
+                            <button id="pve-start-btn" class="px-6 py-4 bg-emerald-700 text-white font-black rounded-2xl btn-fancy text-xs">
+                                開始人機對戰
+                            </button>
+                            <button id="battle-btn" class="px-6 py-4 bg-amber-950 text-white font-black rounded-2xl btn-fancy text-xs">
+                                模型對戰
+                            </button>
+                <button id="open-replay-btn" class="px-6 py-4 bg-white/60 text-amber-950 font-black rounded-2xl btn-fancy text-xs">
+                    查看對局重播
+                </button>
+                <button id="choose-save-dir-btn" class="px-6 py-4 bg-white/60 text-amber-950 font-black rounded-2xl btn-fancy text-xs">
+                    設定存檔資料夾
+                </button>
+                <button id="pass-btn" class="hidden px-8 py-4 bg-amber-950 text-white font-black rounded-2xl btn-fancy text-xs tracking-widest">
+                    跳過第二步 (PASS)
+                </button>
+                <button onclick="location.reload()" class="px-6 py-4 bg-white/50 text-amber-950 font-black rounded-2xl btn-fancy text-xs">
+                    重置
+                </button>
+            </div>
+        </div>
+
+        <!-- 底部統計 -->
+        <div class="stats-dock left">
+            <div id="white-stats-panel" class="player-panel white glass interactive shadow-2xl">
+                <!-- 白方數據 -->
+            </div>
+        </div>
+
+        <div class="stats-dock right">
+            <div id="black-stats-panel" class="player-panel black glass interactive shadow-2xl">
+                <!-- 數據將在此處生成 -->
+            </div>
+        </div>
+        </div>
+
+    <!-- 主畫面播放控制列（重播時顯示） -->
+    <div id="replay-control-bar" class="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 hidden">
+        <div class="glass px-5 py-4 flex items-center gap-4 interactive shadow-2xl">
+            <span id="replay-title" class="text-xs font-black text-amber-800 uppercase tracking-widest w-40 truncate">對局重播</span>
+            <button id="rp-first-btn" class="px-3 py-2 bg-white/50 text-amber-950 font-black rounded-xl btn-fancy text-sm">|< 起點</button>
+            <button id="replay-prev-btn" class="px-3 py-2 bg-amber-950 text-white font-black rounded-xl btn-fancy text-sm">◀ 上一步</button>
+            <span id="replay-position" class="font-black text-sm text-amber-950 min-w-[4.5rem] text-center">0 / 0</span>
+            <button id="replay-next-btn" class="px-3 py-2 bg-amber-950 text-white font-black rounded-xl btn-fancy text-sm">下一步 ▶</button>
+            <button id="rp-last-btn" class="px-3 py-2 bg-white/50 text-amber-950 font-black rounded-xl btn-fancy text-sm">終點 >|</button>
+            <div class="w-px h-8 bg-amber-900/20"></div>
+            <span id="replay-meta" class="text-xs font-bold text-amber-800 max-w-xs truncate"></span>
+            <button id="rp-exit-btn" class="px-3 py-2 bg-white/60 text-amber-950 font-black rounded-xl btn-fancy text-xs">結束重播</button>
+        </div>
+    </div>
+
+    <!-- 結局畫面 -->
+    <div id="game-over-modal" class="fixed inset-0 bg-amber-950/90 backdrop-blur-xl hidden flex items-center justify-center z-50">
+        <div class="text-center p-12">
+            <div class="text-amber-200 text-sm font-black tracking-widest mb-2 uppercase">Game Over</div>
+            <h2 id="winner-display" class="text-7xl font-black text-white mb-4 tracking-tighter">白方獲勝</h2>
+            <p id="reason-display" class="text-amber-400 font-bold mb-12 italic text-xl">對手棋子已絕種</p>
+            <div class="flex items-center justify-center gap-4 flex-wrap">
+                <button id="save-record-btn" class="px-8 py-4 bg-amber-500 text-amber-950 font-black rounded-3xl hover:scale-105 transition-transform text-lg shadow-2xl">
+                    儲存對局
+                </button>
+                <button onclick="location.reload()" class="px-12 py-4 bg-white text-amber-950 font-black rounded-3xl hover:scale-105 transition-transform text-lg shadow-2xl">
+                    再戰一局
+                </button>
+            </div>
+                        <div id="save-result-text" class="mt-4 text-sm font-bold text-amber-200/90"></div>
+        </div>
+    </div>
+
+    <!-- 模型對戰模態 -->
+    <div id="battle-modal" class="fixed inset-0 bg-amber-950/70 backdrop-blur-sm hidden flex items-center justify-center z-50">
+        <div class="bg-amber-50 text-amber-950 rounded-3xl shadow-2xl p-8 w-[min(560px,92vw)] max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-3xl font-black tracking-tight">模型對戰</h2>
+                <button id="battle-close-btn" class="text-2xl font-black text-amber-700 hover:text-amber-950">×</button>
+            </div>
+
+            <div class="space-y-4">
+                <div>
+                                        <label class="block text-xs font-black text-amber-800 mb-1 uppercase tracking-widest">Model A（先手輪替：白/黑）</label>
+                    <div class="flex gap-2">
+                        <select id="battle-model-a" class="flex-1 px-3 py-2 rounded-xl bg-white border border-amber-300 font-bold"></select>
+                        <input id="battle-sims-a" type="number" min="1" value="200" class="w-20 px-3 py-2 rounded-xl bg-white border border-amber-300 font-bold text-center" title="Model A 模擬次數">
+                        <select id="battle-mode-a" class="px-2 py-2 rounded-xl bg-white border border-amber-300 font-bold text-xs" title="Model A 走法模式">
+                            <option value="stochastic">機率</option>
+                            <option value="greedy">貪婪</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-black text-amber-800 mb-1 uppercase tracking-widest">Model B</label>
+                    <div class="flex gap-2">
+                        <select id="battle-model-b" class="flex-1 px-3 py-2 rounded-xl bg-white border border-amber-300 font-bold"></select>
+                        <input id="battle-sims-b" type="number" min="1" value="200" class="w-20 px-3 py-2 rounded-xl bg-white border border-amber-300 font-bold text-center" title="Model B 模擬次數">
+                        <select id="battle-mode-b" class="px-2 py-2 rounded-xl bg-white border border-amber-300 font-bold text-xs" title="Model B 走法模式">
+                            <option value="stochastic">機率</option>
+                            <option value="greedy">貪婪</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="flex gap-2 items-end">
+                    <div class="flex-1">
+                        <label class="block text-xs font-black text-amber-800 mb-1 uppercase tracking-widest">場數</label>
+                        <input id="battle-games" type="number" min="1" value="10" class="w-full px-3 py-2 rounded-xl bg-white border border-amber-300 font-bold text-center">
+                    </div>
+                    <button id="battle-start-btn" class="px-6 py-2 bg-amber-950 text-white font-black rounded-xl btn-fancy text-sm">開始對戰</button>
+                </div>
+
+                <div id="battle-progress" class="text-sm font-bold text-amber-700">尚未開始。</div>
+            </div>
+
+            <div id="battle-result" class="hidden mt-6 border-t border-amber-200 pt-4 space-y-2"></div>
+        </div>
+    </div>
+
+    <!-- 對局重播模態 -->
+    <div id="replay-modal" class="fixed inset-0 bg-amber-950/70 backdrop-blur-sm hidden flex items-center justify-center z-50">
+        <div class="bg-amber-50 text-amber-950 rounded-3xl shadow-2xl p-8 w-[min(560px,92vw)] max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-3xl font-black tracking-tight">對局重播</h2>
+                <button id="replay-close-btn" class="text-2xl font-black text-amber-700 hover:text-amber-950">×</button>
+            </div>
+                        <div id="replay-list" class="space-y-2"></div>
+            <div class="text-center text-xs font-bold text-amber-700 mt-4">※ 點選要重播的對局後，會自動切回主畫面棋盤，並在下方出現播放控制列。</div>
+        </div>
+    </div>
+
+    <script>
+        // --- 核心配置 (依據 gameRule.txt 與圖片) ---
+        const RAW_LAYOUT = [
+            [3, 3, 3, 3, 6, -1, -1, -1, -1],
+            [6, 2, 2, 2, 5, 6, -1, -1, -1],
+            [6, 5, 1, 1, 4, 5, 6, -1, -1],
+            [6, 5, 4, 3, 6, 4, 5, 6, -1],
+            [6, 5, 4, 6, -1, 3, 1, 2, 3],
+            [-1, 3, 2, 1, 3, 6, 1, 2, 3],
+            [-1, -1, 3, 2, 1, 4, 4, 2, 3],
+            [-1, -1, -1, 3, 2, 5, 5, 5, 3],
+            [-1, -1, -1, -1, 3, 6, 6, 6, 6]
+        ];
+
+        const PIECE_DEFS = {
+            1: { p: 'White', t: 'Tzaar' }, 2: { p: 'White', t: 'Tzarra' }, 3: { p: 'White', t: 'Tott' },
+            4: { p: 'Black', t: 'Tzaar' }, 5: { p: 'Black', t: 'Tzarra' }, 6: { p: 'Black', t: 'Tott' }
+        };
+
+        // UI 端原本的方向定義（維持原手感）
+        const DIRS = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, 1]];
+        const VALID_POSITIONS = (() => {
+            const out = [];
+            for (let r = 0; r < 9; r++) {
+                for (let c = 0; c < 9; c++) {
+                    if (RAW_LAYOUT[r][c] !== -1) out.push([r, c]);
+                }
+            }
+            return out;
+        })();
+        const POS_INDEX_MAP = new Map(
+            VALID_POSITIONS.map((pos, idx) => [`${pos[0]},${pos[1]}`, idx])
+        );
+
+                let state = {
+            board: [], // {r, c, p, t, h}
+            turn: 'White',
+            turnNumber: 1,
+            step: 1,
+            whiteFirst: true,
+            selected: null,
+            over: false,
+            vsMode: 'human',        // 'human' = 雙人對戰, 'ai' = 人機對戰
+            aiPlayer: 'Black',      // AI 執哪一色
+            userColor: 'White',     // 人類執哪一色
+        };
+        let aiThinking = false;     // 防止人機對弈中重複觸發 AI 走子
+
+        let saveDirectoryHandle = null;
+        let gameRecord = null;
+
+        const canvas = document.getElementById('tzaarBoard');
+        const ctx = canvas.getContext('2d');
+        let scale = 0;
+        let pieceRadius = 0;
+        let centerHoleRadius = 0;
+        let hitRadius = 0;
+        let boardCenter = { x: 0, y: 0 };
+
+        function projectUnit(r, c) {
+            const rr = r - 4;
+            const cc = c - 4;
+            // For DIRS [r+1,c], [r,c+1], [r+1,c+1], make neighbor distance uniform.
+            const x = cc - rr / 2;
+            const y = rr * (Math.sqrt(3) / 2);
+            return { x, y };
+        }
+
+        function generateGameId() {
+            const rand = Math.random().toString(36).slice(2, 10);
+            return `tzaar_game_${rand}`;
+        }
+
+        function cloneBoardPieces() {
+            return state.board.map(p => ({ r: p.r, c: p.c, p: p.p, t: p.t, h: p.h }));
+        }
+
+        function pieceTypeId(pieceType) {
+            if (pieceType === 'Tzaar') return 1;
+            if (pieceType === 'Tzarra') return 2;
+            return 3;
+        }
+
+        function encodePieceCode(piece) {
+            const ownerId = piece.p === 'White' ? 1 : 2;
+            const typeId = pieceTypeId(piece.t);
+            return ownerId * 10000 + typeId * 1000 + piece.h;
+        }
+
+        function toPosIndex(cell) {
+            if (!cell) return null;
+            return POS_INDEX_MAP.get(`${cell.r},${cell.c}`) ?? null;
+        }
+
+        function captureBoardSnapshot() {
+            const pieceMap = new Map();
+            for (const piece of state.board) {
+                pieceMap.set(`${piece.r},${piece.c}`, piece);
+            }
+
+            const boardVec = new Array(VALID_POSITIONS.length).fill(0);
+            for (let i = 0; i < VALID_POSITIONS.length; i++) {
+                const [r, c] = VALID_POSITIONS[i];
+                const piece = pieceMap.get(`${r},${c}`);
+                boardVec[i] = piece ? encodePieceCode(piece) : 0;
+            }
+
+            return {
+                turn: state.turn,
+                turn_number: state.turnNumber,
+                step: state.step,
+                whiteFirst: state.whiteFirst,
+                board_vec: boardVec,
+            };
+        }
+
+        function resetGameRecord() {
+            gameRecord = {
+                schema_version: 2,
+                game_id: generateGameId(),
+                final_result: null,
+                position_index_map: VALID_POSITIONS,
+                piece_code_scheme: {
+                    empty: 0,
+                    formula: "owner*10000 + type*1000 + height",
+                    owner: { "1": "White", "2": "Black" },
+                    type: { "1": "Tzaar", "2": "Tzarra", "3": "Tott" }
+                },
+                initial_board: captureBoardSnapshot(),
+                moves: [],
+                saved: false,
+            };
+            const saveText = document.getElementById('save-result-text');
+            if (saveText) saveText.innerText = '';
+        }
+
+        function recordPreMove(move) {
+            if (!gameRecord) return;
+            gameRecord.moves.push({
+                move_index: gameRecord.moves.length + 1,
+                player: state.turn,
+                before_board: captureBoardSnapshot(),
+                move,
+            });
+        }
+
+        function getRecordFileName() {
+            return `${gameRecord.game_id}.json`;
+        }
+
+        async function chooseSaveDirectory() {
+            const saveText = document.getElementById('save-result-text');
+            if (!window.showDirectoryPicker) {
+                if (saveText) saveText.innerText = '此瀏覽器不支援資料夾選擇，將改用下載檔案。';
+                return;
+            }
+            try {
+                const pickedHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                saveDirectoryHandle = await pickedHandle.getDirectoryHandle('game_records', { create: true });
+                if (saveText) saveText.innerText = '已設定存檔資料夾：game_records';
+            } catch (err) {
+                if (saveText) saveText.innerText = '尚未設定存檔資料夾。';
+            }
+        }
+
+        function downloadRecordFile(recordText, fileName) {
+            const blob = new Blob([recordText], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        async function saveGameRecordToFile() {
+            const saveText = document.getElementById('save-result-text');
+            if (!gameRecord || !gameRecord.final_result) {
+                if (saveText) saveText.innerText = '只有對局結束後才能存檔。';
+                return;
+            }
+            if (gameRecord.saved) {
+                if (saveText) saveText.innerText = '本局已存檔。';
+                return;
+            }
+
+            const fileName = getRecordFileName();
+            const recordText = JSON.stringify(gameRecord);
+
+            try {
+                if (saveDirectoryHandle) {
+                    const fileHandle = await saveDirectoryHandle.getFileHandle(fileName, { create: true });
+                    const writable = await fileHandle.createWritable();
+                    await writable.write(recordText);
+                    await writable.close();
+                    gameRecord.saved = true;
+                    if (saveText) saveText.innerText = `已存檔到 game_records/${fileName}`;
+                    return;
+                }
+
+                if (window.showSaveFilePicker) {
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: fileName,
+                        types: [{
+                            description: 'TZAAR Game Record',
+                            accept: { 'application/json': ['.json'] },
+                        }],
+                    });
+                    const writable = await handle.createWritable();
+                    await writable.write(recordText);
+                    await writable.close();
+                    gameRecord.saved = true;
+                    if (saveText) saveText.innerText = `已存檔：${fileName}`;
+                    return;
+                }
+
+                downloadRecordFile(recordText, fileName);
+                gameRecord.saved = true;
+                if (saveText) saveText.innerText = `瀏覽器不支援直接寫入，已下載：${fileName}`;
+            } catch (err) {
+                if (saveText) saveText.innerText = '存檔失敗或已取消，請再試一次。';
+            }
+        }
+
+        function init() {
+            state.board = [];
+            state.turn = 'White';
+            state.turnNumber = 1;
+            state.step = 1;
+            state.whiteFirst = true;
+            state.selected = null;
+            state.over = false;
+            for(let r=0; r<9; r++) {
+                for(let c=0; c<9; c++) {
+                    const val = RAW_LAYOUT[r][c];
+                    if(val !== -1) {
+                        state.board.push({
+                            r, c,
+                            p: PIECE_DEFS[val].p,
+                            t: PIECE_DEFS[val].t,
+                            h: 1
+                        });
+                    }
+                }
+            }
+                        resetGameRecord();
+            resize();
+            updateUI();
+            loop();
+            // 人機對戰：若 AI 執白且先手，開局即觸發 AI
+            maybeTriggerAI();
+        }
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            const verticalInset = Math.max(24, Math.min(56, window.innerHeight * 0.05));
+            const reservedSide = Math.max(145, Math.min(220, window.innerWidth * 0.18));
+            const availableWidth = Math.max(260, canvas.width - reservedSide * 2);
+            const availableHeight = Math.max(260, canvas.height - verticalInset * 2);
+
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            for (let r = 0; r < 9; r++) {
+                for (let c = 0; c < 9; c++) {
+                    if (RAW_LAYOUT[r][c] !== -1 || (r === 4 && c === 4)) {
+                        const p = projectUnit(r, c);
+                        if (p.x < minX) minX = p.x;
+                        if (p.x > maxX) maxX = p.x;
+                        if (p.y < minY) minY = p.y;
+                        if (p.y > maxY) maxY = p.y;
+                    }
+                }
+            }
+
+            const boardWidthUnits = Math.max(1, maxX - minX);
+            const boardHeightUnits = Math.max(1, maxY - minY);
+            const margin = 0.96;
+            scale = Math.min(
+                availableWidth / boardWidthUnits,
+                availableHeight / boardHeightUnits
+            ) * margin;
+            boardCenter = {
+                x: canvas.width / 2,
+                y: canvas.height / 2
+            };
+            // 定義棋子與互動常數
+            pieceRadius = Math.max(13, Math.min(scale * 0.47, 29));
+            centerHoleRadius = scale * 0.68;
+            hitRadius = Math.max(pieceRadius + 6, pieceRadius * 1.2);
+        }
+
+        window.addEventListener('resize', resize);
+
+        function getCoord(r, c) {
+            const p = projectUnit(r, c);
+            const x = boardCenter.x + scale * p.x;
+            const y = boardCenter.y + scale * p.y;
+            return { x, y };
+        }
+
+                function drawOnce() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // Mirror rendering only, keep game logic coordinates unchanged.
+            ctx.save();
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            
+            
+            // 1. 繪製圖片風格背景 (三角形網格)
+            drawGrid();
+
+            // 2. 繪製中心空洞 (圖片特徵)
+            const center = getCoord(4, 4);
+            ctx.beginPath();
+            ctx.arc(center.x, center.y, centerHoleRadius, 0, Math.PI * 2);
+            ctx.fillStyle = '#d4a017';
+            ctx.fill();
+            ctx.strokeStyle = '#f5e6be';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // 3. 選中效果提示
+            if (state.selected) {
+                const sPos = getCoord(state.selected.r, state.selected.c);
+                ctx.save();
+                ctx.setLineDash([8, 12]);
+                ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+                DIRS.forEach(([dr, dc]) => {
+                    ctx.beginPath();
+                    ctx.moveTo(sPos.x, sPos.y);
+                    const ePos = getCoord(state.selected.r + dr*10, state.selected.c + dc*10);
+                    ctx.lineTo(ePos.x, ePos.y);
+                    ctx.stroke();
+                });
+                ctx.restore();
+            }
+
+            // 4. 繪製棋子
+            state.board.forEach(p => {
+                const pos = getCoord(p.r, p.c);
+                drawPiece(pos.x, pos.y, p, state.selected === p);
+            });
+
+                        ctx.restore();
+        }
+
+        function loop() {
+            drawOnce();
+            if (!state.over) requestAnimationFrame(loop);
+        }
+
+        function drawGrid() {
+            ctx.strokeStyle = '#f5e6be';
+            ctx.lineWidth = 1.5;
+            const drawnEdges = new Set();
+            
+            // 遍查每個有效節點的所有 6 方向連線
+            for(let r=0; r<9; r++) {
+                for(let c=0; c<9; c++) {
+                    if (RAW_LAYOUT[r][c] === -1 && !(r===4 && c===4)) continue;
+                    const p1 = getCoord(r, c);
+                    // 所有 6 方向（與 strategy/tzaar.py 一致）
+                    DIRS.forEach(([dr, dc]) => {
+                        const nr = r + dr, nc = c + dc;
+                        if (nr>=0 && nr<9 && nc>=0 && nc<9) {
+                            if (RAW_LAYOUT[nr][nc] !== -1 || (nr===4 && nc===4)) {
+                                const edgeKey = `${Math.min(r,nr)},${Math.min(c,nc)}-${Math.max(r,nr)},${Math.max(c,nc)}`;
+                                if (!drawnEdges.has(edgeKey)) {
+                                    drawnEdges.add(edgeKey);
+                                    const p2 = getCoord(nr, nc);
+                                    ctx.beginPath();
+                                    ctx.moveTo(p1.x, p1.y);
+                                    ctx.lineTo(p2.x, p2.y);
+                                    ctx.stroke();
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        function drawPiece(x, y, p, sel) {
+            const r = pieceRadius;
+            for(let i=0; i<p.h; i++) {
+                const py = y - i * 4;
+                ctx.beginPath();
+                ctx.arc(x, py, r, 0, Math.PI * 2);
+                
+                if (i === 0) {
+                    ctx.shadowColor = 'rgba(0,0,0,0.2)';
+                    ctx.shadowBlur = 15;
+                    ctx.shadowOffsetY = 8;
+                }
+
+                const grad = ctx.createRadialGradient(x - r/3, py - r/3, r/6, x, py, r);
+                if (p.p === 'White') {
+                    grad.addColorStop(0, '#ffffff');
+                    grad.addColorStop(1, '#bbbbbb');
+                } else {
+                    grad.addColorStop(0, '#444444');
+                    grad.addColorStop(1, '#000000');
+                }
+                
+                ctx.fillStyle = grad;
+                ctx.fill();
+                ctx.strokeStyle = p.p === 'White' ? '#666' : '#111';
+                ctx.lineWidth = 1.6;
+                ctx.stroke();
+                ctx.shadowColor = 'transparent';
+            }
+
+            const ty = y - (p.h-1) * 4;
+            const rings = p.t === 'Tzaar' ? 3 : (p.t === 'Tzarra' ? 2 : 1);
+            for(let i=1; i<=rings; i++) {
+                const ringRadius = (r * i) / 4;
+
+                // 外圈陰影線：先畫一層反差色，提升紋路可見性
+                ctx.beginPath();
+                ctx.arc(x, ty, ringRadius, 0, Math.PI * 2);
+                ctx.strokeStyle = p.p === 'White' ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.95)';
+                ctx.lineWidth = 2.8;
+                ctx.stroke();
+
+                // 內圈主紋路：再疊一層主色線，形成清楚的雙層紋路
+                ctx.beginPath();
+                ctx.arc(x, ty, ringRadius, 0, Math.PI * 2);
+                ctx.strokeStyle = p.p === 'White' ? 'rgba(0,0,0,0.75)' : 'rgba(255,255,255,0.92)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+
+            if (sel) {
+                ctx.beginPath();
+                ctx.arc(x, ty, r + 6, 0, Math.PI * 2);
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 4;
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(x, ty, r + 9, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+
+            if (p.h > 1) {
+                ctx.save();
+                ctx.scale(-1, 1);
+                ctx.fillStyle = p.p === 'White' ? '#000' : '#fff';
+                ctx.font = '900 12px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(p.h, -x, ty + 4);
+                ctx.restore();
+            }
+        }
+
+        // --- 邏輯判定 ---
+
+        function getAt(r, c) { return state.board.find(x => x.r === r && x.c === c); }
+
+        function isInside(r, c) {
+            return r >= 0 && r < 9 && c >= 0 && c < 9;
+        }
+
+        function isValidCell(r, c) {
+            return isInside(r, c) && RAW_LAYOUT[r][c] !== -1;
+        }
+
+        function firstOccupiedInDirection(r, c, dr, dc) {
+            let nr = r + dr;
+            let nc = c + dc;
+            while (isValidCell(nr, nc)) {
+                const piece = getAt(nr, nc);
+                if (piece) return piece;
+                nr += dr;
+                nc += dc;
+            }
+            return null;
+        }
+
+        function canMove(f, t) {
+            if (!f || !t || f === t) return false;
+
+            // 與後端一致：只能選擇該方向第一個可見棋堆作為目標。
+            let legalTarget = false;
+            for (const [dr, dc] of DIRS) {
+                const first = firstOccupiedInDirection(f.r, f.c, dr, dc);
+                if (first === t) {
+                    legalTarget = true;
+                    break;
+                }
+            }
+            if (!legalTarget) return false;
+
+            if (state.step === 1) {
+                // 第一步：必吃且高度不小於目標
+                return t.p !== f.p && f.h >= t.h;
+            }
+
+            // 第二步：可疊可吃；吃子仍需高度不小於目標
+            if (t.p === f.p) return true;
+            return f.h >= t.h;
+        }
+
+        function getExtinctionResult() {
+            const players = ['White', 'Black'];
+            const types = ['Tzaar', 'Tzarra', 'Tott'];
+            for (const p of players) {
+                for (const t of types) {
+                    if (state.board.filter(x => x.p === p && x.t === t).length === 0) {
+                        return { win: p === 'White' ? 'Black' : 'White', msg: `${t} 絕種了！` };
+                    }
+                }
+            }
+            return null;
+        }
+
+        function hasMandatoryCapture(player) {
+            return state.board.some(src => {
+                if (src.p !== player) return false;
+                return state.board.some(dst => src !== dst && canMove(src, dst) && dst.p !== src.p);
+            });
+        }
+
+        function getNoMandatoryCaptureResultAtTurnStart() {
+            // 與後端一致：只在一個玩家「第一步開始時」判定必吃。
+            if (state.step !== 1) return null;
+            if (hasMandatoryCapture(state.turn)) return null;
+            return {
+                win: state.turn === 'White' ? 'Black' : 'White',
+                msg: '無法進行強制吃子！'
+            };
+        }
+
+        function doMove(f, t) {
+            const isCap = f.p !== t.p;
+            recordPreMove({
+                kind: isCap ? 'CAPTURE' : 'REINFORCE',
+                src_idx: toPosIndex(f),
+                dst_idx: toPosIndex(t),
+                mandatory_capture_step: state.step === 1,
+            });
+
+            if (isCap) {
+                state.board = state.board.filter(x => x !== t);
+                f.r = t.r; f.c = t.c;
+            } else {
+                // 與後端一致：疊子後目標頂端種類改為來源頂端種類。
+                t.p = f.p;
+                t.t = f.t;
+                t.h += f.h;
+                state.board = state.board.filter(x => x !== f);
+            }
+
+            state.selected = null;
+
+            const extinction = getExtinctionResult();
+            if (extinction) { gameOver(extinction); return; }
+
+            if (state.whiteFirst) {
+                state.whiteFirst = false;
+                state.turn = 'Black';
+                state.turnNumber += 1;
+                state.step = 1;
+            } else {
+                if (state.step === 1) state.step = 2;
+                else {
+                    state.turn = state.turn === 'White' ? 'Black' : 'White';
+                    state.turnNumber += 1;
+                    state.step = 1;
+                }
+            }
+
+                        const noCap = getNoMandatoryCaptureResultAtTurnStart();
+            if (noCap) { gameOver(noCap); return; }
+            updateUI();
+            maybeTriggerAI();
+        }
+
+        function pieceTypeToBoardCode(piece) {
+            const base = piece.p === 'White' ? 0 : 3;
+            if (piece.t === 'Tzaar') return base + 1;
+            if (piece.t === 'Tzarra') return base + 2;
+            return base + 3;
+        }
+
+        function uiToStrategyCoord(r, c) {
+            return { r, c };
+        }
+
+        function strategyToUiCoord(r, c) {
+            return { r, c };
+        }
+
+        function getHistoryLineCountForStrategy() {
+            if (state.whiteFirst && state.turn === 'White' && state.step === 1 && state.turnNumber === 1) {
+                return 0;
+            }
+            if (state.step !== 1) {
+                return null;
+            }
+            return Math.max(0, (state.turnNumber - 1) * 2);
+        }
+
+        function buildStrategyPayload() {
+            const board = RAW_LAYOUT.map(row => row.map(v => (v === -1 ? -1 : 0)));
+            const layer = RAW_LAYOUT.map(row => row.map(v => (v === -1 ? -1 : 0)));
+            for (const piece of state.board) {
+                const mapped = uiToStrategyCoord(piece.r, piece.c);
+                board[mapped.r][mapped.c] = pieceTypeToBoardCode(piece);
+                layer[mapped.r][mapped.c] = piece.h;
+            }
+                        const historyLineCount = getHistoryLineCountForStrategy();
+            return {
+                board,
+                layer,
+                historyLineCount,
+                turn: state.turn,
+                step: state.step,
+                turn_number: state.turnNumber,
+                model: document.getElementById('ai-model').value,
+                simulations: Number(document.getElementById('ai-sims').value) || 256,
+            };
+        }
+
+        function parseStrategyMove(moveText) {
+            const raw = (moveText || '').trim();
+            if (!raw) throw new Error('策略回傳空字串。');
+            const parts = raw.split(',');
+            if (parts[0] === 'P') return { kind: 'PASS' };
+            if (parts.length !== 5) throw new Error(`策略輸出格式錯誤: ${raw}`);
+            const nums = parts.slice(1).map(v => Number.parseInt(v, 10));
+            if (nums.some(Number.isNaN)) throw new Error(`策略座標非整數: ${raw}`);
+            return {
+                kind: 'MOVE',
+                color: parts[0],
+                fromR: nums[0],
+                fromC: nums[1],
+                toR: nums[2],
+                toC: nums[3],
+                raw,
+            };
+        }
+
+        function applyStrategyMoveToken(token) {
+            if (token.kind === 'PASS') return;
+            const fromCoord = strategyToUiCoord(token.fromR, token.fromC);
+            const toCoord = strategyToUiCoord(token.toR, token.toC);
+            const from = getAt(fromCoord.r, fromCoord.c);
+            const to = getAt(toCoord.r, toCoord.c);
+            if (!from) throw new Error(`找不到來源棋子: ${token.raw}`);
+            if (!to) throw new Error(`找不到目標棋子: ${token.raw}`);
+            if (!canMove(from, to)) throw new Error(`策略動作不合法: ${token.raw}`);
+            doMove(from, to);
+        }
+
+        async function requestStrategyMoveAndApply() {
+            if (state.over) return;
+            if (state.step !== 1) {
+                alert('目前不是第一步，策略程式此版本只建議在每回合起始(第一步)呼叫。');
+                return;
+            }
+
+            const aiBtn = document.getElementById('ai-move-btn');
+            const oldText = aiBtn.innerText;
+            aiBtn.disabled = true;
+            aiBtn.innerText = 'AI 計算中...';
+
+            try {
+                                const payload = buildStrategyPayload();
+                const response = await fetch('http://127.0.0.1:8788/api/strategy-move', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || '策略服務呼叫失敗');
+                }
+
+                                const currentTurnBefore = state.turn;
+                const move1 = parseStrategyMove(data.move1);
+
+                applyStrategyMoveToken(move1);
+                if (!state.over && data.move2 && state.turn === currentTurnBefore && state.step === 2) {
+                    applyStrategyMoveToken(parseStrategyMove(data.move2));
+                }
+            } catch (err) {
+                alert(`AI 代走失敗: ${err.message}`);
+                        } finally {
+                aiBtn.disabled = false;
+                aiBtn.innerText = oldText;
+            }
+        }
+
+        // ── 人機對戰：模型單步走法 ────────────────────────────────
+        function maybeTriggerAI() {
+            if (state.vsMode !== 'ai' || state.over || aiThinking) return;
+            if (state.turn !== state.aiPlayer) return;
+            aiThinking = true;
+            // 小延遲讓畫面先刷新，再讓模型思考
+            setTimeout(requestModelMove, 60);
+        }
+
+        async function requestModelMove() {
+            try {
+                const payload = buildStrategyPayload();
+                payload.model = document.getElementById('ai-model').value;
+                payload.simulations = Number(document.getElementById('ai-sims').value) || 200;
+                payload.mode = (document.getElementById('ai-mode') && document.getElementById('ai-mode').value) || 'stochastic';
+
+                const res = await fetch(`${BATTLE_BASE}/api/model-move`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || '模型走子服務呼叫失敗');
+                                if (data.game_over) {
+                    // 模型被判定無強制吃子 → 由前端判定終局
+                    const noCap = getNoMandatoryCaptureResultAtTurnStart();
+                    if (noCap) gameOver(noCap);
+                    return;
+                }
+                if (data.move === 'P') {
+                    // 模型第二步選擇 PASS → 由前端完成 pass 的回合切換
+                    doPass();
+                    return;
+                }
+                applyStrategyMoveToken(parseStrategyMove(data.move));
+            } catch (err) {
+                console.error('人機對戰失敗', err);
+                alert(`模型走子失敗: ${err.message}`);
+            } finally {
+                aiThinking = false;
+                // 若模型在同一回合還有第二步要下，繼續觸發
+                maybeTriggerAI();
+            }
+        }
+
+        function checkOver() {
+            return getExtinctionResult() || getNoMandatoryCaptureResultAtTurnStart();
+        }
+
+        function updateUI() {
+            const line = document.getElementById('status-line');
+            const pass = document.getElementById('pass-btn');
+            const whitePanel = document.getElementById('white-stats-panel');
+            const blackPanel = document.getElementById('black-stats-panel');
+            const leftDock = document.querySelector('.stats-dock.left');
+            const rightDock = document.querySelector('.stats-dock.right');
+            line.innerHTML = `<span class="${state.turn==='White'?'text-white':'text-black'}">${state.turn==='White'?'白方':'黑方'}</span> · ${state.step===1?'第一步: 強制吃子':'第二步: 自由行動'}`;
+            pass.classList.toggle('hidden', state.step === 1 || state.whiteFirst);
+
+            const types = ['Tzaar', 'Tzarra', 'Tott'];
+                        function renderPanel(player, modelName) {
+                return `
+                    <div class="text-xs font-black opacity-45 uppercase tracking-[0.35em] text-amber-900">${player === 'White' ? 'White' : 'Black'}</div>
+                    <div class="text-lg font-black tracking-tight ${player === 'White' ? 'text-amber-950' : 'text-amber-950'}">${player === 'White' ? '白方' : '黑方'}</div>
+                    ${modelName ? `<div class="text-[10px] font-black text-amber-950/80 mt-[-4px]">${modelName}</div>` : ''}
+                    <div class="player-stats">
+                        ${types.map(t => {
+                            const c = state.board.filter(x => x.p === player && x.t === t).length;
+                            return `<div class="text-center flex-1">
+                                <div class="text-3xl font-black leading-none ${c===0?'text-red-700':'text-amber-950'}">${c}</div>
+                                <div class="text-[10px] font-bold opacity-55 text-amber-900 mt-2 tracking-wide">${t}</div>
+                            </div>`;
+                        }).join('')}
+                    </div>
+                `;
+            }
+
+                        // 重播模式：在雙方棋子剩餘數量下方顯示各自對應的模型
+            let whiteModel = null, blackModel = null;
+            if (replayCtx) {
+                const modelA = replayCtx.models.A.split('_').pop();
+                const modelB = replayCtx.models.B.split('_').pop();
+                if (replayCtx.a_is_white) {
+                    whiteModel = `模型 A · ${modelA}`;
+                    blackModel = `模型 B · ${modelB}`;
+                } else {
+                    whiteModel = `模型 B · ${modelB}`;
+                    blackModel = `模型 A · ${modelA}`;
+                }
+            } else if (state.vsMode === 'ai') {
+                // 人機對戰：標示哪一方是人類 / 哪一方是 AI
+                const m = document.getElementById('ai-model');
+                const short = (m && m.value) ? m.value.split('_').pop() : '';
+                if (state.aiPlayer === 'White') {
+                    whiteModel = `AI · ${short}`;
+                    blackModel = '人類（你）';
+                } else {
+                    whiteModel = '人類（你）';
+                    blackModel = `AI · ${short}`;
+                }
+            }
+
+            whitePanel.innerHTML = renderPanel('White', whiteModel);
+            blackPanel.innerHTML = renderPanel('Black', blackModel);
+            whitePanel.classList.toggle('active', state.turn === 'White');
+            blackPanel.classList.toggle('active', state.turn === 'Black');
+            leftDock.classList.toggle('active', state.turn === 'White');
+            rightDock.classList.toggle('active', state.turn === 'Black');
+        }
+
+        function gameOver(res) {
+            state.over = true;
+            if (gameRecord && !gameRecord.final_result) {
+                gameRecord.final_result = {
+                    winner: res.win,
+                    reason: res.msg,
+                    total_moves: gameRecord.moves.length,
+                };
+            }
+            document.getElementById('game-over-modal').classList.remove('hidden');
+            document.getElementById('winner-display').innerText = (res.win === 'White' ? '白方' : '黑方') + ' 獲勝';
+            document.getElementById('reason-display').innerText = res.msg;
+        }
+
+                canvas.addEventListener('mousedown', e => {
+            if (state.over) return;
+            // 人機對戰：輪到 AI 時，人類不可操作棋子
+            if (state.vsMode === 'ai' && state.turn === state.aiPlayer) return;
+            const rect = canvas.getBoundingClientRect();
+            const rawMx = e.clientX - rect.left;
+            const mx = canvas.width - rawMx;
+            const my = e.clientY - rect.top;
+            let target = null;
+            state.board.forEach(p => {
+                const pos = getCoord(p.r, p.c);
+                if (Math.sqrt((pos.x-mx)**2 + (pos.y-my)**2) < hitRadius) target = p;
+            });
+
+            if (!state.selected) {
+                if (target && target.p === state.turn) state.selected = target;
+            } else {
+                if (target && canMove(state.selected, target)) doMove(state.selected, target);
+                else if (target && target.p === state.turn) state.selected = target;
+                else state.selected = null;
+            }
+        });
+
+                function doPass() {
+            if (state.step !== 2 || state.over) return;
+            recordPreMove({
+                kind: 'PASS',
+                src_idx: null,
+                dst_idx: null,
+                mandatory_capture_step: false,
+            });
+            state.turn = state.turn === 'White' ? 'Black' : 'White';
+            state.turnNumber += 1;
+            state.step = 1; state.selected = null;
+            const res = getNoMandatoryCaptureResultAtTurnStart();
+            if (res) { gameOver(res); return; }
+            updateUI();
+            maybeTriggerAI();
+        }
+
+        document.getElementById('pass-btn').addEventListener('click', doPass);
+
+                document.getElementById('ai-move-btn').addEventListener('click', requestStrategyMoveAndApply);
+                document.getElementById('choose-save-dir-btn').addEventListener('click', chooseSaveDirectory);
+                document.getElementById('save-record-btn').addEventListener('click', saveGameRecordToFile);
+
+                // ── 人機對戰：對手類型與開始 ──────────────────────────────
+                function startPvE() {
+                    const userColor = document.getElementById('user-color').value || 'White';
+                    state.vsMode = 'ai';
+                    state.userColor = userColor;
+                    state.aiPlayer = userColor === 'White' ? 'Black' : 'White';
+                    document.getElementById('opponent-type').value = 'ai';
+                    init();   // init() 開頭會依 aiPlayer 決定是否自動觸發 AI
+                }
+
+                document.getElementById('pve-start-btn').addEventListener('click', startPvE);
+                document.getElementById('opponent-type').addEventListener('change', () => {
+                    const v = document.getElementById('opponent-type').value;
+                    if (v === 'human') {
+                        state.vsMode = 'human';
+                        state.userColor = 'White';
+                        state.aiPlayer = 'Black';
+                    }
+                });
+
+        // ── 模型對戰 & 對局重播 ──────────────────────────────────────
+        const BATTLE_BASE = 'http://127.0.0.1:8788';
+        let battlePollTimer = null;
+
+        function populateSelect(selId, checkpoints) {
+            const sel = document.getElementById(selId);
+            if (!sel) return;
+            sel.innerHTML = checkpoints.map(c =>
+                `<option value="${c}">${c}</option>`
+            ).join('');
+        }
+
+        async function loadCheckpoints() {
+            try {
+                const res = await fetch(`${BATTLE_BASE}/api/checkpoints`);
+                const data = await res.json();
+                const list = data.checkpoints || [];
+                populateSelect('ai-model', list);
+                populateSelect('battle-model-a', list);
+                populateSelect('battle-model-b', list);
+            } catch (err) {
+                console.warn('無法取得模型清單', err);
+            }
+        }
+
+        function openBattleModal() {
+            
+            document.getElementById('battle-modal').classList.remove('hidden');
+            document.getElementById('battle-modal').classList.add('flex');
+        }
+        function closeBattleModal() {
+            document.getElementById('battle-modal').classList.add('hidden');
+            document.getElementById('battle-modal').classList.remove('flex');
+        }
+
+        async function startBattle() {
+                        const ckptA = document.getElementById('battle-model-a').value;
+            const ckptB = document.getElementById('battle-model-b').value;
+            const simsA = Number(document.getElementById('battle-sims-a').value) || 200;
+            const simsB = Number(document.getElementById('battle-sims-b').value) || 200;
+            const modeA = document.getElementById('battle-mode-a').value || 'stochastic';
+            const modeB = document.getElementById('battle-mode-b').value || 'stochastic';
+            const games = Number(document.getElementById('battle-games').value) || 10;
+            const prog = document.getElementById('battle-progress');
+            const resultBox = document.getElementById('battle-result');
+
+            if (!ckptA || !ckptB) { alert('請先選擇模型 A 與模型 B。'); return; }
+            resultBox.classList.add('hidden');
+            resultBox.innerHTML = '';
+            prog.innerText = '正在啟動對戰...';
+
+            try {
+                const res = await fetch(`${BATTLE_BASE}/api/battle`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ckptA, ckptB, simsA, simsB, games, modeA, modeB, temperature: 0.1 }),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || '啟動對戰失敗');
+                const jobId = data.job_id;
+                pollBattle(jobId, games);
+            } catch (err) {
+                prog.innerText = `失敗：${err.message}`;
+            }
+        }
+
+        function pollBattle(jobId, totalGames) {
+            if (battlePollTimer) clearInterval(battlePollTimer);
+            const prog = document.getElementById('battle-progress');
+
+            battlePollTimer = setInterval(async () => {
+                try {
+                    const res = await fetch(`${BATTLE_BASE}/api/battle/${jobId}`);
+                    const data = await res.json();
+                    if (data.status === 'done') {
+                        clearInterval(battlePollTimer);
+                        battlePollTimer = null;
+                        renderBattleResult(data.result);
+                        if (typeof loadReplayList === 'function') loadReplayList();
+                        return;
+                    }
+                    if (data.status === 'error') {
+                        clearInterval(battlePollTimer);
+                        battlePollTimer = null;
+                        prog.innerText = `對戰出錯：${(data.errors || []).join('; ')}`;
+                        return;
+                    }
+                    prog.innerText = `對戰進行中... ${data.progress}/${data.total} 局`;
+                } catch (err) {
+                    console.warn('輪詢對戰失敗', err);
+                }
+            }, 1200);
+        }
+
+        function renderBattleResult(result) {
+            const box = document.getElementById('battle-result');
+            const prog = document.getElementById('battle-progress');
+            if (!result) return;
+            prog.innerText = `對戰完成：共 ${result.games} 局`;
+            const pct = (rate => (rate * 100).toFixed(2) + '%')(result.A_win_rate);
+            box.innerHTML = `
+                <div class="text-xs font-black text-amber-800 uppercase tracking-widest">結果</div>
+                <div class="grid grid-cols-3 gap-2 text-center">
+                    <div class="bg-amber-100 rounded-xl p-3">
+                        <div class="text-2xl font-black">${result.A}</div>
+                        <div class="text-[11px] font-bold text-amber-800">Model A 勝</div>
+                    </div>
+                    <div class="bg-amber-100 rounded-xl p-3">
+                        <div class="text-2xl font-black">${result.B}</div>
+                        <div class="text-[11px] font-bold text-amber-800">Model B 勝</div>
+                    </div>
+                    <div class="bg-amber-100 rounded-xl p-3">
+                        <div class="text-2xl font-black">${result.draw}</div>
+                        <div class="text-[11px] font-bold text-amber-800">和局</div>
+                    </div>
+                </div>
+                <div class="text-sm font-black">Model A 勝率：${pct}</div>
+                <div class="text-[11px] font-bold text-amber-700">A=${result.models.A.split('_').pop()} · sims=${result.simulations.A} · ${(result.modes?.A || 'stochastic')==='greedy'?'貪婪':'機率'} &nbsp;|&nbsp; B=${result.models.B.split('_').pop()} · sims=${result.simulations.B} · ${(result.modes?.B || 'stochastic')==='greedy'?'貪婪':'機率'}</div>
+            `;
+            box.classList.remove('hidden');
+        }
+
+                // ── 對局重播 ──────────────────────────────────────────────────
+        let replayCtx = null;
+        let replayIdx = 0;
+
+        function closeReplayModal() {
+            document.getElementById('replay-modal').classList.add('hidden');
+            document.getElementById('replay-modal').classList.remove('flex');
+        }
+
+                function openReplayModal() {
+            loadReplayList();
+            document.getElementById('replay-modal').classList.remove('hidden');
+            document.getElementById('replay-modal').classList.add('flex');
+        }
+
+        async function loadReplayList() {
+            const listBox = document.getElementById('replay-list');
+            try {
+                const res = await fetch(`${BATTLE_BASE}/api/games`);
+                const data = await res.json();
+                const games = data.games || [];
+                if (!games.length) {
+                    listBox.innerHTML = '<div class="text-sm font-bold text-amber-700">尚無對局紀錄。</div>';
+                    return;
+                }
+                listBox.innerHTML = games.slice().reverse().map(g => `
+                    <button data-gid="${g.game_id}" class="replay-item w-full text-left px-4 py-3 bg-amber-100 hover:bg-amber-200 rounded-xl btn-fancy">
+                        <div class="text-xs font-black text-amber-900">${g.game_id}</div>
+                        <div class="text-[11px] font-bold text-amber-700">
+                            A: ${g.models.A.split('_').pop()} vs B: ${g.models.B.split('_').pop()} · ${g.ply_count} 手 · 勝者 ${g.winner || '?'}
+                        </div>
+                    </button>
+                `).join('');
+                listBox.querySelectorAll('.replay-item').forEach(btn => {
+                    btn.addEventListener('click', () => loadReplayGame(btn.dataset.gid));
+                });
+            } catch (err) {
+                listBox.innerHTML = `<div class="text-sm font-bold text-red-700">讀取對局失敗：${err.message}</div>`;
+            }
+        }
+
+        function enterReplayMode() {
+            if (!replayCtx) return;
+            // 關掉重播選單視窗，改用主畫面播放列
+                        closeReplayModal();
+            document.getElementById('replay-control-bar').classList.remove('hidden');
+
+            const title = document.getElementById('replay-title');
+            title.textContent = `重播 · ${replayCtx.game_id}`;
+            const meta = document.getElementById('replay-meta');
+            const a = replayCtx.models.A.split('_').pop();
+            const b = replayCtx.models.B.split('_').pop();
+            meta.textContent = `${a} (勝${replayCtx.winner === 'A' ? 'A' : replayCtx.winner === 'B' ? 'B' : '-'})`;
+        }
+
+        async function loadReplayGame(gameId) {
+            try {
+                const res = await fetch(`${BATTLE_BASE}/api/games/${gameId}`);
+                const rec = await res.json();
+                if (!res.ok) throw new Error(rec.error || '讀取失敗');
+                replayCtx = rec;
+                replayIdx = 0;
+                enterReplayMode();
+                renderReplayPly();
+            } catch (err) {
+                alert(`讀取對局失敗：${err.message}`);
+            }
+        }
+
+        function renderReplayPly() {
+            if (!replayCtx) return;
+            const plies = replayCtx.plies || [];
+            // 建立「按步數」的盤面序列：
+            // boards[k] = 下了 k 手之後的盤面（k=0 為初始盤面）。
+            const boards = plies.map(p => p.board);
+            boards.push(replayCtx.final_board || (boards.length ? boards[boards.length - 1] : []));
+            if (replayIdx > boards.length - 1) replayIdx = boards.length - 1;
+            if (replayIdx < 0) replayIdx = 0;
+            const pieces = boards[replayIdx] || [];
+
+            state.board = pieces.map(p => ({ r: p.r, c: p.c, p: p.p, t: p.t, h: p.h }));
+            state.over = true;
+            state.selected = null;
+
+                        const pos = document.getElementById('replay-position');
+            pos.innerText = `${replayIdx} / ${plies.length}`;
+            document.getElementById('replay-prev-btn').disabled = replayIdx <= 0;
+            document.getElementById('replay-next-btn').disabled = replayIdx >= plies.length;
+            
+
+            updateUI();
+            drawOnce();
+        }
+
+        function exitReplayMode() {
+            replayCtx = null;
+            replayIdx = 0;
+            document.getElementById('replay-control-bar').classList.add('hidden');
+            init();   // 回到全新對局
+        }
+
+        document.getElementById('battle-btn').addEventListener('click', openBattleModal);
+        document.getElementById('battle-close-btn').addEventListener('click', closeBattleModal);
+        document.getElementById('battle-start-btn').addEventListener('click', startBattle);
+        document.getElementById('open-replay-btn').addEventListener('click', openReplayModal);
+        document.getElementById('replay-close-btn').addEventListener('click', closeReplayModal);
+        document.getElementById('replay-prev-btn').addEventListener('click', () => { if (replayIdx > 0) { replayIdx -= 1; renderReplayPly(); } });
+        document.getElementById('replay-next-btn').addEventListener('click', () => { if (replayCtx && replayIdx < (replayCtx.plies || []).length) { replayIdx += 1; renderReplayPly(); } });
+        document.getElementById('rp-first-btn').addEventListener('click', () => { replayIdx = 0; renderReplayPly(); });
+        document.getElementById('rp-last-btn').addEventListener('click', () => { if (replayCtx) { replayIdx = (replayCtx.plies || []).length; renderReplayPly(); } });
+        document.getElementById('rp-exit-btn').addEventListener('click', exitReplayMode);
+
+
+        loadCheckpoints();
+
+        init();
+    </script>
+</body>
+</html>

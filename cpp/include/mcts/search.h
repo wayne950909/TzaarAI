@@ -108,7 +108,7 @@ class SearchSession {
   };
 
   static constexpr int root_node_index_ = 0;
-  static constexpr int kMaxNodesPerTree = 65000;   // 節點池容量上限
+  static constexpr int kMaxNodesPerTree = 120000;   // 節點池容量上限
   SearchConfig config_;
   int root_node_id_ = 1;
   int simulations_processed_ = 0;

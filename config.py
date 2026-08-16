@@ -68,13 +68,13 @@ NETWORK_CFG = NetworkConfig()
 @dataclass
 class MCTSConfig:
     """MCTS 搜尋引擎的超參數"""
-    simulations: int = 256  
+    simulations: int = 512 
     puct_c: float = 1.5
-    leaf_batch_size: int = 32
+    leaf_batch_size: int = 16
 
     # Root Dirichlet noise（訓練時啟用）
     use_root_dirichlet_noise: bool = True
-    root_dirichlet_eps: float = 0.25
+    root_dirichlet_eps: float = 0.3
     root_dirichlet_alpha: float = 0.05
 
     # 啟發式先驗（設為 0 則停用）
@@ -147,7 +147,7 @@ class SelfPlayConfig:
     """自我對弈的動作採樣溫度排程"""
     temp_high: float = 1.0     # 前期探索溫度
     temp_low: float = 0.1      # 後期利用溫度
-    temp_switch_decision: int = 8  # 第幾步之後切換到低溫
+    temp_switch_decision: int = 6  # 第幾步之後切換到低溫
 
 
 SELFPLAY_CFG = SelfPlayConfig()
@@ -164,8 +164,8 @@ class TrainingConfig:
     games_per_update: int = 400
     selfplay_model_game_ratio: float = 1.0  # 純自我對弈比例 (0~1)
     train_epochs_per_update: int = 1
-    optimization_passes_per_update: int = 5
-    batch_size: int = 128
+    optimization_passes_per_update: int = 16
+    batch_size: int = 256
     checkpoint_every_updates: int = 20
     log_every: int = 10
     selfplay_progress_log_interval: int = 1  # <=0 停用進度log
@@ -185,8 +185,8 @@ TRAINING_CFG = TrainingConfig()
 @dataclass
 class OptimizerConfig:
     """Adam 優化器與損失加權"""
-    learning_rate_start: float = 0.0007
-    learning_rate_end: float = 0.0007   # = start 表示固定學習率
+    learning_rate_start: float = 0.00035
+    learning_rate_end: float = 0.00035   # = start 表示固定學習率
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     policy_loss_weight: float = 1.0
@@ -207,7 +207,7 @@ class GatekeeperConfig:
     eval_games: int = 100
     winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
-    simulations_per_decision: int = 256  # 評估時的 MCTS 模擬數
+    simulations_per_decision: int = 800  # 評估時的 MCTS 模擬數
     eval_every_updates: int = 1        # 每 N 次更新執行一次
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True
@@ -224,8 +224,8 @@ GATE_CFG = GatekeeperConfig()
 class ReplayConfig:
     """Replay Buffer 設定"""
     enabled: bool = True
-    max_samples: int = 200000
-    train_samples_per_update: int = 8192
+    max_samples: int = 100000
+    train_samples_per_update: int = 16384
     min_train_samples: int = 256
     snapshot_version: int = 1
     snapshot_tag: str = "latest"

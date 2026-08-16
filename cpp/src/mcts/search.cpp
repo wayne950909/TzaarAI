@@ -282,7 +282,7 @@ int SearchSession::simulate_into_buffers(int chunk,
   NvtxRangeGuard sim_guard("simulate_into_buffers");
 
   int simulated_count = 0;
-  const int max_attempts = chunk + 400;  // 預留給終端節點的重試空間
+  const int max_attempts = chunk + 800;  // 預留給終端節點的重試空間
 
   for (int attempts = 0; attempts < max_attempts; ++attempts) {
     if (simulated_count >= chunk) break;
@@ -295,7 +295,7 @@ int SearchSession::simulate_into_buffers(int chunk,
     int node_idx = root_node_index_;
     std::vector<int> path;
     path.reserve(128);
-        path.push_back(node_idx);
+    path.push_back(node_idx);
 
     while (true) {
       MctsNode& node = nodes_[node_idx];
