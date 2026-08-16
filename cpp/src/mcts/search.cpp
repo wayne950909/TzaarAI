@@ -64,11 +64,17 @@ struct NvtxRangeGuard {
 SearchSession::SearchSession(const PhaseGameState& root_state, SearchConfig config)
     : config_(std::move(config)), rng_(std::random_device{}()) {
 
-  // 零動態分配 Flat Node Pool：一次 reserve 到位，之後不再 reallocation。
+    // 零動態分配 Flat Node Pool：一次 reserve 到位，之後不再 reallocation。
   // reset() 只重設內容與狀態，不再觸發 reserve/resize。
   if (next_free_node_idx_ <= root_node_index_) next_free_node_idx_ = 1;
   nodes_.reserve(static_cast<std::size_t>(kMaxNodesPerTree));
   nodes_.resize(static_cast<std::size_t>(kMaxNodesPerTree));
+
+  // pending 葉清單容量預留為「一次 leaf batch 最多可送出的葉數」，
+  // 跨多輪搜尋重用（reset 只 clear 不釋放），避免每次 batch 重新配置。
+  if (config.leaf_batch_size > 0) {
+    pending_leaves_.reserve(static_cast<std::size_t>(config.leaf_batch_size));
+  }
 
   reset(root_state, config_);
 }
@@ -117,12 +123,11 @@ void SearchSession::reset(const PhaseGameState& root_state, SearchConfig config)
         root_board_flat_.data(), root_global_feat_.data());
   }
 
-  // 清空搜尋期間的暫態狀態。
+    // 清空搜尋期間的暫態狀態。
   simulations_processed_ = 0;
   root_noise_applied_ = false;
-  pending_node_order_.clear();
-  pending_paths_.clear();
-  pending_eval_map_.clear();
+  pending_leaves_.clear();
+  pending_evaluated_count_ = 0;
   batch_board_flat_.clear();
   batch_global_feat_.clear();
   batch_legal_mask_.clear();
@@ -154,7 +159,7 @@ SearchSession::PackedLeaves SearchSession::collect_pending_leaves_packed(int max
     return result;
   }
 
-  result.batch_size = static_cast<int>(pending_node_order_.size());
+    result.batch_size = static_cast<int>(pending_leaves_.size());
   result.node_ids = batch_node_ids_.data();
   result.legal_masks = batch_legal_mask_.data();
   result.board_state_flat = batch_board_flat_.data();
@@ -168,16 +173,22 @@ void SearchSession::submit_leaf_eval(int node_id, const std::vector<float>& prio
     throw std::invalid_argument("unknown node_id for current search session");
   if (!has_pending_leaves())
     throw std::invalid_argument("no pending leaves to evaluate");
-  if (pending_paths_.find(node_idx) == pending_paths_.end())
+
+  MctsNode& node = nodes_[node_idx];
+  if (node.pending_slot < 0 || node.pending_slot >= static_cast<int>(pending_leaves_.size()))
     throw std::invalid_argument("node_id is not in pending leaves");
-  if (pending_eval_map_.find(node_idx) != pending_eval_map_.end())
+  PendingLeaf& leaf = pending_leaves_[node.pending_slot];
+  if (leaf.evaluated)
     throw std::invalid_argument("leaf evaluation already submitted for this node");
   if (priors.size() != static_cast<std::size_t>(kActionCount))
     throw std::invalid_argument("priors must have length N_ACTIONS");
 
-  pending_eval_map_.emplace(node_idx, PendingEval{priors, value});
+  leaf.evaluated = true;
+  leaf.value = value;
+  leaf.priors = priors;
+  pending_evaluated_count_ += 1;
 
-  if (pending_eval_map_.size() == pending_node_order_.size()) {
+  if (pending_evaluated_count_ == static_cast<int>(pending_leaves_.size())) {
     process_pending_evals();
   }
 }
@@ -188,29 +199,31 @@ void SearchSession::submit_leaf_eval_batch(
     const float* values,
     int batch_size) {
 
-  if (!has_pending_leaves())
+    if (!has_pending_leaves())
     throw std::invalid_argument("no pending leaves to evaluate");
-
-  std::vector<float> prior_row(static_cast<std::size_t>(kActionCount), 0.0f);
 
   for (int i = 0; i < batch_size; ++i) {
     const int node_id = static_cast<int>(node_ids[i]);
     const int node_idx = node_id - 1;
 
-        if (node_idx < 0 || node_idx >= next_free_node_idx_)
+    if (node_idx < 0 || node_idx >= next_free_node_idx_)
       throw std::invalid_argument("unknown node_id for current search session");
-    if (pending_paths_.find(node_idx) == pending_paths_.end())
+
+    MctsNode& node = nodes_[node_idx];
+    if (node.pending_slot < 0 || node.pending_slot >= static_cast<int>(pending_leaves_.size()))
       throw std::invalid_argument("node_id is not in pending leaves");
-    if (pending_eval_map_.find(node_idx) != pending_eval_map_.end())
+    PendingLeaf& leaf = pending_leaves_[node.pending_slot];
+    if (leaf.evaluated)
       throw std::invalid_argument("leaf evaluation already submitted for this node");
 
-    std::memcpy(prior_row.data(),
-                priors + (i * static_cast<std::int64_t>(kActionCount)),
-                static_cast<std::size_t>(kActionCount) * sizeof(float));
-    pending_eval_map_.emplace(node_idx, PendingEval{prior_row, values[i]});
+    leaf.evaluated = true;
+    leaf.value = values[i];
+    leaf.priors.assign(priors + (i * static_cast<std::int64_t>(kActionCount)),
+                       priors + ((i + 1) * static_cast<std::int64_t>(kActionCount)));
+    pending_evaluated_count_ += 1;
   }
 
-  if (pending_eval_map_.size() == pending_node_order_.size()) {
+  if (pending_evaluated_count_ == static_cast<int>(pending_leaves_.size())) {
     process_pending_evals();
   }
 }
@@ -225,7 +238,7 @@ SearchResult SearchSession::finish() {
   result.needs_root_eval = has_pending_leaves();
   result.simulations_requested = config_.simulations;
   result.simulations_processed = simulations_processed_;
-  result.pending_leaf_count = static_cast<int>(pending_node_order_.size());
+  result.pending_leaf_count = static_cast<int>(pending_leaves_.size());
   result.root_value = nodes_[root_node_index_].mean_value();
 
     // 根節點 legal mask：臨時產生，不長期佔用節點空間。
@@ -296,9 +309,10 @@ int SearchSession::simulate_into_buffers(int chunk,
     int node_idx = root_node_index_;
     // 重用呼叫端提供的執行緒級容器（capacity 跨多次呼叫/多次 run_search 保留），
     // 避免每次迭代重新配置 std::vector<int>（heap 熱點）。
-    std::vector<int>& path = path_buffer;
+        std::vector<int>& path = path_buffer;
     path.clear();
-    path.reserve(128);   // capacity 已足夠時為 no-op；深度異常時才有一次 realloc
+    // capacity 由呼叫端（SearchManager 執行緒）提供並跨多次呼叫重用，
+    // 因此這裡不需再做 reserve。
     path.push_back(node_idx);
 
     while (true) {
@@ -331,8 +345,22 @@ int SearchSession::simulate_into_buffers(int chunk,
         continue;  // 仍在走訪，段1持續計時
       }
 
-                              // 情況 C：未展開葉節點
+                                                            // 情況 C：未展開葉節點
       // 走訪完成，段1到此（仍在外層 sib_stage1_selection 範圍內）
+
+            // ── 撞到「已送出、等 GPU 的 pending 節點」──
+      // 不送新的給 GPU、不新增待推論節點；只重疊 virtual loss，
+      // 並對該 pending 葉的 repeat_count 累加（同葉必同路徑，
+      // 不必再複製 path；結果回來時會依 repeat_count 重複 backup）。
+      if (node.pending_slot >= 0) {
+        for (const int idx : path) {
+          nodes_[idx].visit_count += 1;
+          nodes_[idx].value_sum -= 1.0f;
+        }
+        pending_leaves_[node.pending_slot].repeat_count += 1;
+        simulations_processed_ += 1;
+        break;
+      }
 
       // ── 段3：遊戲狀態複製與動作套用 ──────────────
       PhaseGameState state;
@@ -350,37 +378,7 @@ int SearchSession::simulate_into_buffers(int chunk,
           simulations_processed_ += 1;
           break;  // 跳出 while，外層 sib_stage1_selection 在此迭代結束時一併 pop
         }
-      }  // sib_stage3_state_clone pop
-
-            // ── 生成本節點合法動作遮罩（計數用；真正的寫入在段5）──
-      // 診斷：若 node.is_terminal 為 false（搜尋認為局面未結束），
-      // 但合法動作數量為 0（局面實際上無步可下），代表「終局判斷漏掉」
-      // 或「重建出的局面與實際遊戲不一致」——這正是可能造成整棵樹
-      // 卡住（無法模擬、剩餘模擬次數不減）的關鍵原因。
-      {
-        // 在呼叫 legal_mask()「之前」先記錄原始 phase/player，避免
-        // legal_mask() 內部把局勢判定為終局（並把 stage 改為 Done）干擾診斷資訊。
-        const std::string dbg_phase_before = state.phase();
-        const int dbg_player = state.current_player();
-        const int dbg_turn = state.turn_number();
-        const int dbg_winner = state.winner();
-        const int dbg_done_node = node.is_terminal ? 1 : 0;
-
-        const std::vector<bool> dbg_legal = state.legal_mask();
-        int dbg_legal_count = 0;
-        for (std::size_t j = 0; j < dbg_legal.size(); ++j) {
-          if (dbg_legal[j]) dbg_legal_count++;
-        }
-        if (dbg_legal_count == 0) {
-          TZAAR_DEBUG_LOG(
-              "[mcts/simulate] TREE %d | node_idx=%d | phase_before=%s | "
-              "current_player=%d | turn=%d | node.is_terminal=%d | "
-              "winner=%d | NO-LEGAL-MOVES=%d !!! "
-              "(搜尋判定未終局，但重建局面無合法步子 -> 疑似終局判斷漏判或重建不一致)",
-              tree_id, node_idx, dbg_phase_before.c_str(),
-              dbg_player, dbg_turn, dbg_done_node, dbg_winner, 1);
-        }
-      }
+            }  // sib_stage3_state_clone pop
 
       // ── 段4：特徵序列化與寫入緩衝區（build_cnn_features_into）──
       {
@@ -427,17 +425,25 @@ int SearchSession::simulate_into_buffers(int chunk,
         parent.expanded = true;
       }  // sib_stage2_node_alloc pop
 
-      // ── Virtual loss + 記錄 pending（併入段1 sib_stage1_selection）──
+            // ── Virtual loss + 記錄 pending（併入段1 sib_stage1_selection）──
       for (const int idx : path) {
         nodes_[idx].visit_count += 1;
         nodes_[idx].value_sum -= 1.0f;
       }
-      pending_node_order_.push_back(node_idx);
+
+      // 建立 pending 葉：快照唯一一條路徑（同葉必同路徑，因此只存一份）。
+      PendingLeaf leaf;
+      leaf.node_idx = node_idx;
+      leaf.path = path;
+      leaf.repeat_count = 1;
+      leaf.evaluated = false;
+      node.pending_slot = static_cast<int>(pending_leaves_.size());
+      pending_leaves_.push_back(std::move(leaf));
+
       node_ids_out[simulated_count] = static_cast<int32_t>(node_idx + 1);
-            if (tree_ids_out) {
+      if (tree_ids_out) {
         tree_ids_out[simulated_count] = static_cast<int32_t>(tree_id);
       }
-      pending_paths_[node_idx].push_back(path);
 
       simulated_count++;
       simulations_processed_ += 1;
@@ -452,8 +458,8 @@ int SearchSession::simulate_into_buffers(int chunk,
     TZAAR_DEBUG_LOG(
         "[mcts/simulate] TREE %d | simulate_into_buffers ch=%d RETURNED 0 "
         "(proc=%d/%d | pending=%d) -> 此樹可能被丟掉/卡住",
-        tree_id, chunk, simulations_processed_, config_.simulations,
-        static_cast<int>(pending_node_order_.size()));
+                tree_id, chunk, simulations_processed_, config_.simulations,
+        static_cast<int>(pending_leaves_.size()));
   }
 
   return simulated_count;
@@ -465,19 +471,21 @@ bool SearchSession::submit_single_eval(int node_id,
   const int node_idx = node_id - 1;
   if (node_idx < 0 || node_idx >= next_free_node_idx_)
     throw std::invalid_argument("unknown node_id for current search session");
-  if (pending_paths_.find(node_idx) == pending_paths_.end())
+
+  MctsNode& node = nodes_[node_idx];
+  if (node.pending_slot < 0 || node.pending_slot >= static_cast<int>(pending_leaves_.size()))
     throw std::invalid_argument("node_id is not in pending leaves");
-  if (pending_eval_map_.find(node_idx) != pending_eval_map_.end())
+  PendingLeaf& leaf = pending_leaves_[node.pending_slot];
+  if (leaf.evaluated)
     throw std::invalid_argument("leaf evaluation already submitted for this node");
 
-  std::vector<float> prior_row(static_cast<std::size_t>(kActionCount), 0.0f);
-  std::memcpy(prior_row.data(), priors,
-              static_cast<std::size_t>(kActionCount) * sizeof(float));
-
-  pending_eval_map_.emplace(node_idx, PendingEval{std::move(prior_row), value});
+  leaf.evaluated = true;
+  leaf.value = value;
+  leaf.priors.assign(priors, priors + static_cast<std::size_t>(kActionCount));
+  pending_evaluated_count_ += 1;
 
   // 當所有 pending 都到齊時自動處理
-  if (pending_eval_map_.size() == pending_node_order_.size()) {
+  if (pending_evaluated_count_ == static_cast<int>(pending_leaves_.size())) {
     process_pending_evals();
     return true;
   }
@@ -505,9 +513,10 @@ void SearchSession::reset_node(MctsNode& node) {
   node.visit_count = 0;
   node.value_sum = 0.0f;
   node.expanded = false;
-  node.to_play = 0;
+    node.to_play = 0;
   node.winner = 0;
   node.is_terminal = false;
+  node.pending_slot = -1;
 }
 
 std::vector<int> SearchSession::collect_action_path_to_node(int node_idx) const {
@@ -550,8 +559,8 @@ bool SearchSession::prepare_pending_leaves(int max_batch) {
 
   if (is_complete()) return false;
 
-  if (has_pending_leaves()) {
-    if (static_cast<int>(pending_node_order_.size()) > max_batch)
+    if (has_pending_leaves()) {
+    if (static_cast<int>(pending_leaves_.size()) > max_batch)
       throw std::invalid_argument("max_batch is smaller than current pending leaf count");
     return true;
   }
@@ -563,17 +572,17 @@ bool SearchSession::prepare_pending_leaves(int max_batch) {
     simulate_chunk(chunk);
   }
 
-  if (!has_pending_leaves()) return false;
-  if (static_cast<int>(pending_node_order_.size()) > max_batch)
+    if (!has_pending_leaves()) return false;
+  if (static_cast<int>(pending_leaves_.size()) > max_batch)
     throw std::invalid_argument("max_batch is smaller than current pending leaf count");
   return true;
 }
 
 std::vector<LeafSnapshot> SearchSession::pending_leaf_snapshots() {
   std::vector<LeafSnapshot> leaves;
-  leaves.reserve(pending_node_order_.size());
-  for (const int node_idx : pending_node_order_) {
-    leaves.push_back(build_leaf_snapshot(node_idx));
+  leaves.reserve(pending_leaves_.size());
+  for (const PendingLeaf& leaf : pending_leaves_) {
+    leaves.push_back(build_leaf_snapshot(leaf.node_idx));
   }
   return leaves;
 }
@@ -596,9 +605,8 @@ LeafSnapshot SearchSession::build_leaf_snapshot(int node_idx) {
 }
 
 void SearchSession::simulate_chunk(int chunk) {
-  pending_node_order_.clear();
-  pending_paths_.clear();
-  pending_eval_map_.clear();
+  pending_leaves_.clear();
+  pending_evaluated_count_ = 0;
   batch_board_flat_.clear();
   batch_global_feat_.clear();
   batch_legal_mask_.clear();
@@ -632,14 +640,14 @@ void SearchSession::simulate_chunk(int chunk) {
         continue;
       }
 
-      // 未展開葉節點
-      if (pending_paths_.count(node_idx) > 0) {
-        // 已在佇列中：應用 virtual loss
+            // 未展開葉節點
+      if (node.pending_slot >= 0) {
+        // 已在佇列中：應用 virtual loss，repeat_count 累加
         for (const int idx : path) {
           nodes_[idx].visit_count += 1;
           nodes_[idx].value_sum -= 1.0f;
         }
-        pending_paths_[node_idx].push_back(path);
+        pending_leaves_[node.pending_slot].repeat_count += 1;
         break;
       }
 
@@ -694,14 +702,19 @@ void SearchSession::simulate_chunk(int chunk) {
         node.children_count++;
       }
 
-      // 加入 NN 批次佇列 — 應用 virtual loss
+            // 加入 NN 批次佇列 — 應用 virtual loss
       for (const int idx : path) {
         nodes_[idx].visit_count += 1;
         nodes_[idx].value_sum -= 1.0f;
       }
-      pending_node_order_.push_back(node_idx);
+      PendingLeaf leaf;
+      leaf.node_idx = node_idx;
+      leaf.path = path;
+      leaf.repeat_count = 1;
+      leaf.evaluated = false;
+      node.pending_slot = static_cast<int>(pending_leaves_.size());
+      pending_leaves_.push_back(std::move(leaf));
       batch_node_ids_.push_back(static_cast<int32_t>(node_idx + 1));
-      pending_paths_[node_idx].push_back(path);
       break;
     }
   }
@@ -729,8 +742,7 @@ int SearchSession::select_child_action(int node_idx) {
   for (int i = 0; i < cnt; ++i) {
     const int child_idx = base + i;
 
-    // ── 跳過底下已有 pending leaf 的子節點 ──────────
-    if (has_pending_descendant(child_idx)) continue;
+    // 不做 pending 硬避開，一律用 UCB（virtual loss 軟懲罰已降低重複機率）
 
     const MctsNode& child = nodes_[child_idx];
     const float q_child = child.mean_value();
@@ -778,30 +790,32 @@ void SearchSession::backup(const std::vector<int>& path, float leaf_value, int l
 // 2. 對所有等待同一節點結果的 path 還原 virtual loss
 // 3. 再做真正 backup
 void SearchSession::process_pending_evals() {
-  for (const int node_idx : pending_node_order_) {
-    auto eval_it = pending_eval_map_.find(node_idx);
-    if (eval_it == pending_eval_map_.end())
+  for (PendingLeaf& leaf : pending_leaves_) {
+    if (!leaf.evaluated)
       throw std::runtime_error("missing pending eval while processing leaf batch");
 
-    expand_node(node_idx, eval_it->second.priors);
+    MctsNode& leaf_node = nodes_[leaf.node_idx];
+    expand_node(leaf.node_idx, leaf.priors);
 
-        const int leaf_to_play = nodes_[node_idx].to_play;
-    const float leaf_value = eval_it->second.value;
+    const int leaf_to_play = leaf_node.to_play;
+    const float leaf_value = leaf.value;
 
-    auto path_it = pending_paths_.find(node_idx);
-    for (const auto& path : path_it->second) {
-      // 還原 virtual loss
-      for (const int idx : path) {
+    // 依 repeat_count 還原 virtual loss 並做真正 backup。
+    // 因為「同葉必同路徑」，所有重複命中的路徑都相同，只需對同一條
+    // leaf.path 重複 apply 即可（每次送出/stall 各施加過一次 virtual loss）。
+    for (int r = 0; r < leaf.repeat_count; ++r) {
+      for (const int idx : leaf.path) {
         nodes_[idx].visit_count -= 1;
         nodes_[idx].value_sum += 1.0f;
       }
-      backup(path, leaf_value, leaf_to_play);
+      backup(leaf.path, leaf_value, leaf_to_play);
     }
+
+    leaf_node.pending_slot = -1;
   }
 
-  pending_node_order_.clear();
-  pending_paths_.clear();
-  pending_eval_map_.clear();
+  pending_leaves_.clear();
+  pending_evaluated_count_ = 0;
 }
 
 void SearchSession::expand_node(int node_idx, const std::vector<float>& priors) {
@@ -846,28 +860,6 @@ void SearchSession::expand_node(int node_idx, const std::vector<float>& priors) 
     apply_root_dirichlet_noise();
     root_noise_applied_ = true;
   }
-}
-
-// 遞迴檢查 node_idx 底下是否有 pending leaf。
-// 用於 simulate_into_buffers 中的 selection：避開已有 pending leaf 的子樹，
-// 讓每次 selection 都走向新的未展開節點。
-bool SearchSession::has_pending_descendant(int node_idx) const {
-  // 如果這個節點本身就在 pending 中（未展開的葉節點）
-  if (pending_paths_.find(node_idx) != pending_paths_.end()) return true;
-
-  const MctsNode& node = nodes_[node_idx];
-  if (!node.expanded) {
-    // 未展開且不在 pending 中 → 沒有 pending descendant
-    return false;
-  }
-
-    // 已展開：遞迴檢查所有子節點（連續區塊）
-  const int base = node.children_base_idx;
-  const int cnt = node.children_count;
-  for (int i = 0; i < cnt; ++i) {
-    if (has_pending_descendant(base + i)) return true;
-  }
-  return false;
 }
 
 void SearchSession::apply_root_dirichlet_noise() {

@@ -8,7 +8,6 @@
 
 #include <cstdint>
 #include <random>
-#include <unordered_map>
 #include <vector>
 
 namespace tzaar {
@@ -22,9 +21,9 @@ class SearchSession {
   // 避免每次重新 reserve/resize 節點池（kMaxNodesPerTree）。
   void reset(const PhaseGameState& root_state, SearchConfig config);
 
-  // ─── 唯讀查詢 ─────────────────────────────────────────
+      // ─── 唯讀查詢 ─────────────────────────────────────────
   SearchConfig config() const { return config_; }
-  bool has_pending_leaves() const { return !pending_node_order_.empty(); }
+  bool has_pending_leaves() const { return !pending_leaves_.empty(); }
   bool is_complete() const;
   int simulations_processed() const { return simulations_processed_; }
   int simulations_requested() const { return config_.simulations; }
@@ -65,7 +64,7 @@ class SearchSession {
     // path_buffer：呼叫端（SearchManager 的執行緒）提供的重用容器。
   // 執行緒可預先 reserve 容量並跨多次呼叫/多次 run_search 重用，
   // 避免 simulate_into_buffers 每次迭代重新配置 path（heap 熱點）。
-  int simulate_into_buffers(int chunk,
+    int simulate_into_buffers(int chunk,
                             float* board_out,
                             float* global_out,
                             uint8_t* mask_out,
@@ -82,9 +81,18 @@ class SearchSession {
                           float value);
 
  private:
-  struct PendingEval {
-    std::vector<float> priors;
-    float value = 0.0f;
+  // ─── 一棵樹內的一條 pending 路徑 ──────────────────────
+  // 關鍵不變式：抵達同一片葉節點（node_idx 相同）的 path 一定相同
+  // （node 只存唯一 parent_idx + action_from_parent）。因此每個 pending
+  // 葉只需存「一條」path，stall（重複被選中）時用 repeat_count 疊加即可，
+  // 不必像舊設計用 vector<vector<int>> 深拷貝多條 path，也不需要 unordered_map。
+  struct PendingLeaf {
+    int node_idx = -1;        // 葉節點（對外 node_id = node_idx + 1）
+    std::vector<int> path;    // 唯一一條 root→leaf 路徑（池內直接快照）
+    int repeat_count = 1;     // 這條 path 被選中的次數（含第一次送出）
+    bool evaluated = false;   // NN eval 是否已提交
+    float value = 0.0f;       // eval 回傳的 value
+    std::vector<float> priors; // eval 回傳的 prior（尺寸 kActionCount）
   };
 
   struct MctsNode {
@@ -105,6 +113,12 @@ class SearchSession {
     int winner = 0;
     bool is_terminal = false;
 
+    // ─── 待推論葉節點對應（取代 unordered_map）──────────
+    // 若本節點是一顆「已送出、等 NN 回傳」的葉，此欄位指向其在
+    // pending_leaves_ 中的 index；否則為 -1。用於 O(1) 判斷是否 pending
+    // 並直接取得 path，避免 hash lookup。
+    int pending_slot = -1;
+
     float mean_value() const {
       if (visit_count <= 0) return 0.0f;
       return value_sum / static_cast<float>(visit_count);
@@ -123,10 +137,15 @@ class SearchSession {
   std::vector<MctsNode> nodes_;       // reserve(kMaxNodesPerTree) 後不再 reallocation
   int next_free_node_idx_ = 1;        // 節點池分配指標（0 = root）
 
-  // ─── Pending leaves 狀態 ──────────────────────────
-  std::vector<int> pending_node_order_;
-  std::unordered_map<int, std::vector<std::vector<int>>> pending_paths_;
-  std::unordered_map<int, PendingEval> pending_eval_map_;
+    // ─── Pending leaves 狀態 ──────────────────────────
+  // 單一連續容器取代舊的 pending_node_order_ / pending_paths_ /
+  // pending_eval_map_ 三者。每個 pending 葉 = 一條 path + repeat_count。
+    // capacity 跨 search 保留（reset 只 clear 不釋放），避免 heap 熱點。
+  std::vector<PendingLeaf> pending_leaves_;
+  // 已提交 eval 的 pending 葉數量。當其 == pending_leaves_.size() 即代表
+  // 所有 pending 都到齊，可觸發 process_pending_evals（取代舊的
+  // pending_eval_map_.size() == pending_node_order_.size() 判斷）。
+  int pending_evaluated_count_ = 0;
 
   // ─── 批次緩衝區（供 collect_pending_leaves_packed 使用） ─
   std::vector<float>    batch_board_flat_;
@@ -158,10 +177,6 @@ class SearchSession {
   void process_pending_evals();
   void expand_node(int node_idx, const std::vector<float>& priors);
   void apply_root_dirichlet_noise();
-  
-  // ─── 供 simulate_into_buffers 使用的輔助方法 ──────
-  // 檢查子節點底下是否有 pending leaf（遞迴檢查）
-  bool has_pending_descendant(int node_idx) const;
 };
 
 }  // namespace tzaar
