@@ -559,9 +559,13 @@
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
             const verticalInset = Math.max(24, Math.min(56, window.innerHeight * 0.05));
-            const reservedSide = Math.max(145, Math.min(220, window.innerWidth * 0.18));
+                        const reservedSide = Math.max(145, Math.min(220, window.innerWidth * 0.18));
+            // 頂部預留較多空間給上方控制列（標題 + 按鈕），避免棋盤被覆蓋
+            const topInset = Math.max(170, Math.min(230, window.innerHeight * 0.24));
+                        // 底部也預留一些空間，避免重播時被下方的播放控制列擋到
+            const bottomInset = Math.max(110, window.innerHeight * 0.16);
             const availableWidth = Math.max(260, canvas.width - reservedSide * 2);
-            const availableHeight = Math.max(260, canvas.height - verticalInset * 2);
+            const availableHeight = Math.max(260, canvas.height - topInset - bottomInset);
 
             let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
             for (let r = 0; r < 9; r++) {
@@ -576,16 +580,18 @@
                 }
             }
 
-            const boardWidthUnits = Math.max(1, maxX - minX);
+                        const boardWidthUnits = Math.max(1, maxX - minX);
             const boardHeightUnits = Math.max(1, maxY - minY);
-            const margin = 0.96;
+            // 額外縮小棋盤，避免貼到 UI
+            const margin = 0.88;
             scale = Math.min(
                 availableWidth / boardWidthUnits,
                 availableHeight / boardHeightUnits
             ) * margin;
+            // 棋盤中心往下移，避開頂部控制列
             boardCenter = {
                 x: canvas.width / 2,
-                y: canvas.height / 2
+                y: topInset + (canvas.height - topInset - bottomInset) / 2
             };
             // 定義棋子與互動常數
             pieceRadius = Math.max(13, Math.min(scale * 0.47, 29));

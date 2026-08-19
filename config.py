@@ -68,14 +68,14 @@ NETWORK_CFG = NetworkConfig()
 @dataclass
 class MCTSConfig:
     """MCTS 搜尋引擎的超參數"""
-    simulations: int = 512 
-    puct_c: float = 1.5
+    simulations: int = 768 
+    puct_c: float = 2.25
     leaf_batch_size: int = 16
 
     # Root Dirichlet noise（訓練時啟用）
     use_root_dirichlet_noise: bool = True
-    root_dirichlet_eps: float = 0.3
-    root_dirichlet_alpha: float = 0.05
+    root_dirichlet_eps: float = 0.25
+    root_dirichlet_alpha: float = 0.17
 
     # 啟發式先驗（設為 0 則停用）
     heuristic_prior_weight: float = 0.0
@@ -102,7 +102,7 @@ class AsyncMCTSConfig:
     """多 CPU worker + 共享 GPU worker 的非同步 pipeline"""
     enabled: bool = True
     # 同時進行的 active game pool 大小（例如 200 局平行推進）
-    parallel_games: int = 400
+    parallel_games: int = 800
     # C++ SearchManager 的常駐 worker thread 數量（固定不變）
     num_threads: int = 10
     # 單次 GPU forward 最多聚合多少個 leaf states。
@@ -124,7 +124,7 @@ class AsyncMCTSConfig:
     local_capacity: int = 2000
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
-    ready_flush_leaves: int = 64
+    ready_flush_leaves: int = 128
 
     # ── C++ SearchManager 內部 Debug Log ──────────────────
     # 在 config.py 設定，經 cpp_manager._build_config 傳入 C++ SearchManager。
@@ -146,7 +146,7 @@ ASYNC_MCTS_CFG = AsyncMCTSConfig()
 class SelfPlayConfig:
     """自我對弈的動作採樣溫度排程"""
     temp_high: float = 1.0     # 前期探索溫度
-    temp_low: float = 0.1      # 後期利用溫度
+    temp_low: float = 1.0     # 後期利用溫度
     temp_switch_decision: int = 6  # 第幾步之後切換到低溫
 
 
@@ -164,8 +164,8 @@ class TrainingConfig:
     games_per_update: int = 400
     selfplay_model_game_ratio: float = 1.0  # 純自我對弈比例 (0~1)
     train_epochs_per_update: int = 1
-    optimization_passes_per_update: int = 16
-    batch_size: int = 256
+    optimization_passes_per_update: int = 32
+    batch_size: int = 512
     checkpoint_every_updates: int = 20
     log_every: int = 10
     selfplay_progress_log_interval: int = 1  # <=0 停用進度log
@@ -185,16 +185,49 @@ TRAINING_CFG = TrainingConfig()
 @dataclass
 class OptimizerConfig:
     """Adam 優化器與損失加權"""
-    learning_rate_start: float = 0.00035
-    learning_rate_end: float = 0.00035   # = start 表示固定學習率
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     policy_loss_weight: float = 1.0
     value_loss_weight: float = 1.0
     entropy_weight: float = 0.0
 
+    # 沒對應到任何模擬次數門檻時採用的回退學習率
+    default_lr: float = 0.0004
+
+    # ── 模擬次數 → 學習率 階梯式對應表 ─────────────────
+    # 當腳本（GateEscalator）切換到某個模擬次數時，訓練迴圈會自動
+    # 套用這裡對應的學習率，形成階梯式下降。
+    # 每一項為 (simulations, lr)：simulations >= 該門檻即套用該 lr。
+    lr_by_simulations: tuple = (
+        (128, 0.0008),
+        (256, 0.0006),
+        (384, 0.0004),
+        (512, 0.0003),
+        (768, 0.0002),
+        (1280, 0.0001)
+    )
+
 
 OPTIMIZER_CFG = OptimizerConfig()
+
+
+def lr_for_simulations(simulations: int) -> float:
+    """依目前模擬次數回傳應使用的學習率（階梯式下降）。
+
+    遍歷 OPTIMIZER_CFG.lr_by_simulations，取「simulations >= 門檻」中
+    最高門檻所對應的學習率：
+    - simulations 小於最小門檻 → 使用第一段（最小門檻）的 lr
+    - simulations 大於最大門檻 → 鎖在最後一段的 lr（持續維持）
+    - 表格為空時 → 使用 OPTIMIZER_CFG.default_lr
+    """
+    table = getattr(OPTIMIZER_CFG, "lr_by_simulations", ())
+    if not table:
+        return float(OPTIMIZER_CFG.default_lr)
+    lr = float(OPTIMIZER_CFG.default_lr)
+    for sims, val in table:
+        if simulations >= sims:
+            lr = val
+    return lr
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -207,10 +240,20 @@ class GatekeeperConfig:
     eval_games: int = 100
     winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
-    simulations_per_decision: int = 800  # 評估時的 MCTS 模擬數
+    simulations_per_decision: int = 384  # 評估時的 MCTS 模擬數
     eval_every_updates: int = 1        # 每 N 次更新執行一次
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True
+
+    # ── Escalation（連續失敗時提高模擬數）──────────────────
+    # 當 gate 連續失敗達 escalate_after_failures 次後，下一次評估即把
+    # simulations 升級一階。軌跡（以 simulations_per_decision 為底數）：
+    #   128 → 256 → 384 → 512 → 640 → ...（每階 +escalation_step，最高到上限）
+    # 一旦 gate 通過，連續失敗計數與升級等級都會重置回底數。
+    escalate_enabled: bool = True
+    escalate_after_failures: int = 2        # 連續失敗幾次後升級一階模擬數
+    escalation_step: int = 128             # 每階增加的模擬數
+    escalation_max_simulations: int = 960  # 模擬數上限（超出則維持上限）
 
 
 GATE_CFG = GatekeeperConfig()
@@ -224,9 +267,9 @@ GATE_CFG = GatekeeperConfig()
 class ReplayConfig:
     """Replay Buffer 設定"""
     enabled: bool = True
-    max_samples: int = 100000
+    max_samples: int = 300000
     train_samples_per_update: int = 16384
-    min_train_samples: int = 256
+    min_train_samples: int = 512
     snapshot_version: int = 1
     snapshot_tag: str = "latest"
 

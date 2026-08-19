@@ -32,19 +32,21 @@ from config import (
     MCTS_CFG,
     GATE_CFG,
     REPLAY_CFG,
-    ASYNC_MCTS_CFG,
+        ASYNC_MCTS_CFG,
     _ACTIVE_STATE_BACKEND,
     _ACTIVE_CPP_MODULE,
+    lr_for_simulations,
 )
 from core.board import TRAINING_GAME_STEPS
 from core.env import TzaarEnv, EnvConfig
-from gate.gate import gate_keeper
+from gate.gate import gate_keeper, GateEscalator
 from heuristics import HeuristicPlayoutPolicy as HP
 from training.metrics import (
     accumulate_kind_stats,
     format_exploration_stats,
 )
 from training.replay import (
+    remove_samples_from_buffer,
     replay_extend,
     save_replay_snapshot_async,
     select_train_samples,
@@ -288,6 +290,24 @@ def run(title: str) -> None:
     )
     hp = HP(hp_config)
 
+        # ── Gate 連續失敗時的模擬數升級機制 ──────────────────
+    # 每一階（模擬數）各別「連續失敗 GATE_CFG.escalate_after_failures 次」
+    # 就升到下一階（128 → 256 → 384 → 512 → 640 → ...，封頂）。
+    # 一旦升級就「不再退回」（通過 gate 只重置當前連續失敗計數，階層不降）。
+    # 升級後的模擬數同時套用於 gate keeper 與 self-play（產生對局）。
+    # 若 escalate_enabled=False 則永遠用底數。
+    gate_escalator = GateEscalator(
+        base_simulations=int(GATE_CFG.simulations_per_decision),
+        escalate_after_failures=int(GATE_CFG.escalate_after_failures),
+        escalation_step=int(GATE_CFG.escalation_step),
+        escalation_max_simulations=int(GATE_CFG.escalation_max_simulations),
+    )
+    if not GATE_CFG.escalate_enabled:
+        gate_escalator.escalation_max_simulations = int(
+            GATE_CFG.simulations_per_decision
+        )
+        gate_escalator.escalation_step = 0
+
     # ── 全域統計 ──────────────────────────────────────────
     stats: Dict[str, float] = {
         "steps": 0.0,
@@ -306,6 +326,21 @@ def run(title: str) -> None:
     for update_idx in range(start_update, total_updates):
         update_start = time.perf_counter()
         inference_temperature = float(SELFPLAY_CFG.temp_low)
+
+        # ── 依目前 gate 階層同步模擬數 ────────────────────
+        # 升級後的模擬數同時套用於 self-play（產生對局）與 gate keeper。
+        # self-play 直接讀 MCTS_CFG.simulations，gate 讀 GATE_CFG.simulations_per_decision。
+        current_sims = gate_escalator.current_simulations()
+        MCTS_CFG.simulations = current_sims
+        GATE_CFG.simulations_per_decision = current_sims
+
+        # ── 依目前模擬次數套用對應學習率（階梯式下降）──────
+        # 當 GateEscalator 升級模擬次數時，這裡會自動切換到
+        # config.lr_by_simulations 對應的學習率。
+        current_lr = lr_for_simulations(current_sims)
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
+
 
         # ── Self‑play ────────────────────────────────────
         # 這裡只負責呼叫 self-play engine 產生 fresh samples。
@@ -385,6 +420,12 @@ def run(title: str) -> None:
         if update_idx > 0 and update_idx % GATE_CFG.eval_every_updates == 0:
             policy.eval()
             guard_policy.eval()
+
+        # ── 記錄本次用的模擬階層（供 log） ──────────
+            gate_sims = gate_escalator.current_simulations()
+            gate_level = gate_escalator.level
+            gate_consecutive_failures = gate_escalator.consecutive_failures
+
             with torch.no_grad():
                 gate_result = gate_keeper(
                     policy,
@@ -399,10 +440,14 @@ def run(title: str) -> None:
                                 )
                 gate_passed = gate_result.win_rate >= GATE_CFG.winrate_threshold
             if gate_passed:
-                print(f"[gate] PASSED | win_rate={gate_result.win_rate:.3f}")
+                gate_escalator.record_success()
+                print(
+                    f"[gate] PASSED | win_rate={gate_result.win_rate:.3f} "
+                    f"| sims={gate_sims}"
+                )
                 guard_policy.load_state_dict(policy.state_dict(), strict=True)
                 guard_policy.eval()
-                                                                # candidate 通過 gate → 把目前的權重存成一個 guard checkpoint。
+                # candidate 通過 gate → 把目前的權重存成一個 guard checkpoint。
                 # 這是「guard 唯一會寫入磁碟」的時機，讓後續 resume 能接續強化。
                 train_module.save_checkpoint(
                     title=guard_title,
@@ -427,13 +472,33 @@ def run(title: str) -> None:
                         max_samples=REPLAY_CFG.max_samples,
                     )
             else:
+                gate_escalator.record_failure()
                 print(
                     f"[gate] FAILED | win_rate={gate_result.win_rate:.3f} "
-                    f"< threshold={GATE_CFG.winrate_threshold}"
+                    f"< threshold={GATE_CFG.winrate_threshold} "
+                    f"| sims={gate_sims} | level={gate_level} | "
+                    f"consecutive_failures={gate_consecutive_failures} | "
+                    f"next_sims={gate_escalator.current_simulations()}"
                 )
                 policy.load_state_dict(guard_policy.state_dict(), strict=True)
                 policy.train()
                 update_accepted = False
+                # 此次被拒 update 產生的 fresh samples 品質不佳。
+                # 若 keep_replay_on_reject=False（預設），從 replay buffer 移除
+                # 這批資料，避免被往後的 update 重複抽樣；若為 True 則保留。
+                if not GATE_CFG.keep_replay_on_reject:
+                    if REPLAY_CFG.enabled and replay_buffer and fresh_samples:
+                        replay_write_idx = remove_samples_from_buffer(
+                            replay_buffer,
+                            replay_write_idx,
+                            REPLAY_CFG.max_samples,
+                            fresh_samples,
+                        )
+                    elif fresh_samples:
+                        print(
+                            "[replay] reject: replay disabled or buffer empty, "
+                            "skipping removal"
+                        )
 
         # ── Logging ──────────────────────────────────────
         samples_in_update = len(fresh_samples)

@@ -44,6 +44,78 @@ class GateResult:
         return (self.candidate_wins + 0.5 * self.draws) / self.total
 
 
+class GateEscalator:
+    """gate 連續失敗時的模擬數自動升級機制。
+
+    每一階（模擬數）必須「在該階內部」連續失敗達 ``escalate_after_failures``
+    次才升級到下一階，而且一旦升級就「不會再退回」——即使之後 gate 通過，
+    也只是重置當前的連續失敗計數，模擬數階層保持不變。
+
+    升級軌跡（以 base 128 為例）：
+
+        level      0      1      2      3      4+
+        sims      128    256    384    512    640
+
+        0 階：連續失敗 4 次 → 升到 256（計數器歸零，開始在 256 這階重算）
+        1 階：再連續失敗 4 次 → 升到 384（在 384 這階重算）
+        2 階：再連續失敗 4 次 → 升到 512
+        3 階：再連續失敗 4 次 → 升到 640（封頂）
+
+    也就是「每階分開計算連續 4 次」，不是累積式的 4-7 / 8-11 ...。
+
+    用法（於訓練迴圈中常駐一個實例）：
+
+        escalator = GateEscalator(...)
+        sims = escalator.current_simulations()   # 本次 self-play / gate 共用
+        escalator.record_success()  # gate 通過：重置連續失敗計數（不退回階層）
+        escalator.record_failure()  # gate 失敗：累加，達到門檻即升級
+    """
+
+    def __init__(
+        self,
+        base_simulations: int = 128,
+        escalate_after_failures: int = 4,
+        escalation_step: int = 128,
+        escalation_max_simulations: int = 640,
+    ) -> None:
+        self.base_simulations = int(base_simulations)
+        self.escalate_after_failures = max(1, int(escalate_after_failures))
+        self.escalation_step = max(0, int(escalation_step))
+        self.escalation_max_simulations = max(
+            self.base_simulations, int(escalation_max_simulations)
+        )
+        self._level = 0                    # 目前階層（只升不降）
+        self._consecutive_failures = 0     # 目前階層內的連續失敗次數
+
+    @property
+    def level(self) -> int:
+        """目前已升級到的階層（只增不減）。"""
+        return self._level
+
+    @property
+    def consecutive_failures(self) -> int:
+        """目前階層內已連續失敗的次數。"""
+        return self._consecutive_failures
+
+    def current_simulations(self) -> int:
+        """依目前階層回傳應使用的模擬數（gate 與 self-play 共用）。"""
+        sims = self.base_simulations + self._level * self.escalation_step
+        return min(int(sims), self.escalation_max_simulations)
+
+    def record_success(self) -> None:
+        """gate 通過時呼叫：只重置當前連續失敗計數，階層不退。"""
+        self._consecutive_failures = 0
+
+    def record_failure(self) -> None:
+        """gate 失敗時呼叫：累加連續失敗，達到門檻即在該階內升一階。"""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.escalate_after_failures:
+            # 已在該階連續失敗滿門檻次數：升級並在下一階重新計數
+            if self.current_simulations() < self.escalation_max_simulations:
+                self._level += 1
+            self._consecutive_failures = 0
+
+
 def gate_keeper(
     candidate: torch.nn.Module,
     guard: torch.nn.Module,

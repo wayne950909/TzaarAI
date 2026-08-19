@@ -125,7 +125,7 @@ def load_or_init_policy(
     ).to(device)
     optimizer = torch.optim.Adam(
         policy.parameters(),
-        lr=OPTIMIZER_CFG.learning_rate_start,
+        lr=OPTIMIZER_CFG.default_lr,
         weight_decay=OPTIMIZER_CFG.weight_decay,
     )
 
