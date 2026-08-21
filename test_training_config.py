@@ -23,6 +23,7 @@ from config import (
     NETWORK_CFG,
     REPLAY_CFG,
     GATE_CFG,
+    ELO_CFG,
 )
 
 # ─── 測試用極小參數 ─────────────────────────────────────
@@ -31,18 +32,18 @@ print("王柏崴你好")
 print("=" * 60)
 
 # 訓練配置
-TRAINING_CFG.total_updates = 50        # 只做 2 個 update
-TRAINING_CFG.games_per_update = 500      # 每輪 5 場遊戲
+TRAINING_CFG.total_updates = 100        # 只做 2 個 update
+TRAINING_CFG.games_per_update = 400      # 每輪 5 場遊戲
 TRAINING_CFG.log_every = 1
 TRAINING_CFG.checkpoint_every_updates = 10  # 測試時不存
 
 # Self-play
 SELFPLAY_CFG.temp_high = 1.0
-SELFPLAY_CFG.temp_low = 1.0
-SELFPLAY_CFG.temp_switch_decision = 8
+SELFPLAY_CFG.temp_low = 0.1
+SELFPLAY_CFG.temp_switch_decision = 6
 
 # MCTS
-MCTS_CFG.simulations = 384     # 極少模擬
+MCTS_CFG.simulations = 768     # 極少模擬
 MCTS_CFG.leaf_batch_size = 16
 MCTS_CFG.puct_c = 1.25
 MCTS_CFG.use_root_dirichlet_noise = True
@@ -50,11 +51,20 @@ MCTS_CFG.use_root_dirichlet_noise = True
 # Gate — 測試時跳過（設為極大值）
 GATE_CFG.eval_every_updates = 1
 
+# ─── ELO 歷史對手池（測試參數） ────────────────────────
+ELO_CFG.enabled = True
+ELO_CFG.pool_size = 6
+ELO_CFG.round_robin_pairs_games = 20     # 每對內戰局數（極少）
+ELO_CFG.round_robin_simulations = 768   # 內戰模擬數（極少）
+ELO_CFG.round_robin_temperature = 0.1
+ELO_CFG.elo_selfplay_ratio = 1.0
+
 print("\n訓練參數：")
 print(f"  total_updates = {TRAINING_CFG.total_updates}")
 print(f"  games_per_update = {TRAINING_CFG.games_per_update}")
 print(f"  mcts_simulations = {MCTS_CFG.simulations}")
 print(f"  cpp_backend = {os.environ.get('TZAAR_STATE_BACKEND', 'cpp')}")
+print(f"  elo_opponent_pool = {ELO_CFG.enabled} | pool_size={ELO_CFG.pool_size}")
 
 print("\n正在啟動訓練...\n")
 

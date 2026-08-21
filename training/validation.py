@@ -15,6 +15,7 @@ from config import (
     REPLAY_CFG,
     NETWORK_CFG,
     ASYNC_MCTS_CFG,
+    ELO_CFG,
 )
 
 
@@ -82,3 +83,14 @@ def validate_constants() -> None:
                 "REPLAY_MIN_TRAIN_SAMPLES must be <= "
                 "REPLAY_BUFFER_MAX_SAMPLES"
             )
+    if ELO_CFG.enabled:
+        if ELO_CFG.pool_size <= 0:
+            raise ValueError("ELO_POOL_SIZE must be >= 1")
+        if ELO_CFG.k_factor <= 0:
+            raise ValueError("ELO_K_FACTOR must be > 0")
+        if ELO_CFG.round_robin_pairs_games <= 0:
+            raise ValueError("ELO_ROUND_ROBIN_PAIRS_GAMES must be >= 1")
+        if ELO_CFG.round_robin_simulations <= 0:
+            raise ValueError("ELO_ROUND_ROBIN_SIMULATIONS must be >= 1")
+        if not (0.0 <= ELO_CFG.elo_selfplay_ratio <= 1.0):
+            raise ValueError("ELO_SELFPLAY_RATIO must be in [0, 1]")

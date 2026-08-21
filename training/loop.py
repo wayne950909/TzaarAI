@@ -32,6 +32,7 @@ from config import (
     MCTS_CFG,
     GATE_CFG,
     REPLAY_CFG,
+    ELO_CFG,
         ASYNC_MCTS_CFG,
     _ACTIVE_STATE_BACKEND,
     _ACTIVE_CPP_MODULE,
@@ -64,6 +65,7 @@ from training.selfplay_engine import (
     is_async_selfplay_ready,
 )
 from training.validation import validate_constants
+from training.opponent_pool import HistoricalOpponentPool
 from mcts.cpp_manager import CppSearchManager
 
 import torch.cuda.nvtx as nvtx
@@ -290,6 +292,21 @@ def run(title: str) -> None:
     )
     hp = HP(hp_config)
 
+    # ── ELO 歷史對手池（可選）────────────────────────────
+    # 掃描 guard checkpoint 建立固定大小的 ELO 對手池，作為 self-play 對手。
+    opponent_pool = None
+    if ELO_CFG.enabled:
+        opponent_pool = HistoricalOpponentPool(
+            guard_title=guard_title,
+            device=device,
+            env_cfg=env_cfg,
+            search_manager=search_manager,
+        )
+        print(
+            f"[elo] opponent pool ready | size={len(opponent_pool)} "
+            f"| ratings={opponent_pool.ratings_summary()}"
+        )
+
         # ── Gate 連續失敗時的模擬數升級機制 ──────────────────
     # 每一階（模擬數）各別「連續失敗 GATE_CFG.escalate_after_failures 次」
     # 就升到下一階（128 → 256 → 384 → 512 → 640 → ...，封頂）。
@@ -347,6 +364,17 @@ def run(title: str) -> None:
         # engine 內部會自行決定：
         # - 是否採用 async-batch
         # - 是否因錯誤而 fallback 到 sync-single
+        #
+        # ELO 歷史對手池啟用時：把 self-play 的基準設為「目前 ELO 最強的
+        # guard checkpoint」權重。也就是用最強模型自己跟自己對弈產生資料，
+        # 再據此訓練更新。這正是「挑選最強模型，然後自對弈」的 (A) 方案。
+        if opponent_pool is not None:
+            synced = opponent_pool.sync_to_strongest(policy)
+            if synced:
+                print(
+                    f"[elo] self-play baseline = strongest guard idx="
+                    f"{opponent_pool.strongest()}"
+                )
         nvtx.range_push("selfplay")
         policy.eval()
         sp_t0 = time.perf_counter()
@@ -447,8 +475,9 @@ def run(title: str) -> None:
                 )
                 guard_policy.load_state_dict(policy.state_dict(), strict=True)
                 guard_policy.eval()
-                # candidate 通過 gate → 把目前的權重存成一個 guard checkpoint。
+                                # candidate 通過 gate → 把目前的權重存成一個 guard checkpoint。
                 # 這是「guard 唯一會寫入磁碟」的時機，讓後續 resume 能接續強化。
+                promoted_ckpt_idx = int(next_guard_ckpt_idx)
                 train_module.save_checkpoint(
                     title=guard_title,
                     policy=guard_policy,
@@ -456,10 +485,14 @@ def run(title: str) -> None:
                     update_idx=update_idx,
                     samples_in_update=len(fresh_samples),
                     inference_temperature=inference_temperature,
-                    checkpoint_index=int(next_guard_ckpt_idx),
+                    checkpoint_index=promoted_ckpt_idx,
                 )
                 next_guard_ckpt_idx += 1
                 print(f"[guard] saved promoted guard checkpoint: {guard_title}")
+                # 若 ELO 對手池啟用：把新 guard 加入池，並觸發整池 round-robin
+                # 內戰更新 ELO → 修剪回固定大小 → 之後 self-play 改用最強者。
+                if opponent_pool is not None:
+                    opponent_pool.on_new_guard(promoted_ckpt_idx)
                 # gate 通過時也一併保存 replay buffer，讓 resume 能還原
                 # 當前 self-play 累積的資料，而不只是權重。
                 if REPLAY_CFG.enabled and replay_buffer:

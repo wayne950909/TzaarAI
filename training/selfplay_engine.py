@@ -173,6 +173,10 @@ def collect_selfplay_samples(
 ) -> tuple[List[PolicySample], int, int, float]:
     """執行一個 update 需要的 self-play，並回傳訓練樣本。
 
+    這是對稱自我對弈：policy（目前 ELO 最強模型 / 最新模型）自己跟自己對弈，
+    兩邊都用同一份權重。每一局由 policy 同時下黑白兩邊，所有決策都產生
+    PolicySample。
+
     如果 search_manager 不為 None 且 C++ backend 可用，則使用
     CppSearchManager（常駐 C++ worker pool + 雙 buffer）加速批次搜尋，
     否則使用 sync-single 搜尋作為降級路徑。

@@ -102,7 +102,7 @@ class AsyncMCTSConfig:
     """多 CPU worker + 共享 GPU worker 的非同步 pipeline"""
     enabled: bool = True
     # 同時進行的 active game pool 大小（例如 200 局平行推進）
-    parallel_games: int = 800
+    parallel_games: int = 400
     # C++ SearchManager 的常駐 worker thread 數量（固定不變）
     num_threads: int = 10
     # 單次 GPU forward 最多聚合多少個 leaf states。
@@ -124,7 +124,7 @@ class AsyncMCTSConfig:
     local_capacity: int = 2000
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
-    ready_flush_leaves: int = 128
+    ready_flush_leaves: int = 64
 
     # ── C++ SearchManager 內部 Debug Log ──────────────────
     # 在 config.py 設定，經 cpp_manager._build_config 傳入 C++ SearchManager。
@@ -238,9 +238,9 @@ def lr_for_simulations(simulations: int) -> float:
 class GatekeeperConfig:
     """Gatekeeper 評估的超參數"""
     eval_games: int = 100
-    winrate_threshold: float = 0.55
+    winrate_threshold: float = 0.54
     temperature: float = 0.1           # 評估時的採樣溫度
-    simulations_per_decision: int = 384  # 評估時的 MCTS 模擬數
+    simulations_per_decision: int = 768  # 評估時的 MCTS 模擬數
     eval_every_updates: int = 1        # 每 N 次更新執行一次
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True
@@ -251,9 +251,9 @@ class GatekeeperConfig:
     #   128 → 256 → 384 → 512 → 640 → ...（每階 +escalation_step，最高到上限）
     # 一旦 gate 通過，連續失敗計數與升級等級都會重置回底數。
     escalate_enabled: bool = True
-    escalate_after_failures: int = 2        # 連續失敗幾次後升級一階模擬數
-    escalation_step: int = 128             # 每階增加的模擬數
-    escalation_max_simulations: int = 960  # 模擬數上限（超出則維持上限）
+    escalate_after_failures: int = 4        # 連續失敗幾次後升級一階模擬數
+    escalation_step: int = 256             # 每階增加的模擬數
+    escalation_max_simulations: int = 1280  # 模擬數上限（超出則維持上限）
 
 
 GATE_CFG = GatekeeperConfig()
@@ -275,6 +275,47 @@ class ReplayConfig:
 
 
 REPLAY_CFG = ReplayConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ELO 歷史對手池
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class EloConfig:
+    """ELO 歷史對手池設定。
+
+    self-play 不再讓最新模型自己跟自己對弈，而是選出池中 ELO 最強的
+    歷史 guard 模型作為對手。
+
+    對手池流程（當新 guard 晉升時）：
+        1. 新 guard checkpoint 加入對手池
+        2. 池內所有模型進行 round-robin 內戰，更新各自的 ELO
+        3. 若超過 pool_size，剔除 ELO 最低的成員，維持固定大小
+        4. 之後的 self-play 改用「ELO 最強的模型」作為對手
+    """
+    enabled: bool = False               # 是否啟用 ELO 歷史對手池做為 self-play 對手
+    pool_size: int = 10                 # 對手池固定大小上限
+    initial_rating: float = 1200.0      # 新成員的初始 ELO
+    k_factor: float = 32.0              # ELO K 值（更新幅度）
+
+    # ── round-robin 內戰參數 ─────────────────────────────
+    # 新模型加入後，池內所有成員兩兩對戰，每對打 round_robin_pairs_games 局，
+    # 以對戰結果更新雙方 ELO。
+    round_robin_pairs_games: int = 20   # 每對對戰的局數
+    round_robin_simulations: int = 256  # 內戰時的 MCTS 模擬數（較低以省時間）
+    round_robin_temperature: float = 0.1  # 內戰時的採樣溫度（較低偏貪婪）
+
+    # ── self-play 使用 ELO 最強對手的比例 ────────────────
+    # 0.0 → 完全自我對弈；1.0 → 全部用 ELO 最強對手。
+    # 池中還沒有可用對手時（例如只有 bootstrap guard），自動退回自我對弈。
+    elo_selfplay_ratio: float = 1.0
+
+    # 持久化檔名基底（位於 checkpoints/ 資料夾）
+    ratings_filename: str = "elo_ratings.json"
+
+
+ELO_CFG = EloConfig()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -332,3 +373,14 @@ def validate_configs() -> None:
             raise ValueError("REPLAY_MIN_TRAIN_SAMPLES must be >= 1")
         if REPLAY_CFG.min_train_samples > REPLAY_CFG.max_samples:
             raise ValueError("REPLAY_MIN_TRAIN_SAMPLES must be <= REPLAY_BUFFER_MAX_SAMPLES")
+    if ELO_CFG.enabled:
+        if ELO_CFG.pool_size <= 0:
+            raise ValueError("ELO_POOL_SIZE must be >= 1")
+        if ELO_CFG.k_factor <= 0:
+            raise ValueError("ELO_K_FACTOR must be > 0")
+        if ELO_CFG.round_robin_pairs_games <= 0:
+            raise ValueError("ELO_ROUND_ROBIN_PAIRS_GAMES must be >= 1")
+        if ELO_CFG.round_robin_simulations <= 0:
+            raise ValueError("ELO_ROUND_ROBIN_SIMULATIONS must be >= 1")
+        if not (0.0 <= ELO_CFG.elo_selfplay_ratio <= 1.0):
+            raise ValueError("ELO_SELFPLAY_RATIO must be in [0, 1]")
