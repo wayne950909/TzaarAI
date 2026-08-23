@@ -69,13 +69,13 @@ NETWORK_CFG = NetworkConfig()
 class MCTSConfig:
     """MCTS 搜尋引擎的超參數"""
     simulations: int = 768 
-    puct_c: float = 2.25
+    puct_c: float = 1.5
     leaf_batch_size: int = 16
 
     # Root Dirichlet noise（訓練時啟用）
     use_root_dirichlet_noise: bool = True
     root_dirichlet_eps: float = 0.25
-    root_dirichlet_alpha: float = 0.17
+    root_dirichlet_alpha: float = 0.2
 
     # 啟發式先驗（設為 0 則停用）
     heuristic_prior_weight: float = 0.0
@@ -91,6 +91,42 @@ class MCTSConfig:
 
 
 MCTS_CFG = MCTSConfig()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 隨機模擬次數排程器（self-play 資料產生用）
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SimulationSchedulerConfig:
+    """隨機模擬次數排程器設定。
+
+    self-play 每個 run_search 呼叫（每批 root states）時，以
+    high_probability 的機率選擇「高模擬範圍」、否則選擇「低模擬範圍」，
+    並在該範圍內均勻抽一個整數模擬次數；該次 run_search 內所有局面共用
+    同一個次數。
+
+    兩個範圍的端點都隨訓練 update 進度（0 → 1）線性上升：
+        lo(t) = round(lerp(start[0], end[0], t))
+        hi(t) = round(lerp(start[1], end[1], t))
+
+    本排程器獨立於 gate 的 GateEscalator（gate 失敗升級模擬數）與
+    lr_by_simulations（學習率階梯），僅負責 self-play 資料產生的抽樣。
+    """
+    enabled: bool = True
+    # 低模擬範圍端點（(min, max)，update 進度 0 → 1 線性插值）
+    low_start: tuple = (100, 120)      # 初期低模擬
+    low_end: tuple = (256, 320)        # 晚期低模擬
+    # 高模擬範圍端點
+    high_start: tuple = (600, 800)     # 初期高模擬
+    high_end: tuple = (1280, 1536)     # 晚期高模擬
+    # 高模擬範圍被選中的機率（其餘 1-p 選低模擬範圍）
+    high_probability: float = 0.25
+    # 隨機種子（0 → 每次訓練不固定；非 0 → 可重現）
+    seed: int = 0
+
+
+SIMS_CFG = SimulationSchedulerConfig()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -164,8 +200,8 @@ class TrainingConfig:
     games_per_update: int = 400
     selfplay_model_game_ratio: float = 1.0  # 純自我對弈比例 (0~1)
     train_epochs_per_update: int = 1
-    optimization_passes_per_update: int = 32
-    batch_size: int = 512
+    optimization_passes_per_update: int = 4
+    batch_size: int = 256
     checkpoint_every_updates: int = 20
     log_every: int = 10
     selfplay_progress_log_interval: int = 1  # <=0 停用進度log
@@ -237,8 +273,8 @@ def lr_for_simulations(simulations: int) -> float:
 @dataclass
 class GatekeeperConfig:
     """Gatekeeper 評估的超參數"""
-    eval_games: int = 100
-    winrate_threshold: float = 0.54
+    eval_games: int = 200
+    winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
     simulations_per_decision: int = 768  # 評估時的 MCTS 模擬數
     eval_every_updates: int = 1        # 每 N 次更新執行一次
@@ -250,7 +286,7 @@ class GatekeeperConfig:
     # simulations 升級一階。軌跡（以 simulations_per_decision 為底數）：
     #   128 → 256 → 384 → 512 → 640 → ...（每階 +escalation_step，最高到上限）
     # 一旦 gate 通過，連續失敗計數與升級等級都會重置回底數。
-    escalate_enabled: bool = True
+    escalate_enabled: bool = False
     escalate_after_failures: int = 4        # 連續失敗幾次後升級一階模擬數
     escalation_step: int = 256             # 每階增加的模擬數
     escalation_max_simulations: int = 1280  # 模擬數上限（超出則維持上限）

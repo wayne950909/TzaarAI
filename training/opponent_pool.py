@@ -280,7 +280,7 @@ class HistoricalOpponentPool:
         return True
 
     # ── 新成員加入 + 內戰 + 修剪 ─────────────────────────
-    def on_new_guard(self, new_index: int) -> None:
+    def on_new_guard(self, new_index: int, simulations: Optional[int] = None) -> None:
         """新 guard checkpoint 加入對手池，並觸發整池 round-robin + 修剪。
 
         流程：
@@ -289,13 +289,19 @@ class HistoricalOpponentPool:
           3. 對該集合做 round-robin 內戰，更新所有成員 ELO。
           4. 依 ELO 修剪回 pool_size，剔除最低者。
           5. 持久化 ELO。
+
+        參數
+        ----
+        simulations : 本次 round-robin 內戰使用的模擬次數。若為 None，
+            回退到 ELO_CFG.round_robin_simulations。訓練迴圈會傳入「目前
+            高模擬下限」，與 gate 評估使用同一套邏輯。
         """
         self.elo.set_init(new_index)
         working = self._active_indices | {int(new_index)}
         # 每次評估都重新開始：先把手池成員的 ELO 全部重設回初始分，
         # 再打整套 round-robin，確保每一輪評比獨立、不被歷史分數污染。
         self.elo.reset_all(working)
-        self._play_round_robin(sorted(working))
+        self._play_round_robin(sorted(working), simulations=simulations)
         self._active_indices = set(working)
         self._prune_to_size()
         self._policy_cache = {
@@ -309,12 +315,26 @@ class HistoricalOpponentPool:
             f"| strongest={top} rating={self.elo.get(top) if top is not None else '-'}"
         )
 
-    def _play_round_robin(self, indices: List[int]) -> None:
-        """對指定成員集合做全對全內戰，更新 ELO。"""
+    def _play_round_robin(
+        self,
+        indices: List[int],
+        simulations: Optional[int] = None,
+    ) -> None:
+        """對指定成員集合做全對全內戰，更新 ELO。
+
+        參數
+        ----
+        simulations : 內戰使用的模擬次數；若為 None 則回退到
+            ELO_CFG.round_robin_simulations。
+        """
         if len(indices) < 2:  # noqa: PLR2004
             return
         n_games = int(ELO_CFG.round_robin_pairs_games)
-        sims = int(ELO_CFG.round_robin_simulations)
+        sims = (
+            int(simulations)
+            if simulations is not None
+            else int(ELO_CFG.round_robin_simulations)
+        )
         temperature = float(ELO_CFG.round_robin_temperature)
 
         # 建立 gate_cfg 相容的 namespace（gate_keeper 讀 simulations 與 temperature）

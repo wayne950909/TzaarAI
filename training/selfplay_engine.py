@@ -20,12 +20,19 @@ from typing import Any, Dict, List, Optional
 import torch
 
 import config as _cfg
-from config import ASYNC_MCTS_CFG, MCTS_CFG, SELFPLAY_CFG, TRAINING_CFG
+from config import (
+    ASYNC_MCTS_CFG,
+    MCTS_CFG,
+    SELFPLAY_CFG,
+    SIMS_CFG,
+    TRAINING_CFG,
+)
 from core.action import N_ACTIONS
 from core.env import EnvConfig, TzaarEnv
 from core.types import GameResult
 from training.metrics import record_exploration_stats
 from training.sample import PolicySample
+from training.sims_schedule import sample_simulations
 from mcts.cpp_manager import CppSearchManager
 
 
@@ -284,10 +291,18 @@ def collect_selfplay_samples(
         if not root_states:
             continue
 
-                        # ── 執行 MCTS 批次搜尋 ─────────────────────────
-        # 走 CppSearchManager 路徑或 sync-single 降級路徑
+                                # ── 執行 MCTS 批次搜尋 ─────────────────────────
+        # 走 CppSearchManager 路徑或 sync-single 降級路徑。
+        # 每個 while 迴圈 = 一批 root_states = 一次 run_search 呼叫。
+        # 每一次都會抽樣一次模擬次數，且該批所有局面共用同一個次數。
         apply_noise = bool(update_idx > 0)
-        simulations = int(MCTS_CFG.simulations)
+        sims_tag = "fixed"
+        if SIMS_CFG.enabled:
+            simulations, sims_tag = sample_simulations(
+                int(update_idx), int(total_updates)
+            )
+        else:
+            simulations = int(MCTS_CFG.simulations)
         use_cpp_manager = async_active
 
         if use_cpp_manager:

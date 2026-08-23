@@ -40,7 +40,7 @@ from config import (
 )
 from core.board import TRAINING_GAME_STEPS
 from core.env import TzaarEnv, EnvConfig
-from gate.gate import gate_keeper, GateEscalator
+from gate.gate import gate_keeper
 from heuristics import HeuristicPlayoutPolicy as HP
 from training.metrics import (
     accumulate_kind_stats,
@@ -66,6 +66,7 @@ from training.selfplay_engine import (
 )
 from training.validation import validate_constants
 from training.opponent_pool import HistoricalOpponentPool
+from training.sims_schedule import current_ranges
 from mcts.cpp_manager import CppSearchManager
 
 import torch.cuda.nvtx as nvtx
@@ -307,23 +308,11 @@ def run(title: str) -> None:
             f"| ratings={opponent_pool.ratings_summary()}"
         )
 
-        # ── Gate 連續失敗時的模擬數升級機制 ──────────────────
-    # 每一階（模擬數）各別「連續失敗 GATE_CFG.escalate_after_failures 次」
-    # 就升到下一階（128 → 256 → 384 → 512 → 640 → ...，封頂）。
-    # 一旦升級就「不再退回」（通過 gate 只重置當前連續失敗計數，階層不降）。
-    # 升級後的模擬數同時套用於 gate keeper 與 self-play（產生對局）。
-    # 若 escalate_enabled=False 則永遠用底數。
-    gate_escalator = GateEscalator(
-        base_simulations=int(GATE_CFG.simulations_per_decision),
-        escalate_after_failures=int(GATE_CFG.escalate_after_failures),
-        escalation_step=int(GATE_CFG.escalation_step),
-        escalation_max_simulations=int(GATE_CFG.escalation_max_simulations),
-    )
-    if not GATE_CFG.escalate_enabled:
-        gate_escalator.escalation_max_simulations = int(
-            GATE_CFG.simulations_per_decision
-        )
-        gate_escalator.escalation_step = 0
+                                # ── Gate / ELO 的模擬次數來源 ─────────────────────
+    # GateEscalator（失敗升級模擬數）已停用。gate keeper 與 ELO round-robin
+    # 一律使用「目前高模擬範圍下限」的「一半」，隨 update 進度線性上升
+    # （與 self-play 排程器同源，取高模擬範圍的 min 再整除 2）。
+    # 這是每個 update 用的基準模擬次數（gate 與 ELO 共用，不隨單局抽樣）。
 
     # ── 全域統計 ──────────────────────────────────────────
     stats: Dict[str, float] = {
@@ -344,17 +333,21 @@ def run(title: str) -> None:
         update_start = time.perf_counter()
         inference_temperature = float(SELFPLAY_CFG.temp_low)
 
-        # ── 依目前 gate 階層同步模擬數 ────────────────────
-        # 升級後的模擬數同時套用於 self-play（產生對局）與 gate keeper。
-        # self-play 直接讀 MCTS_CFG.simulations，gate 讀 GATE_CFG.simulations_per_decision。
-        current_sims = gate_escalator.current_simulations()
-        MCTS_CFG.simulations = current_sims
-        GATE_CFG.simulations_per_decision = current_sims
+                                # ── Gate / ELO 模擬次數 = 目前高模擬下限的一半（隨 update 線性上升）──
+        # 依目前 update 進度取高模擬範圍，取其下限（high_lo）的「一半」當作
+        # gate 與 ELO round-robin 共用的基準模擬次數。它不會像 self-play 那樣
+        # 每個 run_search 隨機抽樣，而是該 update 固定為同一個值。
+        # max(1, ...) 防止下限過小時除到 0。
+        _, (high_lo, _) = current_ranges(int(update_idx), int(total_updates))
+        gate_sims = max(1, int(high_lo) // 2)
+        GATE_CFG.simulations_per_decision = gate_sims
+        # self-play 已由隨機排程器接管（SIMS_CFG.enabled 時），此處僅保留
+        # 停用時的回退基準；啟用狀態下不影響實際抽樣。
+        MCTS_CFG.simulations = gate_sims
 
         # ── 依目前模擬次數套用對應學習率（階梯式下降）──────
-        # 當 GateEscalator 升級模擬次數時，這裡會自動切換到
-        # config.lr_by_simulations 對應的學習率。
-        current_lr = lr_for_simulations(current_sims)
+        # 以 gate / ELO 使用的高模擬下限對應的學習率為準。
+        current_lr = lr_for_simulations(gate_sims)
         for group in optimizer.param_groups:
             group["lr"] = current_lr
 
@@ -449,11 +442,7 @@ def run(title: str) -> None:
             policy.eval()
             guard_policy.eval()
 
-        # ── 記錄本次用的模擬階層（供 log） ──────────
-            gate_sims = gate_escalator.current_simulations()
-            gate_level = gate_escalator.level
-            gate_consecutive_failures = gate_escalator.consecutive_failures
-
+                # ── 記錄本次 gate 用的模擬次數（gate_sims 已在 update 頂部設定）──
             with torch.no_grad():
                 gate_result = gate_keeper(
                     policy,
@@ -468,7 +457,6 @@ def run(title: str) -> None:
                                 )
                 gate_passed = gate_result.win_rate >= GATE_CFG.winrate_threshold
             if gate_passed:
-                gate_escalator.record_success()
                 print(
                     f"[gate] PASSED | win_rate={gate_result.win_rate:.3f} "
                     f"| sims={gate_sims}"
@@ -491,8 +479,11 @@ def run(title: str) -> None:
                 print(f"[guard] saved promoted guard checkpoint: {guard_title}")
                 # 若 ELO 對手池啟用：把新 guard 加入池，並觸發整池 round-robin
                 # 內戰更新 ELO → 修剪回固定大小 → 之後 self-play 改用最強者。
+                # round-robin 使用「目前高模擬下限的一半」（gate_sims），與 gate 同邏輯。
                 if opponent_pool is not None:
-                    opponent_pool.on_new_guard(promoted_ckpt_idx)
+                    opponent_pool.on_new_guard(
+                        promoted_ckpt_idx, simulations=gate_sims
+                    )
                 # gate 通過時也一併保存 replay buffer，讓 resume 能還原
                 # 當前 self-play 累積的資料，而不只是權重。
                 if REPLAY_CFG.enabled and replay_buffer:
@@ -505,13 +496,10 @@ def run(title: str) -> None:
                         max_samples=REPLAY_CFG.max_samples,
                     )
             else:
-                gate_escalator.record_failure()
                 print(
                     f"[gate] FAILED | win_rate={gate_result.win_rate:.3f} "
                     f"< threshold={GATE_CFG.winrate_threshold} "
-                    f"| sims={gate_sims} | level={gate_level} | "
-                    f"consecutive_failures={gate_consecutive_failures} | "
-                    f"next_sims={gate_escalator.current_simulations()}"
+                    f"| sims={gate_sims}"
                 )
                 policy.load_state_dict(guard_policy.state_dict(), strict=True)
                 policy.train()
