@@ -84,9 +84,9 @@ def _run_model_forward(
     ).to(device=device)
 
     with torch.no_grad():
-        hidden = model.encode(board_batch, global_batch)
-        logits = model.action_head(hidden)
-        values = model.forward_value(hidden).squeeze(-1)
+        vh, ph = model.encode(board_batch, global_batch)
+        logits = model.action_head(ph)
+        values = model.forward_value(vh).squeeze(-1)
 
     masked_logits = logits.masked_fill(~mask_batch, -1e9)
     priors_np = (
@@ -360,6 +360,7 @@ def _cpu_worker_main(
             visits,
             replay_board,
             replay_global,
+            float(result.root_value),
         )
 
     except Exception as exc:
@@ -381,6 +382,7 @@ def run_mcts_cpp_batch_async(
         torch.Tensor,
         Optional[torch.Tensor],
         Optional[torch.Tensor],
+        float,
     ]
 ]:
     """非同步批次 MCTS 搜尋。
@@ -397,7 +399,7 @@ def run_mcts_cpp_batch_async(
 
     回傳
     ----
-    List of (head, action_dim, legal_mask, visits, replay_board, replay_global)
+    List of (head, action_dim, legal_mask, visits, replay_board, replay_global, root_value)
     """
     from config import _ACTIVE_CPP_MODULE as _cpp_mod
     module = _cpp_mod

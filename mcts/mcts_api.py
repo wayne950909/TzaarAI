@@ -34,6 +34,14 @@ def run_mcts(
     device: torch.device,
     apply_dirichlet_noise: bool = True,
     simulations: int = 600,
+
+
+
+
+
+
+
+
 ) -> Tuple[
     str,
     int,
@@ -41,6 +49,7 @@ def run_mcts(
     torch.Tensor,
     Optional[torch.Tensor],
     Optional[torch.Tensor],
+    float,
 ]:
     """執行 MCTS 搜尋（自動選擇後端）。
 
@@ -52,9 +61,10 @@ def run_mcts(
     apply_dirichlet_noise : 是否在根節點添加 Dirichlet 雜訊
     simulations : 模擬次數
 
-    回傳
+        回傳
     ----
-    (head, action_dim, legal_mask, visits, replay_board, replay_global)
+    (head, action_dim, legal_mask, visits, replay_board, replay_global, root_value)
+    root_value : 根節點訪問加權 Q value（root 玩家視角）
     """
     if root_state.is_done():
         raise ValueError("Cannot run MCTS from terminal state")
@@ -122,23 +132,21 @@ def run_mcts_batch(
         torch.Tensor,
         Optional[torch.Tensor],
         Optional[torch.Tensor],
+        float,
     ]
 ]:
     """批次執行 MCTS 搜尋（自動選擇後端）。
 
     若條件允許，使用非同步 pipeline 加速。
-
-    參數
-    ----
-    policy : 策略網路
     root_states : 根狀態列表
     device : torch 裝置
     apply_dirichlet_noise : 是否在根節點添加 Dirichlet 雜訊
     simulations : 模擬次數
 
-    回傳
+        回傳
     ----
-    List of (head, action_dim, legal_mask, visits, replay_board, replay_global)
+    List of (head, action_dim, legal_mask, visits, replay_board, replay_global, root_value)
+    root_value : 根節點訪問加權 Q value（root 玩家視角）
     """
     if not root_states:
         return []

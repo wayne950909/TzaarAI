@@ -146,6 +146,7 @@ def run_mcts_python(
     torch.Tensor,
     Optional[torch.Tensor],
     Optional[torch.Tensor],
+    float,
 ]:
     """純 Python MCTS 搜尋引擎。
 
@@ -157,9 +158,13 @@ def run_mcts_python(
     apply_dirichlet_noise : 是否在根節點添加探索雜訊
     simulations : 模擬次數
 
-    回傳
+
+
+
+        回傳
     ----
-    (head, action_dim, legal_mask, visits, replay_board, replay_global)
+    (head, action_dim, legal_mask, visits, replay_board, replay_global, root_value)
+    root_value : 根節點訪問加權 Q value（root 玩家視角）
     """
     if root_state.is_done():
         raise ValueError("Cannot run MCTS from terminal state")
@@ -255,4 +260,13 @@ def run_mcts_python(
         if n_legal > 0:
             visits[legal] = 1.0 / float(n_legal)
 
-    return head, action_dim, legal_mask.to(device="cpu"), visits, None, None
+    root_value = root.mean_value()
+    return (
+        head,
+        action_dim,
+        legal_mask.to(device="cpu"),
+        visits,
+        None,
+        None,
+        float(root_value),
+    )

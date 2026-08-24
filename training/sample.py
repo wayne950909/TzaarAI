@@ -24,7 +24,8 @@ class PolicySample:
     target_pi_padded : (N_ACTIONS,) MCTS 訪問次數正規化後的目標策略
     player : 走棋玩家（WHITE=1 / BLACK=-1）
     winner_sign : 最終勝者（0=平局）
-    value_target : 價值目標（1.0 / -1.0 / 0.0）     
+    value_target : 價值目標（混合式，見 assign_value_targets）
+    root_value : 該決策步 MCTS 根的訪問加權 Q value（當前玩家視角）
     """
     state: torch.Tensor
     global_features: torch.Tensor
@@ -34,3 +35,4 @@ class PolicySample:
     player: int
     winner_sign: int = 0
     value_target: float = 0.0
+    root_value: float = 0.0

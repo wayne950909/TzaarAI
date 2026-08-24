@@ -83,9 +83,9 @@ def evaluate_leaf(
     )
 
     with torch.no_grad():
-        hidden = policy.encode(board, global_features)
-        logits = policy.head_logits(hidden, HEAD_ACTION)[0]
-        value = float(policy.forward_value(hidden).squeeze().item())
+        vh, ph = policy.encode(board, global_features)
+        logits = policy.head_logits(ph, HEAD_ACTION)[0]
+        value = float(policy.forward_value(vh).squeeze().item())
 
     mask = mask.to(device=device)
     masked_logits = logits[:action_dim].masked_fill(~mask[:action_dim], -1e9)
@@ -126,9 +126,9 @@ def evaluate_leaf_batch(
     global_batch = torch.stack(globals_).to(device)
 
     with torch.no_grad():
-        hidden = policy.encode(board_batch, global_batch)
-        action_logits = policy.action_head(hidden)
-        values = policy.forward_value(hidden).squeeze(-1)
+        vh, ph = policy.encode(board_batch, global_batch)
+        action_logits = policy.action_head(ph)
+        values = policy.forward_value(vh).squeeze(-1)
 
     results: List[Tuple[str, int, torch.Tensor, torch.Tensor, float]] = []
     for i in range(len(states)):

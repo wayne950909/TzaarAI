@@ -39,15 +39,30 @@ def winner_sign_from_result(result: Optional[GameResult]) -> int:
 
 
 def assign_value_targets(samples: List[PolicySample], winner_sign: int) -> None:
-    """在一局結束後，回填該局所有 sample 的 winner/value target。"""
+    """在一局結束後，回填該局所有 sample 的 winner/value target。
+
+    使用混合式 value target：
+        value_target = (1 - value_q_weight)*終局輸贏 + value_q_weight*MCTS根Q
+
+    其中該步的 MCTS 根 Q（root_value）已在樣本製作當下存入 sample，
+    這裡只把「終局輸贏」那一半依照 value_q_weight 權重加總回來。
+
+    value_q_weight = 0.0 → 純終局價值（舊行為）
+    value_q_weight = 1.0 → 純 MCTS 根 Q
+    """
+    q_weight = float(SELFPLAY_CFG.value_q_weight)
     for sample in samples:
         sample.winner_sign = int(winner_sign)
         if winner_sign == 0:
-            sample.value_target = 0.0
+            terminal = 0.0
         elif winner_sign == sample.player:
-            sample.value_target = 1.0
+            terminal = 1.0
         else:
-            sample.value_target = -1.0
+            terminal = -1.0
+        q = float(sample.root_value)
+        sample.value_target = float(
+            (1.0 - q_weight) * terminal + q_weight * q
+        )
 
 
 def is_async_selfplay_ready() -> bool:
@@ -305,8 +320,9 @@ def collect_selfplay_samples(
                         output["action_dim"],
                         output["legal_mask"],
                         output["visits"],
-                        output["replay_board"],
+                                                output["replay_board"],
                         output["replay_global"],
+                        float(output.get("root_value", 0.0)),
                     ))
             except Exception as exc:
                 print(
@@ -340,7 +356,8 @@ def collect_selfplay_samples(
 
         # 根據 MCTS 結果逐局採樣動作，然後把尚未結束的局留在 survivors。
         survivors: List[Dict[str, Any]] = []
-        for prep, (_, _, legal_mask, visits, _, _) in zip(prepared, batch_outputs):
+
+        for prep, (_, _, legal_mask, visits, _, _, root_value) in zip(prepared, batch_outputs):
             entry = prep["entry"]
             env = prep["env"]
             temperature = float(prep["temperature"])
@@ -376,6 +393,7 @@ def collect_selfplay_samples(
                     legal_mask_padded=legal_mask_cpu,
                     target_pi_padded=target_pi.detach().to("cpu", dtype=torch.float32).clone(),
                     player=int(prep["current_player"]),
+                    root_value=float(root_value),
                 )
             )
             entry["decision_step"] = int(entry["decision_step"]) + 1

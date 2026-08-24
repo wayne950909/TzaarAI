@@ -274,7 +274,7 @@ def run_battle(job: BattleJob) -> Dict[str, Any]:
                 env._game_in_progress = False
                 break
             with torch.no_grad():
-                _, _, legal_mask, visits, _, _ = run_mcts(
+                _, _, legal_mask, visits, _, _, _ = run_mcts(
                     policy,
                     root_state,
                     device,
@@ -393,7 +393,7 @@ def run_strategy_move(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     def do_one_decision(awaiting_step2: bool) -> Optional[str]:
         with torch.no_grad():
-            _, _, legal_mask, visits, _, _ = run_mcts(
+            _, _, legal_mask, visits, _, _, _ = run_mcts(
                 model, current_state, device,
                 apply_dirichlet_noise=False, simulations=sims,
             )
@@ -479,7 +479,7 @@ def run_model_move(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"move": "P", "step": step, "game_over": True}
 
     with torch.no_grad():
-        _, _, legal_mask, visits, _, _ = run_mcts(
+        _, _, legal_mask, visits, _, _, _ = run_mcts(
             model,
             state,
             device,

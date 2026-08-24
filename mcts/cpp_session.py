@@ -40,6 +40,21 @@ def run_mcts_cpp_session(
     device: torch.device,
     apply_dirichlet_noise: bool = True,
     simulations: int = 600,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ) -> Tuple[
     str,
     int,
@@ -47,6 +62,7 @@ def run_mcts_cpp_session(
     torch.Tensor,
     Optional[torch.Tensor],
     Optional[torch.Tensor],
+    float,
 ]:
     """使用 C++ SearchSession 執行 MCTS 搜尋。
 
@@ -54,7 +70,8 @@ def run_mcts_cpp_session(
 
     回傳
     ----
-    (head, action_dim, legal_mask, visits, replay_board, replay_global)
+    (head, action_dim, legal_mask, visits, replay_board, replay_global, root_value)
+    root_value : 根節點訪問加權 Q value（root 玩家視角）
     """
     module = _cfg._ACTIVE_CPP_MODULE
     if module is None:
@@ -111,9 +128,9 @@ def run_mcts_cpp_session(
             ).to(device=device)
 
             with torch.no_grad():
-                hidden = policy.encode(board_batch, global_batch)
-                logits = policy.action_head(hidden)
-                values = policy.forward_value(hidden).squeeze(-1)
+                vh, ph = policy.encode(board_batch, global_batch)
+                logits = policy.action_head(ph)
+                values = policy.forward_value(vh).squeeze(-1)
 
             masked_logits = logits.masked_fill(~mask_batch, -1e9)
             priors = (
@@ -177,9 +194,9 @@ def run_mcts_cpp_session(
             global_batch = torch.stack(global_batch_items).to(device)
 
             with torch.no_grad():
-                hidden = policy.encode(board_batch, global_batch)
-                logits = policy.action_head(hidden)
-                values = policy.forward_value(hidden).squeeze(-1)
+                vh, ph = policy.encode(board_batch, global_batch)
+                logits = policy.action_head(ph)
+                values = policy.forward_value(vh).squeeze(-1)
 
             for i, node_id in enumerate(node_ids):
                 mask = legal_masks[i].to(device=device)
@@ -230,4 +247,5 @@ def run_mcts_cpp_session(
         visits,
         replay_board,
         replay_global,
+        float(result.root_value),
     )

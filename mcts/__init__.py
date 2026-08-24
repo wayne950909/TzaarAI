@@ -10,8 +10,8 @@ mcts — Monte Carlo Tree Search 引擎
 
 使用方式
 --------
-    from mcts import run_mcts
-    head, action_dim, legal_mask, visits, replay_board, replay_global = run_mcts(
+        from mcts import run_mcts
+    head, action_dim, legal_mask, visits, replay_board, replay_global, root_value = run_mcts(
         policy, root_state, device
     )
 """

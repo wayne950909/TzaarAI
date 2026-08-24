@@ -20,7 +20,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -31,12 +31,12 @@ from config import (
     SELFPLAY_CFG,
     MCTS_CFG,
     GATE_CFG,
+    OPTIMIZER_CFG,
     REPLAY_CFG,
     ELO_CFG,
-        ASYNC_MCTS_CFG,
+    ASYNC_MCTS_CFG,
     _ACTIVE_STATE_BACKEND,
     _ACTIVE_CPP_MODULE,
-    lr_for_simulations,
 )
 from core.board import TRAINING_GAME_STEPS
 from core.env import TzaarEnv, EnvConfig
@@ -47,6 +47,9 @@ from training.metrics import (
     format_exploration_stats,
 )
 from training.replay import (
+    load_replay_snapshot,
+    prune_replay_snapshots,
+    remove_replay_snapshots_after,
     remove_samples_from_buffer,
     replay_extend,
     save_replay_snapshot_async,
@@ -124,6 +127,122 @@ def _create_log_file(title: str) -> Path:
     return log_path
 
 
+def _delete_checkpoints_after(title: str, cutoff_index: int) -> int:
+    """刪除指定 title 中 checkpoint index 嚴格大於 cutoff_index 的 .pt 檔。
+
+    用於 ELO 回溯：當挑出最強模型 index K 後，把 K 之後產生的所有 guard
+    checkpoint 從磁碟移除，避免後續 resume / 掃描把它們當成可用模型。
+
+    回傳被刪除的檔案數量。
+    """
+    removed = 0
+    for info in train_module.list_checkpoints(title=title):
+        if info.index > cutoff_index:
+            try:
+                info.path.unlink()
+                print(f"[elo] removed guard checkpoint after rollback: {info.path.name}")
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except Exception as exc:  # pragma: no cover - I/O guard
+                print(f"[elo] failed to remove {info.path.name}: {exc}")
+    return removed
+
+
+def _rollback_to_guard(
+    *,
+    guard_title: str,
+    policy: torch.nn.Module,
+    guard_policy: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    opponent_pool: Any,
+    replay_buffer: list,
+    replay_write_idx: int,
+    strongest_idx: int,
+) -> tuple[list, int]:
+    """ELO 觸發時，把訓練回滾到 ELO 最強 guard checkpoint K。
+
+    參數
+    ----
+    guard_title    : guard checkpoint 的 title
+    policy         : 目前 candidate 網路（就地覆蓋為 K 的權重）
+    guard_policy   : 目前 guard 網路（就地覆蓋為 K 的權重）
+    optimizer      : 目前優化器（就地覆蓋為 K 的 optimizer state）
+    device         : torch device
+    opponent_pool  : HistoricalOpponentPool（回溯後 refresh，反映磁碟刪檔）
+    replay_buffer  : 目前 replay buffer（會被覆寫為 K 的快照）
+    replay_write_idx : 目前 write idx（會被覆寫為 K 的 write idx）
+    strongest_idx  : ELO 最強 guard 的 checkpoint index K
+
+    回傳
+    ----
+    (new_replay_buffer, new_write_idx) ELO 回溯後的 replay 狀態。
+    """
+    # 1) 找到最強 guard K 的 checkpoint 檔
+    candidates = {
+        info.index: info
+        for info in train_module.list_checkpoints(title=guard_title)
+    }
+    info = candidates.get(int(strongest_idx))
+    if info is None:
+        print(
+            f"[rollback] checkpoint idx={strongest_idx} not found on disk; "
+            "skipping rollback"
+        )
+        return replay_buffer, replay_write_idx
+
+    # 2) 載入最強模型 K 的權重 + optimizer state → policy & guard & optimizer
+    ckpt = torch.load(str(info.path), map_location=str(device), weights_only=True)
+    policy.load_state_dict(ckpt["policy_state"], strict=True)
+    guard_policy.load_state_dict(ckpt["policy_state"], strict=True)
+    if "optimizer_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    optimizer_to(optimizer, device)
+    policy.train()
+    guard_policy.eval()
+    print(
+        f"[rollback] loaded guard idx={strongest_idx} into policy/guard/optimizer "
+        f"(source={info.path.name})"
+    )
+
+    # 3) 回溯 replay buffer 到 K 晉升時存的快照
+    if REPLAY_CFG.enabled:
+        rb, rw = load_replay_snapshot(
+            title=guard_title,
+            checkpoint_index=int(strongest_idx),
+            max_samples=REPLAY_CFG.max_samples,
+        )
+        if rb:
+            replay_buffer = rb
+            replay_write_idx = rw
+        else:
+            print(
+                f"[rollback] no replay snapshot for idx={strongest_idx}; "
+                "starting with empty buffer"
+            )
+            replay_buffer = []
+            replay_write_idx = 0
+
+    # 4) 刪除 K 之後的所有 guard checkpoint
+    removed_ckpt = _delete_checkpoints_after(guard_title, int(strongest_idx))
+    # 5) 刪除 K 之後的所有 indexed replay 快照
+    removed_rb = remove_replay_snapshots_after(
+        title=guard_title, cutoff_index=int(strongest_idx)
+    )
+    # 6) 讓 opponent pool 重新掃描磁碟，反映刪除後的狀態
+    try:
+        opponent_pool.refresh()
+    except Exception as exc:  # pragma: no cover - I/O guard
+        print(f"[rollback] failed to refresh opponent pool: {exc}")
+
+    print(
+        f"[rollback] rollback complete | removed {removed_ckpt} checkpoints, "
+        f"{len(removed_rb)} replay snapshots | pool_size={len(opponent_pool)}"
+    )
+    return replay_buffer, replay_write_idx
+
+
 def _rng_seed_offset(
     update: int,
     n_updates: int,
@@ -187,7 +306,7 @@ training/selfplay_engine.py 決定是否走 run_mcts_batch。
 
     root_state = _build_phase_state_from_env(env)
     with torch.no_grad():
-        _, action_dim, legal_mask, visits, _, _ = _mcts_search(
+        _, action_dim, legal_mask, visits, _, _, _ = _mcts_search(
             policy,
             root_state,
             device,
@@ -197,12 +316,15 @@ training/selfplay_engine.py 決定是否走 run_mcts_batch。
     return visits, legal_mask
 
 
-def run(title: str) -> None:
+def run(title: str, start_level: Optional[int] = None) -> None:
     """執行訓練流程。
 
     參數
     ----
-    title : 訓練任務名稱（用於檢查點/日誌命名）
+    title       : 訓練任務名稱（用於檢查點/日誌命名）
+    start_level : 從階級表的哪一階開始（0-based）。None = 預設從第 0 階開始。
+                  每階對應「模擬次數 + 學習率」，例如 GATE_CFG.level_schedule 的
+                  level 0 = (128, 8e-4)、level 1 = (256, 6e-4) 等。
     """
     # ── 設定 ──────────────────────────────────────────────
     validate_constants()
@@ -307,23 +429,22 @@ def run(title: str) -> None:
             f"| ratings={opponent_pool.ratings_summary()}"
         )
 
-        # ── Gate 連續失敗時的模擬數升級機制 ──────────────────
-    # 每一階（模擬數）各別「連續失敗 GATE_CFG.escalate_after_failures 次」
-    # 就升到下一階（128 → 256 → 384 → 512 → 640 → ...，封頂）。
-    # 一旦升級就「不再退回」（通過 gate 只重置當前連續失敗計數，階層不降）。
-    # 升級後的模擬數同時套用於 gate keeper 與 self-play（產生對局）。
-    # 若 escalate_enabled=False 則永遠用底數。
-    gate_escalator = GateEscalator(
-        base_simulations=int(GATE_CFG.simulations_per_decision),
-        escalate_after_failures=int(GATE_CFG.escalate_after_failures),
-        escalation_step=int(GATE_CFG.escalation_step),
-        escalation_max_simulations=int(GATE_CFG.escalation_max_simulations),
+    # ── Gate 階級表：每一階的「模擬次數 + 學習率」一起切換────────
+    # 每升一階（連續失敗累積達門檻），模擬次數與學習率會『一併』跳到下
+    # 一階對應的值；不再用固定 step 遞增模擬次數。
+    # 若 escalate_enabled=False，只保留單一階（永遠用底數，不升級）。
+    _level_schedule = (
+        list(GATE_CFG.level_schedule) if GATE_CFG.level_schedule
+        else [(int(GATE_CFG.simulations_per_decision), float(OPTIMIZER_CFG.default_lr))]
     )
     if not GATE_CFG.escalate_enabled:
-        gate_escalator.escalation_max_simulations = int(
-            GATE_CFG.simulations_per_decision
-        )
-        gate_escalator.escalation_step = 0
+        first_sims, first_lr = _level_schedule[0]
+        _level_schedule = [(first_sims, first_lr)]
+    gate_escalator = GateEscalator(
+        schedule=_level_schedule,
+        escalator_after_failures=int(GATE_CFG.escalate_after_failures),
+        start_level=int(start_level) if start_level is not None else 0,
+    )
 
     # ── 全域統計 ──────────────────────────────────────────
     stats: Dict[str, float] = {
@@ -351,10 +472,9 @@ def run(title: str) -> None:
         MCTS_CFG.simulations = current_sims
         GATE_CFG.simulations_per_decision = current_sims
 
-        # ── 依目前模擬次數套用對應學習率（階梯式下降）──────
-        # 當 GateEscalator 升級模擬次數時，這裡會自動切換到
-        # config.lr_by_simulations 對應的學習率。
-        current_lr = lr_for_simulations(current_sims)
+        # ── 依目前階級套用「模擬次數 + 學習率」（一併切換）──
+        # GateEscalator 每升一階，sims 與 lr 都由該階表格一併提供。
+        current_lr = gate_escalator.current_learning_rate()
         for group in optimizer.param_groups:
             group["lr"] = current_lr
 
@@ -365,16 +485,11 @@ def run(title: str) -> None:
         # - 是否採用 async-batch
         # - 是否因錯誤而 fallback 到 sync-single
         #
-        # ELO 歷史對手池啟用時：把 self-play 的基準設為「目前 ELO 最強的
-        # guard checkpoint」權重。也就是用最強模型自己跟自己對弈產生資料，
-        # 再據此訓練更新。這正是「挑選最強模型，然後自對弈」的 (A) 方案。
-        if opponent_pool is not None:
-            synced = opponent_pool.sync_to_strongest(policy)
-            if synced:
-                print(
-                    f"[elo] self-play baseline = strongest guard idx="
-                    f"{opponent_pool.strongest()}"
-                )
+        # Self-play 基準 =「目前最新 accepted guard」（guard_policy）權重，
+        # 也就是用目前最強/最新模型自己跟自己對弈產生資料。
+        # （ELO 只在 escalation 觸發時用於回溯決策，不再於每個 update
+        #   用 ELO 最強模型覆蓋 self-play 基準。)
+        policy.load_state_dict(guard_policy.state_dict(), strict=True)
         nvtx.range_push("selfplay")
         policy.eval()
         sp_t0 = time.perf_counter()
@@ -489,22 +604,28 @@ def run(title: str) -> None:
                 )
                 next_guard_ckpt_idx += 1
                 print(f"[guard] saved promoted guard checkpoint: {guard_title}")
-                # 若 ELO 對手池啟用：把新 guard 加入池，並觸發整池 round-robin
-                # 內戰更新 ELO → 修剪回固定大小 → 之後 self-play 改用最強者。
-                if opponent_pool is not None:
-                    opponent_pool.on_new_guard(promoted_ckpt_idx)
-                # gate 通過時也一併保存 replay buffer，讓 resume 能還原
-                # 當前 self-play 累積的資料，而不只是權重。
+                # gate 通過 → 以該 guard checkpoint index 另外存一份 indexed
+                # replay 快照，供 ELO 回溯時 rollback 使用；並把快照數修剪回
+                # REPLAY_CFG.max_snapshots（保留最近 6 份，刪除最舊）。
+                # 注意：ELO round-robin「不在」這裡觸發——ELO 只在 escalation
+                # （連續失敗、即將升級模擬次數/學率）時才評估。
                 if REPLAY_CFG.enabled and replay_buffer:
                     save_replay_snapshot_async(
                         title=guard_title,
-                        checkpoint_index=None,
+                        checkpoint_index=promoted_ckpt_idx,
                         update_idx=update_idx,
                         replay_buffer=replay_buffer,
                         write_idx=replay_write_idx,
                         max_samples=REPLAY_CFG.max_samples,
                     )
+                    prune_replay_snapshots(
+                        title=guard_title,
+                        keep=REPLAY_CFG.max_snapshots,
+                    )
             else:
+                # 記錄升級前的 level（gate_level 已在本 update 開頭捕捉 =
+                # gate_escalator.level，與 record_failure() 前相同）
+                prev_level = gate_level
                 gate_escalator.record_failure()
                 print(
                     f"[gate] FAILED | win_rate={gate_result.win_rate:.3f} "
@@ -513,9 +634,51 @@ def run(title: str) -> None:
                     f"consecutive_failures={gate_consecutive_failures} | "
                     f"next_sims={gate_escalator.current_simulations()}"
                 )
+                # 先把權重載回目前 guard（現行行為）
                 policy.load_state_dict(guard_policy.state_dict(), strict=True)
                 policy.train()
                 update_accepted = False
+
+                # ── ELO 觸發 + 回溯（僅在 escalation 時）─────────
+                # 當「正要切換模擬次數與學率」（level 升級）時，才對最新
+                # pool_size 個 guard 做 ELO 評分，挑出最強模型 K，把
+                # policy / guard / optimizer / replay 回溯到 K 的快照，
+                # 並刪除 K 之後的所有 model 與 replay 快照，再以新的
+                # sims / lr 繼續訓練。
+                escalated = gate_escalator.level > prev_level
+                if escalated and ELO_CFG.enabled and opponent_pool is not None:
+                    print(
+                        "[elo] gate failed enough times; triggering ELO "
+                        f"evaluation at escalation level {gate_escalator.level}"
+                    )
+                    strongest_idx = opponent_pool.evaluate_topk(
+                        k=int(ELO_CFG.pool_size),
+                        simulations=gate_escalator.current_simulations(),
+                    )
+                    if strongest_idx is not None:
+                        replay_buffer, replay_write_idx = _rollback_to_guard(
+                            guard_title=guard_title,
+                            policy=policy,
+                            guard_policy=guard_policy,
+                            optimizer=optimizer,
+                            device=device,
+                            opponent_pool=opponent_pool,
+                            replay_buffer=replay_buffer,
+                            replay_write_idx=replay_write_idx,
+                            strongest_idx=strongest_idx,
+                        )
+                        # 回溯後：K 之後的 guard 已被刪除，下一個可用的
+                        # guard checkpoint index 應接續在 K 之後（避免空洞）。
+                        next_guard_ckpt_idx = int(strongest_idx) + 1
+                        # 回溯後：policy/guard/optimizer 已載回最強模型 K 的
+                        # 權重與 optimizer state（等同「用最強模型當新基準」）。
+                        print(
+                            "[rollback] resumed training from strongest guard "
+                            f"idx={strongest_idx} | sims="
+                            f"{gate_escalator.current_simulations()} | lr="
+                            f"{gate_escalator.current_learning_rate():.6g}"
+                        )
+
                 # 此次被拒 update 產生的 fresh samples 品質不佳。
                 # 若 keep_replay_on_reject=False（預設），從 replay buffer 移除
                 # 這批資料，避免被往後的 update 重複抽樣；若為 True 則保留。

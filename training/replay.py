@@ -75,6 +75,7 @@ def save_replay_snapshot(
                 "player": int(sample.player),
                 "winner_sign": int(sample.winner_sign),
                 "value_target": float(sample.value_target),
+                "root_value": float(sample.root_value),
             }
         )
 
@@ -205,6 +206,7 @@ def load_replay_snapshot(
                 player=int(raw.get("player", 0)),
                 winner_sign=int(raw.get("winner_sign", 0)),
                 value_target=float(raw.get("value_target", 0.0)),
+                root_value=float(raw.get("root_value", 0.0)),
             )
         )
 
@@ -234,6 +236,93 @@ def load_replay_snapshot(
         f"write_idx={write_idx}"
     )
     return replay_buffer, write_idx
+
+
+def list_replay_snapshot_indices(
+    title: str,
+    base_dir: Optional[Path] = None,
+) -> List[int]:
+    """列出指定 title 目前存在於磁碟的「indexed」replay 快照 index（升序）。
+
+    只考慮以 checkpoint index 命名的 `{title}_replay_{index:06d}.pt`，
+    不包含 "latest" 標籤檔。用於 ELO 回溯時決定可用的 rollback 快照。
+    """
+    import re
+    directory = base_dir if base_dir is not None else Path(train_module.CHECKPOINT_DIR)
+    if not directory.is_dir():
+        return []
+    pattern = re.compile(rf"^{re.escape(title)}_replay_(\d{{6}})\.pt$")
+    indices: List[int] = []
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        m = pattern.fullmatch(path.name)
+        if m is not None:
+            indices.append(int(m.group(1)))
+    return sorted(indices)
+
+
+def prune_replay_snapshots(
+    title: str,
+    keep: Optional[int] = None,
+    base_dir: Optional[Path] = None,
+) -> List[Path]:
+    """對指定 title 的 indexed replay 快照執行「最多保留 keep 份」修剪。
+
+    依 index 升序檢查，保留最新 keep 份；超過的（最舊）刪除磁碟上的 .pt 檔。
+
+    若 keep 為 None，使用 REPLAY_CFG.max_snapshots。
+
+    回傳被刪除的路徑清單。
+    """
+    if keep is None:
+        keep = int(REPLAY_CFG.max_snapshots)
+    if keep <= 0:
+        keep = 1
+
+    indices = list_replay_snapshot_indices(title, base_dir=base_dir)
+    if len(indices) <= keep:
+        return []
+
+    removed: List[Path] = []
+    # 保留最新 keep 份，刪掉前面的（最舊）
+    to_remove = indices[:-keep]
+    for idx in to_remove:
+        path = replay_snapshot_path(title, idx, base_dir=base_dir)
+        try:
+            path.unlink()
+            print(f"[replay] pruned old snapshot: {path.name}")
+            removed.append(path)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # pragma: no cover - I/O guard
+            print(f"[replay] failed to prune {path.name}: {exc}")
+    return removed
+
+
+def remove_replay_snapshots_after(
+    title: str,
+    cutoff_index: int,
+    base_dir: Optional[Path] = None,
+) -> List[Path]:
+    """刪除所有 index > cutoff_index 的 indexed replay 快照（ELO 回溯用）。
+
+    回傳被刪除的路徑清單。
+    """
+    indices = list_replay_snapshot_indices(title, base_dir=base_dir)
+    removed: List[Path] = []
+    for idx in indices:
+        if idx > cutoff_index:
+            path = replay_snapshot_path(title, idx, base_dir=base_dir)
+            try:
+                path.unlink()
+                print(f"[replay] removed snapshot after rollback: {path.name}")
+                removed.append(path)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:  # pragma: no cover - I/O guard
+                print(f"[replay] failed to remove {path.name}: {exc}")
+    return removed
 
 
 def replay_extend(

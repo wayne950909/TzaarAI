@@ -20,7 +20,7 @@ from config import (
     NETWORK_CFG,
 )
 from network import PolicyNetCNNMin17
-from training.replay import load_replay_snapshot
+from training.replay import list_replay_snapshot_indices, load_replay_snapshot
 from training.sample import PolicySample
 
 import TzaarTrain as train_module
@@ -162,12 +162,30 @@ def load_or_init_policy(
             pass
 
     start_update = int(ckpt.get("update_idx", -1)) + 1
-    replay_buffer, replay_write_idx = load_replay_snapshot(
+
+    # ── 載入 replay buffer：載入「最新的一」份有 id 的 indexed 快照 ──
+    # 新架構下 snapshot 是以 checkpoint index 命名（{title}_replay_{index:06d}.pt），
+    # 不會再有 "latest" 標籤檔。resume 時應找 index 最大（最新）的那份來載入，
+    # 而不是呼叫 checkpoint_index=None（那只會找不存在的 latest.pt）。
+    # 若完全沒有 indexed 快照，退回空 buffer。
+    snapshot_indices = list_replay_snapshot_indices(
         title=guard_title,
-        checkpoint_index=None,
-        max_samples=REPLAY_CFG.max_samples,
         base_dir=ckpt_path.parent,
     )
+    latest_snapshot_idx = snapshot_indices[-1] if snapshot_indices else None
+    if latest_snapshot_idx is not None:
+        replay_buffer, replay_write_idx = load_replay_snapshot(
+            title=guard_title,
+            checkpoint_index=latest_snapshot_idx,
+            max_samples=REPLAY_CFG.max_samples,
+            base_dir=ckpt_path.parent,
+        )
+    else:
+        replay_buffer, replay_write_idx = [], 0
+        print(
+            "[resume] no indexed replay snapshot found; "
+            "starting with empty replay buffer"
+        )
     print(
         f"[resume] candidate loaded from guard {ckpt_path.name} "
         f"| start_update={start_update} | replay={len(replay_buffer)}"

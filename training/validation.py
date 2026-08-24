@@ -43,12 +43,27 @@ def validate_constants() -> None:
         raise ValueError("OPTIMIZATION_PASSES_PER_UPDATE must be >= 1")
     if GATE_CFG.eval_games <= 0:
         raise ValueError("GATE_EVAL_GAMES must be >= 1")
+    if GATE_CFG.escalate_after_failures <= 0:
+        raise ValueError("GATE_ESCALATE_AFTER_FAILURES must be >= 1")
+    if GATE_CFG.level_schedule:
+        for row in GATE_CFG.level_schedule:
+            if not isinstance(row, (tuple, list)) or len(row) != 2:
+                raise ValueError(
+                    "GATE_LEVEL_SCHEDULE rows must be (simulations, lr) pairs"
+                )
+            sims, lr = row
+            if sims <= 0:
+                raise ValueError("GATE_LEVEL_SCHEDULE simulations must be >= 1")
+            if lr <= 0:
+                raise ValueError("GATE_LEVEL_SCHEDULE learning rate must be > 0")
     if not (0.0 < GATE_CFG.winrate_threshold < 1.0):
         raise ValueError("GATE_WINRATE_THRESHOLD must be in (0, 1)")
     if MCTS_CFG.heuristic_softmax_temperature <= 0:
         raise ValueError("HEURISTIC_SOFTMAX_TEMPERATURE must be > 0")
     if not (0.0 <= MCTS_CFG.heuristic_prior_weight <= 1.0):
         raise ValueError("HEURISTIC_PRIOR_WEIGHT must be in [0, 1]")
+    if not (0.0 <= SELFPLAY_CFG.value_q_weight <= 1.0):
+        raise ValueError("SELFPLAY_VALUE_Q_WEIGHT must be in [0, 1]")
     if ASYNC_MCTS_CFG.enabled:
         if ASYNC_MCTS_CFG.parallel_games <= 0:
             raise ValueError("ASYNC_PARALLEL_GAMES must be >= 1")
@@ -83,6 +98,8 @@ def validate_constants() -> None:
                 "REPLAY_MIN_TRAIN_SAMPLES must be <= "
                 "REPLAY_BUFFER_MAX_SAMPLES"
             )
+        if REPLAY_CFG.max_snapshots <= 0:
+            raise ValueError("REPLAY_MAX_SNAPSHOTS must be >= 1")
     if ELO_CFG.enabled:
         if ELO_CFG.pool_size <= 0:
             raise ValueError("ELO_POOL_SIZE must be >= 1")

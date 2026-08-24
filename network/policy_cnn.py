@@ -1,12 +1,16 @@
 """
 network/policy_cnn.py — PolicyNetCNNMin17：政策 / 價值雙頭 CNN
 
-修正後架構（壓縮特徵 + 分離 head）：
+修正後架構（分離壓縮 + 分離 head）：
 - Board branch: player-relative 12x9x9 tensor
     -> stem conv (12 -> ch) -> N residual blocks (ch -> ch)
-    -> channel compression (ch -> compress_channels, 預設 2) -> flatten -> 2*9*9 = 162
-- Policy head: 直接從 162 -> 601（不再經過共享 trunk）
-- Value network: 162 -> 隱藏層 (fc_hidden_2=256) -> 1
+    -> 分離兩條壓縮分支：
+        1. value_compress : ch -> compress_channels（預設 2）-> flatten -> 2*9*9 = 162
+                           供 value head 使用
+        2. policy_compress: ch -> policy_compress_channels（預設 8）-> flatten -> 8*9*9 = 648
+                           供 policy head 使用
+- Policy head: 從 648 -> 601（unified action，不再經過共享 trunk）
+- Value network: 162 -> 隱藏層 (fc_hidden_2=256) -> 1（不帶 dropout）
 
 移除的多餘架構：
 1. 原本的 fusion trunk（fc1 512、fc2 256、drop）——因為 policy 現在
@@ -19,7 +23,7 @@ ResNet 殘差區塊本身已內建 skip connection，這裡保留標準寫法，
 沒有額外多餘的殘差包裝。
 
 可透過 config.NETWORK_CFG 調整超參數（channels, num_res_blocks,
-fc_hidden_2, compress_channels, global_feature_dim, dropout）。
+fc_hidden_2, compress_channels, policy_compress_channels, global_feature_dim）。
 加大 num_res_blocks 即可加深 ResNet。
 """
 
@@ -77,9 +81,10 @@ class PolicyNetCNNMin17(nn.Module):
     global_feature_dim : 全域特徵維度（保留介面相容，head 不再使用）
     dropout : value 隱藏層 dropout 比率（default: NETWORK_CFG.dropout）
     channels : CNN 通道數（default: NETWORK_CFG.channels = 64）
-    num_res_blocks : 殘差區塊數（default: NETWORK_CFG.num_res_blocks = 4）
+        num_res_blocks : 殘差區塊數（default: NETWORK_CFG.num_res_blocks = 8）
     fc_hidden_2 : value 隱藏層維度（default: NETWORK_CFG.fc_hidden_2 = 256）
-    compress_channels : 壓縮後通道數（default: NETWORK_CFG.compress_channels = 2）
+    compress_channels : value 分支壓縮後通道數（default: NETWORK_CFG.compress_channels = 2）
+    policy_compress_channels : policy 分支壓縮後通道數（default: NETWORK_CFG.policy_compress_channels = 8）
 
     注意
     ----
@@ -95,6 +100,7 @@ class PolicyNetCNNMin17(nn.Module):
         num_res_blocks: int | None = None,
         fc_hidden_2: int | None = None,
         compress_channels: int | None = None,
+        policy_compress_channels: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -107,6 +113,10 @@ class PolicyNetCNNMin17(nn.Module):
         n_res = num_res_blocks if num_res_blocks is not None else _NET_CFG.num_res_blocks
         f2 = fc_hidden_2 if fc_hidden_2 is not None else _NET_CFG.fc_hidden_2
         cc = compress_channels if compress_channels is not None else _NET_CFG.compress_channels
+        pc = (
+            policy_compress_channels if policy_compress_channels is not None
+            else _NET_CFG.policy_compress_channels
+        )
 
         # Stem: project 12 input channels to `ch`
         self.stem_conv = nn.Conv2d(12, ch, kernel_size=3, padding=1, bias=False)
@@ -115,21 +125,25 @@ class PolicyNetCNNMin17(nn.Module):
         # Residual tower
         self.res_blocks = nn.Sequential(*[_ResBlock(ch) for _ in range(n_res)])
 
-        # Channel compression：ch -> compress_channels，攤平後 board_flat_dim。
-        self.compress = _CompressBlock(ch, cc)
-        board_flat_dim = cc * 9 * 9
+        # 分離的通道壓縮（Value / Policy 各自獨立）：
+        # - value_compress : ch -> compress_channels（預設 2），供 value head 使用
+        # - policy_compress: ch -> policy_compress_channels（預設 8），供 policy head 使用
+        self.value_compress = _CompressBlock(ch, cc)
+        self.policy_compress = _CompressBlock(ch, pc)
 
-        # Policy head：直接從 162 -> 601（不再經過共享 trunk）
+        value_flat_dim = cc * 9 * 9
+        policy_flat_dim = pc * 9 * 9
+
+        # Policy head：從 policy_flat_dim -> 601（不再經過共享 trunk）
         # unified action：0-299 capture, 300-599 reinforce, 600 pass
-        self.action_head = nn.Linear(board_flat_dim, 601)
+        self.action_head = nn.Linear(policy_flat_dim, 601)
 
-        # Value network：162 -> (dropout) -> ReLU -> 256 -> 1
-        self.value_fc = nn.Linear(board_flat_dim, f2)
-        self.value_drop = nn.Dropout(self.dropout_rate)
+        # Value network：value_flat_dim -> ReLU -> 256 -> 1（不帶 dropout）
+        self.value_fc = nn.Linear(value_flat_dim, f2)
         self.value_head = nn.Linear(f2, 1)
 
-    def encode(self, states: torch.Tensor, global_features: torch.Tensor) -> torch.Tensor:
-        """CNN backbone encode → 壓縮後攤平的低維特徵。
+    def encode(self, states: torch.Tensor, global_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """CNN backbone encode → 分離壓縮後攤平的低維特徵。
 
         參數
         ----
@@ -138,21 +152,28 @@ class PolicyNetCNNMin17(nn.Module):
 
         回傳
         ----
-        hidden : (batch, compress_channels * 9 * 9) 低維特徵（預設 162）
+        (value_hidden, policy_hidden) tuple：
+            value_hidden  : (batch, compress_channels * 9 * 9)（預設 162）
+            policy_hidden : (batch, policy_compress_channels * 9 * 9)（預設 648）
+        兩個 head 各自使用對應的壓縮特徵。
         """
         x = F.relu(self.stem_bn(self.stem_conv(states)), inplace=True)
         x = self.res_blocks(x)
-        x = self.compress(x)                 # (batch, cc, 9, 9)
-        x = x.flatten(start_dim=1)           # (batch, cc*9*9)
-        return x
+        vh = self.value_compress(x).flatten(start_dim=1)     # (batch, cc*9*9)
+        ph = self.policy_compress(x).flatten(start_dim=1)    # (batch, pc*9*9)
+        return vh, ph
 
     def forward_value(self, hidden: torch.Tensor) -> torch.Tensor:
         """從低維特徵計算價值預測 ([-1, 1])。"""
-        v = F.relu(self.value_drop(self.value_fc(hidden)), inplace=True)
+        v = F.relu(self.value_fc(hidden), inplace=True)
         return torch.tanh(self.value_head(v))
 
     def head_logits(self, hidden: torch.Tensor, head: str) -> torch.Tensor:
-        """從低維特徵計算指定 head 的 logits。
+        """從 policy 低維特徵計算指定 head 的 logits。
+
+        參數
+        ----
+        hidden : (batch, policy_compress_channels * 9 * 9) 的 policy 壓縮特徵
 
         目前僅支援 head="action"。
         """
@@ -161,8 +182,8 @@ class PolicyNetCNNMin17(nn.Module):
         raise ValueError(f"Unknown head: {head}")
 
     def forward(self, states: torch.Tensor, global_features: torch.Tensor) -> dict[str, torch.Tensor]:
-        hidden = self.encode(states, global_features)
+        vh, ph = self.encode(states, global_features)
         return {
-            "action": self.action_head(hidden),
-            "value": self.forward_value(hidden),
+            "action": self.action_head(ph),
+            "value": self.forward_value(vh),
         }

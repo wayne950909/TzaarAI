@@ -95,9 +95,9 @@ def train_on_samples(
 
             compute_start = time.perf_counter()
 
-            hidden = policy.encode(b_states, b_globals)
-            action_logits = policy.action_head(hidden)
-            value_pred = policy.forward_value(hidden).squeeze(-1)
+            vh, ph = policy.encode(b_states, b_globals)
+            action_logits = policy.action_head(ph)
+            value_pred = policy.forward_value(vh).squeeze(-1)
 
             masked_logits = action_logits.masked_fill(~b_masks, -1e9)
             logp = F.log_softmax(masked_logits, dim=-1)

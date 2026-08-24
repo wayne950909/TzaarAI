@@ -309,12 +309,17 @@ class HistoricalOpponentPool:
             f"| strongest={top} rating={self.elo.get(top) if top is not None else '-'}"
         )
 
-    def _play_round_robin(self, indices: List[int]) -> None:
-        """對指定成員集合做全對全內戰，更新 ELO。"""
+    def _play_round_robin(self, indices: List[int], simulations: Optional[int] = None) -> None:
+        """對指定成員集合做全對全內戰，更新 ELO。
+
+        simulations：內戰使用的 MCTS 模擬次數。
+        - 傳入時使用該值（例如「階級表目前的模擬次數」）。
+        - 未傳入時退回 ELO_CFG.round_robin_simulations。
+        """
         if len(indices) < 2:  # noqa: PLR2004
             return
         n_games = int(ELO_CFG.round_robin_pairs_games)
-        sims = int(ELO_CFG.round_robin_simulations)
+        sims = int(simulations) if simulations is not None else int(ELO_CFG.round_robin_simulations)
         temperature = float(ELO_CFG.round_robin_temperature)
 
         # 建立 gate_cfg 相容的 namespace（gate_keeper 讀 simulations 與 temperature）
@@ -358,6 +363,66 @@ class HistoricalOpponentPool:
                 # a 的勝率（和局算 0.5）
                 a_win_rate = (result.candidate_wins + 0.5 * result.draws) / total
                 self.elo.record_match(idx_a, idx_b, a_win_rate)
+
+        # ── ELO 觸發評估（escalation 時呼叫）──────────────────
+    def evaluate_topk(
+        self,
+        k: Optional[int] = None,
+        simulations: Optional[int] = None,
+    ) -> Optional[int]:
+        """對「最新 k 個」guard 模型做 round-robin ELO，回傳最強 index。
+
+        這是 ELO 唯一的觸發時機：當 gate 連續失敗、即將升級模擬次數與學率
+        （escalation）時，由 training.loop 呼叫。它取代原本「每次 gate 通過
+        就打全池 round-robin」的昂貴做法。
+
+        流程：
+          1. 取出最新 k 個 guard checkpoint index（依 checkpoint index 降序）。
+          2. 把這 k 個的 ELO 加入追蹤並全部重設回初始分。
+          3. 對這 k 個做 round-robin 內戰，更新 ELO。
+          4. 回傳 ELO 最強的 index；<2 個成員或缺損時回傳 None。
+
+        若 k 為 None，使用 ELO_CFG.pool_size。
+        simulations：內戰用的 MCTS 模擬次數；傳入時使用該值（例如階級表的
+        目前模擬次數），否則退回 ELO_CFG.round_robin_simulations。
+        """
+        if k is None:
+            k = int(ELO_CFG.pool_size)
+        if k < 1:
+            k = 1
+
+        members = train_module.list_pool_checkpoints(self.guard_title)
+        members.sort(key=lambda m: m.index, reverse=True)
+        # 取最新 k 個（升序排列後做 round-robin）
+        top_members = sorted(member.index for member in members[:k])
+
+        if len(top_members) < 2:
+            print("[elo] evaluate_topk: fewer than 2 guards, skipping ELO")
+            return None
+
+        for index in top_members:
+            self.elo.set_init(index)
+        # ELO 觸發時獨立評比，避免被先前歷史分數污染
+        self.elo.reset_all(top_members)
+        self._play_round_robin(top_members, simulations=simulations)
+        self.save_ratings()
+
+        ranked = sorted(top_members, key=lambda i: self.elo.get(i), reverse=True)
+        strongest = ranked[0]
+        print(
+            "[elo] topk evaluation | members="
+            f"[{', '.join(str(i) for i in top_members)}] "
+            f"| strongest={strongest} rating={self.elo.get(strongest):.1f} "
+            f"| ratings={self.ratings_summary_for(top_members)}"
+        )
+        return strongest
+
+    def ratings_summary_for(self, indices: List[int]) -> str:
+        """輸出指定成員的 ELO 摘要字串（供日誌顯示）。"""
+        parts = []
+        for idx in sorted(indices):
+            parts.append(f"{idx}:{self.elo.get(idx):.0f}")
+        return "[" + ", ".join(parts) + "]"
 
     # ── 唯讀資訊 ─────────────────────────────────────────
     def ratings_summary(self) -> str:

@@ -219,9 +219,9 @@ class CppSearchManager:
             ).to(device)
 
             with torch.no_grad():
-                hidden = policy.encode(board_batch, global_batch)
-                logits = policy.action_head(hidden)
-                values = policy.forward_value(hidden).squeeze(-1)
+                vh, ph = policy.encode(board_batch, global_batch)
+                logits = policy.action_head(ph)
+                values = policy.forward_value(vh).squeeze(-1)
 
             masked_logits = logits.masked_fill(~mask_batch, -1e9)
             nvtx.range_pop()  # gpu_forward

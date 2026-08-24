@@ -56,7 +56,8 @@ class NetworkConfig:
     channels: int = 64               # CNN 分支通道數
     num_res_blocks: int = 8          # 殘差區塊數（想加深 ResNet 直接改這裡）
     fc_hidden_2: int = 256           # value network 隱藏層維度（162 -> 256 -> 1）
-    compress_channels: int = 2       # CNN 輸出壓縮至的通道數（2*9*9 = 162）
+    compress_channels: int = 2       # value 分支壓縮至的通道數（2*9*9 = 162）
+    policy_compress_channels: int = 8  # policy 分支壓縮至的通道數（8*9*9 = 648）
 
 
 NETWORK_CFG = NetworkConfig()
@@ -148,6 +149,11 @@ class SelfPlayConfig:
     temp_high: float = 1.0     # 前期探索溫度
     temp_low: float = 1.0     # 後期利用溫度
     temp_switch_decision: int = 6  # 第幾步之後切換到低溫
+    # 混合式 value target：
+    #   value_target = (1 - value_q_weight)*終局輸贏 + value_q_weight*訪問加權Q
+    #   value_q_weight = 0.0 → 純終局（現行行為）
+    #                   = 1.0 → 純 Q（MCTS 根值）
+    value_q_weight: float = 0.5
 
 
 SELFPLAY_CFG = SelfPlayConfig()
@@ -194,18 +200,6 @@ class OptimizerConfig:
     # 沒對應到任何模擬次數門檻時採用的回退學習率
     default_lr: float = 0.0004
 
-    # ── 模擬次數 → 學習率 階梯式對應表 ─────────────────
-    # 當腳本（GateEscalator）切換到某個模擬次數時，訓練迴圈會自動
-    # 套用這裡對應的學習率，形成階梯式下降。
-    # 每一項為 (simulations, lr)：simulations >= 該門檻即套用該 lr。
-    lr_by_simulations: tuple = (
-        (128, 0.0008),
-        (256, 0.0006),
-        (384, 0.0004),
-        (512, 0.0003),
-        (768, 0.0002),
-        (1280, 0.0001)
-    )
 
 
 OPTIMIZER_CFG = OptimizerConfig()
@@ -237,23 +231,35 @@ def lr_for_simulations(simulations: int) -> float:
 @dataclass
 class GatekeeperConfig:
     """Gatekeeper 評估的超參數"""
-    eval_games: int = 100
-    winrate_threshold: float = 0.54
+    eval_games: int = 200
+    winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
     simulations_per_decision: int = 768  # 評估時的 MCTS 模擬數
     eval_every_updates: int = 1        # 每 N 次更新執行一次
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True
 
-    # ── Escalation（連續失敗時提高模擬數）──────────────────
-    # 當 gate 連續失敗達 escalate_after_failures 次後，下一次評估即把
-    # simulations 升級一階。軌跡（以 simulations_per_decision 為底數）：
-    #   128 → 256 → 384 → 512 → 640 → ...（每階 +escalation_step，最高到上限）
-    # 一旦 gate 通過，連續失敗計數與升級等級都會重置回底數。
+    # ── Escalation（連續失敗時進入下一階）──────────────────
+    # 當 gate 連續失敗達 escalate_after_failures 次後，進入下一階。
+    # 「每一階」由 level_schedule 明確定義「模擬次數 + 學習率」，
+    # 因此升階時兩者一起切換（不採固定次數遞增）。
+    # 一旦 gate 通過，連續失敗計數重置（階層不退）。
     escalate_enabled: bool = True
-    escalate_after_failures: int = 4        # 連續失敗幾次後升級一階模擬數
-    escalation_step: int = 256             # 每階增加的模擬數
-    escalation_max_simulations: int = 1280  # 模擬數上限（超出則維持上限）
+    escalate_after_failures: int = 5        # 連續失敗幾次後升到下一階
+
+    # ── 階級表：每一階直接設定「模擬次數 + 學習率」────────
+    # GateEscalator 沿著這個表逐階前進；升階時模擬次數與學習率「一併」套用。
+    # 每一項為 (simulations, learning_rate)。level 0 = 第一階（最底部），
+    # 最後一階為封頂（升到頂後維持在最後一階）。
+    level_schedule: tuple = (
+        (128, 0.0008),
+        (256, 0.0006),
+        (384, 0.0004),
+        (512, 0.0003),
+        (768, 0.0002),
+        (1280, 0.0002),
+        (1600, 0.0001)
+    )
 
 
 GATE_CFG = GatekeeperConfig()
@@ -273,6 +279,10 @@ class ReplayConfig:
     snapshot_version: int = 1
     snapshot_tag: str = "latest"
 
+    # gate 通過時會額外以 checkpoint index 存一份 replay 快照供 ELO 回溯。
+    # 這裡控制最多保留幾份（超過就刪除最舊）。
+    max_snapshots: int = 6
+
 
 REPLAY_CFG = ReplayConfig()
 
@@ -285,17 +295,18 @@ REPLAY_CFG = ReplayConfig()
 class EloConfig:
     """ELO 歷史對手池設定。
 
-    self-play 不再讓最新模型自己跟自己對弈，而是選出池中 ELO 最強的
-    歷史 guard 模型作為對手。
+    ELO 不再每次 gate 通過都重跑整池 round-robin。只有在「gate 連續失敗、
+    即將升級模擬次數與學率（escalation）時」才觸發 ELO 評分。
 
-    對手池流程（當新 guard 晉升時）：
-        1. 新 guard checkpoint 加入對手池
-        2. 池內所有模型進行 round-robin 內戰，更新各自的 ELO
-        3. 若超過 pool_size，剔除 ELO 最低的成員，維持固定大小
-        4. 之後的 self-play 改用「ELO 最強的模型」作為對手
+    觸發時：
+        1. 取最新的 pool_size 個 guard 模型做 round-robin 內戰，更新 ELO
+        2. 挑出 ELO 最強的模型 index
+        3. 將 policy / guard 權重與 replay buffer 回溯到該最強模型的快照
+        4. 刪除該最強模型之後的所有 guard 模型與 replay 快照
+        5. 以新的（升級後的）模擬次數與學率繼續訓練
     """
-    enabled: bool = False               # 是否啟用 ELO 歷史對手池做為 self-play 對手
-    pool_size: int = 10                 # 對手池固定大小上限
+    enabled: bool = False               # 是否啟用 ELO（escalation 時評分回溯）
+    pool_size: int = 6                  # ELO 觸發時評估的「最新 N 個」guard 模型數
     initial_rating: float = 1200.0      # 新成員的初始 ELO
     k_factor: float = 32.0              # ELO K 值（更新幅度）
 
@@ -358,12 +369,25 @@ def validate_configs() -> None:
         raise ValueError("OPTIMIZATION_PASSES_PER_UPDATE must be >= 1")
     if GATE_CFG.eval_games <= 0:
         raise ValueError("GATE_EVAL_GAMES must be >= 1")
+    if GATE_CFG.escalate_after_failures <= 0:
+        raise ValueError("GATE_ESCALATE_AFTER_FAILURES must be >= 1")
+    if GATE_CFG.level_schedule:
+        for row in GATE_CFG.level_schedule:
+            if not isinstance(row, (tuple, list)) or len(row) != 2:
+                raise ValueError("GATE_LEVEL_SCHEDULE rows must be (simulations, lr) pairs")
+            sims, lr = row
+            if sims <= 0:
+                raise ValueError("GATE_LEVEL_SCHEDULE simulations must be >= 1")
+            if lr <= 0:
+                raise ValueError("GATE_LEVEL_SCHEDULE learning rate must be > 0")
     if not (0.0 < GATE_CFG.winrate_threshold < 1.0):
         raise ValueError("GATE_WINRATE_THRESHOLD must be in (0, 1)")
     if MCTS_CFG.heuristic_softmax_temperature <= 0:
         raise ValueError("HEURISTIC_SOFTMAX_TEMPERATURE must be > 0")
     if not (0.0 <= MCTS_CFG.heuristic_prior_weight <= 1.0):
         raise ValueError("HEURISTIC_PRIOR_WEIGHT must be in [0, 1]")
+    if not (0.0 <= SELFPLAY_CFG.value_q_weight <= 1.0):
+        raise ValueError("SELFPLAY_VALUE_Q_WEIGHT must be in [0, 1]")
     if REPLAY_CFG.enabled:
         if REPLAY_CFG.max_samples <= 0:
             raise ValueError("REPLAY_BUFFER_MAX_SAMPLES must be >= 1")
@@ -373,6 +397,8 @@ def validate_configs() -> None:
             raise ValueError("REPLAY_MIN_TRAIN_SAMPLES must be >= 1")
         if REPLAY_CFG.min_train_samples > REPLAY_CFG.max_samples:
             raise ValueError("REPLAY_MIN_TRAIN_SAMPLES must be <= REPLAY_BUFFER_MAX_SAMPLES")
+        if REPLAY_CFG.max_snapshots <= 0:
+            raise ValueError("REPLAY_MAX_SNAPSHOTS must be >= 1")
     if ELO_CFG.enabled:
         if ELO_CFG.pool_size <= 0:
             raise ValueError("ELO_POOL_SIZE must be >= 1")
