@@ -15,10 +15,12 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any, Dict, List, Optional
 
 import torch
 
+import TzaarTrain as train_module
 import config as _cfg
 from config import ASYNC_MCTS_CFG, MCTS_CFG, SELFPLAY_CFG, TRAINING_CFG
 from core.action import N_ACTIONS
@@ -411,3 +413,268 @@ def collect_selfplay_samples(
         active = survivors
 
     return fresh_samples, games_played, total_game_samples, last_temperature
+
+
+def collect_vs_past_samples(
+    policy: torch.nn.Module,
+    guard_title: str,
+    device: torch.device,
+    env_cfg: EnvConfig,
+    update_idx: int,
+    search_manager: Optional[CppSearchManager] = None,
+) -> tuple[List[PolicySample], int, int, int]:
+    """讓「最新模型（policy）」對上「一個隨機近期歷史 guard 模型」，產生對弈樣本。
+
+    規則：
+    - 從磁碟上「最近 vs_past_recent_n 個 guard checkpoint」中隨機選一個當對手。
+      若歷史 checkpoint 總數不足 vs_past_recent_n，就從全部可用的歷史 checkpoint
+      中隨機選一個。
+    - 若只有 1 個（或 0 個）歷史 checkpoint，代表沒有「別的可選模型」，這批
+      樣本自動為 0（在此情境下最新模型只能跟自己下，交由一般 self-play 處理）。
+
+    樣本只記錄「最新模型（policy）」的決策步（類似 gate 裡 candidate 的角色），
+    這些回合同時由 MCTS 參與，並以 searchManager 批次搜尋（最新組 / 歷史組各
+    一次 run_search）。
+
+    回傳：
+    fresh_samples      最新模型對上歷史模型所產生的訓練樣本
+    games_played       實際完成的對局數
+    total_game_samples 新增樣本總數
+    opponent_index     被選為對手的 checkpoint index（無對手時為 -1）
+    """
+    from mcts import run_mcts as _mcts_search
+
+    if not getattr(SELFPLAY_CFG, "vs_past_enabled", False):
+        return [], 0, 0, -1
+
+    n_games = int(getattr(SELFPLAY_CFG, "vs_past_games", 100))
+    recent_n = int(getattr(SELFPLAY_CFG, "vs_past_recent_n", 10))
+    if n_games <= 0:
+        return [], 0, 0, -1
+
+    # ── 從磁碟最近的歷史 guard checkpoint 中隨機挑一個對手 ──────
+    all_ckpt = sorted(
+        train_module.list_checkpoints(title=guard_title),
+        key=lambda info: info.index,
+    )
+    # 最新模型 = policy（guard_policy）。歷史模型 = 磁碟上的其他 guard。
+    if len(all_ckpt) < 2:
+        # 只有 0 或 1 個模型 → 沒「別的」可選，直接省略（回到純自對弈）。
+        print(
+            "[vs-past] insufficient historical models "
+            f"(found {len(all_ckpt)} guard), skipping vs-past games"
+        )
+        return [], 0, 0, -1
+
+    # 最近 recent_n 個（不含最新的「目前 guard」權重：它就是 policy 本人，下自己沒意義）
+    historical = all_ckpt[:-1][-recent_n:]
+    chosen = random.choice(historical)
+    opponent_policy = train_module.load_policy_from_checkpoint(
+        chosen.path, str(device)
+    )
+    print(
+        f"[vs-past] update {update_idx} | opponent guard idx={chosen.index} "
+        f"| games={n_games} | pool_choices={len(historical)}"
+    )
+
+    async_active = (
+        is_async_selfplay_ready()
+        and search_manager is not None
+    )
+    simulations = int(MCTS_CFG.simulations)
+
+    fresh_samples: List[PolicySample] = []
+    games_played = 0
+    total_game_samples = 0
+
+    # 每個 entry：一局「最新模型 vs 歷史模型」的對局。
+    # 最新模型的玩家顏色每局輪流（white/black）。
+    active: List[Dict[str, Any]] = []
+    launched = 0
+
+    while games_played < n_games:
+        parallel_games = min(
+            n_games - games_played,
+            int(ASYNC_MCTS_CFG.parallel_games) if async_active else 1,
+        )
+        parallel_games = max(parallel_games, 1)
+        while launched < n_games and len(active) < parallel_games:
+            env = TzaarEnv(env_cfg)
+            env.reset()
+            # 最新模型（policy）隨機分配先手 / 後手
+            latest_player = 1 if random.random() < 0.5 else -1
+            active.append(
+                {
+                    "env": env,
+                    "decision_step": 0,
+                    "samples": [],
+                    "latest_player": latest_player,
+                }
+            )
+            launched += 1
+
+        if not active:
+            break
+
+        # ── 本輪：依 current_player 分組（最新組 / 歷史組）──────
+        # 每組各自做一次 batch MCTS（CppSearchManager 一次只能套單一 policy）。
+        latest_entries: List[dict] = []
+        past_entries: List[dict] = []
+        prepared: List[Dict[str, Any]] = []
+        root_states: List[Any] = []
+        next_active: List[Dict[str, Any]] = []
+
+        for entry in active:
+            env = entry["env"]
+            if not env.game_in_progress:
+                winner_sign = winner_sign_from_result(env.last_game_result)
+                samples = entry["samples"]
+                assign_value_targets(samples, winner_sign)
+                fresh_samples.extend(samples)
+                total_game_samples += len(samples)
+                games_played += 1
+                continue
+
+            decision_step = int(entry["decision_step"])
+            temperature = (
+                float(SELFPLAY_CFG.temp_low)
+                if decision_step >= SELFPLAY_CFG.temp_switch_decision
+                else float(SELFPLAY_CFG.temp_high)
+            )
+
+            current_player = int(env.current_player)
+            obs = env.observe()
+            obs_tensor = obs.to_tensor(device=device).unsqueeze(0)
+            global_f = obs.to_global_tensor().unsqueeze(0)
+
+            prep = {
+                "entry": entry,
+                "env": env,
+                "current_player": current_player,
+                "temperature": temperature,
+                "obs_tensor": obs_tensor,
+                "global_f": global_f,
+            }
+            prepared.append(prep)
+            root_states.append(build_phase_state_from_env(env))
+            next_active.append(entry)
+
+            if current_player == int(entry["latest_player"]):
+                latest_entries.append(prep)
+            else:
+                past_entries.append(prep)
+
+        if not root_states:
+            active = next_active
+            continue
+
+        # ── 對「最新組」與「歷史組」各執行一次批次搜尋 ──────────
+        apply_noise = bool(update_idx > 0)
+
+        def _run_group(group: List[dict], pol: torch.nn.Module) -> Dict[int, Any]:
+            """對一組 root states 執行 MCTS，回傳 {id(prep): output}。"""
+            if not group:
+                return {}
+            states = [build_phase_state_from_env(p["env"]) for p in group]
+            if async_active:
+                search_manager.reset_trees(states, simulations=simulations)
+                outs = search_manager.run_search(pol, device)
+            else:
+                outs = [
+                    _mcts_search(
+                        pol,
+                        st,
+                        device,
+                        apply_dirichlet_noise=apply_noise,
+                        simulations=simulations,
+                    )
+                    for st in states
+                ]
+            return {id(group[i]): outs[i] for i in range(len(group))}
+
+        # 嘗試走 CppSearchManager；任何一組失敗就整組退回 sync-single
+        if async_active:
+            try:
+                all_outputs = {}
+                all_outputs.update(_run_group(latest_entries, policy))
+                all_outputs.update(_run_group(past_entries, opponent_policy))
+            except Exception as exc:
+                print(
+                    "[vs-past] CppSearchManager failed; falling back to "
+                    f"sync-single. {type(exc).__name__}: {exc}"
+                )
+                async_active = False
+                all_outputs = {}
+                all_outputs.update(_run_group(latest_entries, policy))
+                all_outputs.update(_run_group(past_entries, opponent_policy))
+        else:
+            all_outputs = {}
+            all_outputs.update(_run_group(latest_entries, policy))
+            all_outputs.update(_run_group(past_entries, opponent_policy))
+
+        # ── 依搜尋結果採樣動作、產生樣本 ──────────────────────
+        survivors: List[Dict[str, Any]] = []
+        for prep in prepared:
+            out = all_outputs.get(id(prep))
+            if out is None:
+                raise RuntimeError("missing search output for a vs-past game")
+            entry = prep["entry"]
+            env = prep["env"]
+            temperature = float(prep["temperature"])
+
+            # 統一輸出格式（searchManager 是 dict，sync-single 是 tuple）
+            if isinstance(out, dict):
+                legal_mask = out["legal_mask"]
+                visits = out["visits"]
+                root_value = float(out.get("root_value", 0.0))
+            else:
+                _, _, legal_mask, visits, _, _, root_value = out
+
+            legal_mask_cpu = (
+                legal_mask.to(device="cpu", dtype=torch.bool).clone()
+                if legal_mask.device.type != "cpu"
+                else legal_mask.clone().to(dtype=torch.bool)
+            )
+
+            action, target_pi = sample_action_and_target(
+                visits, legal_mask_cpu, temperature
+            )
+            env.step(action)
+
+            # 只記錄「最新模型」的決策步驟（用決策前的 current_player 判斷）
+            if int(prep["current_player"]) == int(entry["latest_player"]):
+                sample_state = (
+                    prep["obs_tensor"].squeeze(0).detach().to("cpu", dtype=torch.float32)
+                )
+                sample_global = (
+                    prep["global_f"].squeeze(0).detach().to("cpu", dtype=torch.float32)
+                )
+                entry["samples"].append(
+                    PolicySample(
+                        state=sample_state,
+                        global_features=sample_global,
+                        action_dim=N_ACTIONS,
+                        legal_mask_padded=legal_mask_cpu,
+                        target_pi_padded=(
+                            target_pi.detach().to("cpu", dtype=torch.float32).clone()
+                        ),
+                        player=int(prep["current_player"]),
+                        root_value=root_value,
+                    )
+                )
+
+            entry["decision_step"] = int(entry["decision_step"]) + 1
+
+            if env.game_in_progress:
+                survivors.append(entry)
+            else:
+                winner_sign = winner_sign_from_result(env.last_game_result)
+                samples = entry["samples"]
+                assign_value_targets(samples, winner_sign)
+                fresh_samples.extend(samples)
+                total_game_samples += len(samples)
+                games_played += 1
+
+        active = survivors
+
+    return fresh_samples, games_played, total_game_samples, int(chosen.index)

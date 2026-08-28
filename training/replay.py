@@ -182,6 +182,9 @@ def load_replay_snapshot(
         print(f"[replay] invalid sample list in {path.name}")
         return [], 0
 
+    # 先在截斷前取回 write_idx（指向環形中最舊樣本的位置，供「保留最新」判斷用）
+    saved_write_idx = int(payload.get("write_idx", 0))
+
     replay_buffer: List[PolicySample] = []
     for raw in raw_samples:
         if not isinstance(raw, dict):
@@ -210,26 +213,45 @@ def load_replay_snapshot(
             )
         )
 
+    _did_truncate = False
     if max_samples > 0 and len(replay_buffer) > max_samples:
         print(
             f"[replay] truncating loaded samples {len(replay_buffer)} -> "
-            f"{max_samples}"
+            f"{max_samples} (keeping NEWEST)"
         )
-        replay_buffer = replay_buffer[:max_samples]
+        # 環形語意：buffer[write_idx] 是最舊，buffer[(write_idx-1)%L] 是最新。
+        # 先旋轉成「最舊在前、最新在後」，再取尾巴 N 個 = 保留最新資料、丟棄最舊。
+        original_len = len(replay_buffer)
+        wild_idx = saved_write_idx
+        if not (0 < wild_idx < original_len):
+            # write_idx 不在合法範圍（未滿 buffer 或已壞）：list 順序即為「舊→新」
+            wild_idx = 0
+        if wild_idx > 0:
+            replay_buffer = (
+                replay_buffer[wild_idx:] + replay_buffer[:wild_idx]
+            )
+        replay_buffer = replay_buffer[-max_samples:]
+        _did_truncate = True
 
     if not replay_buffer:
         print(f"[replay] snapshot empty after parsing: {path.name}")
         return [], 0
 
-    write_idx = int(payload.get("write_idx", 0))
-    max_valid = (
-        max_samples
-        if len(replay_buffer) >= max_samples and max_samples > 0
-        else len(replay_buffer)
-    )
-    if write_idx < 0 or write_idx >= max(max_valid, 1):
-        print(f"[replay] invalid write_idx={write_idx}, reset to 0")
+    # 若曾發生「保留最新」的截斷，buffer 已被重新排序成「最舊在前、最新在後」，
+    # 此時新的最舊位置即 index 0，故 write_idx（下一個要覆寫的位置）重設為 0；
+    # 否則沿用快照中記錄的 write_idx，並做合法性檢查。
+    if _did_truncate:
         write_idx = 0
+    else:
+        write_idx = int(payload.get("write_idx", 0))
+        max_valid = (
+            max_samples
+            if len(replay_buffer) >= max_samples and max_samples > 0
+            else len(replay_buffer)
+        )
+        if write_idx < 0 or write_idx >= max(max_valid, 1):
+            print(f"[replay] invalid write_idx={write_idx}, reset to 0")
+            write_idx = 0
 
     print(
         f"[replay] loaded {path.name} | samples={len(replay_buffer)} "

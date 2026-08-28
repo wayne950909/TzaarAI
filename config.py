@@ -70,13 +70,13 @@ NETWORK_CFG = NetworkConfig()
 class MCTSConfig:
     """MCTS 搜尋引擎的超參數"""
     simulations: int = 768 
-    puct_c: float = 2.25
+    puct_c: float = 1.25
     leaf_batch_size: int = 16
 
     # Root Dirichlet noise（訓練時啟用）
     use_root_dirichlet_noise: bool = True
-    root_dirichlet_eps: float = 0.25
-    root_dirichlet_alpha: float = 0.17
+    root_dirichlet_eps: float = 0.35
+    root_dirichlet_alpha: float = 0.2
 
     # 啟發式先驗（設為 0 則停用）
     heuristic_prior_weight: float = 0.0
@@ -122,10 +122,10 @@ class AsyncMCTSConfig:
 
     # ── Worker-Local Double Buffer 參數 ──────────────────────
     # 每個 worker 每側邊緩衝區的最大容量（leaf 數，定值，不再乘樹數量）
-    local_capacity: int = 2000
+    local_capacity: int = 4000
     # 單一側邊緩衝區尚未滿載前，「到達一定資料量」即觸發 is_ready 的 leaf 數。
     # 此值不是緩衝區最大容量，而是 worker 依 adjust.md 判定 ready 的資料量下限。
-    ready_flush_leaves: int = 64
+    ready_flush_leaves: int = 128
 
     # ── C++ SearchManager 內部 Debug Log ──────────────────
     # 在 config.py 設定，經 cpp_manager._build_config 傳入 C++ SearchManager。
@@ -153,7 +153,16 @@ class SelfPlayConfig:
     #   value_target = (1 - value_q_weight)*終局輸贏 + value_q_weight*訪問加權Q
     #   value_q_weight = 0.0 → 純終局（現行行為）
     #                   = 1.0 → 純 Q（MCTS 根值）
-    value_q_weight: float = 0.5
+    value_q_weight: float = 0.2
+
+    # ── 最新模型 vs 隨機近期歷史模型（資料多樣性）────────
+    # 每輪除了自我對弈（games_per_update 局）之外，額外讓「最新模型」
+    # 對上「從最近 vs_past_recent_n 個歷史 guard 模型隨機選出的一個」，
+    # 再產生 vs_past_games 局的訓練樣本（同樣使用 searchManager）。
+    # 若歷史模型不足 1 個（只有最新模型），這批樣本自動為 0。
+    vs_past_enabled: bool = True
+    vs_past_games: int = 100      # 每輪「最新 vs 近期模型」的對局數
+    vs_past_recent_n: int = 10    # 從最近 N 個歷史模型隨機選一個當對手
 
 
 SELFPLAY_CFG = SelfPlayConfig()
@@ -194,7 +203,7 @@ class OptimizerConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     policy_loss_weight: float = 1.0
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 20.0
     entropy_weight: float = 0.0
 
     # 沒對應到任何模擬次數門檻時採用的回退學習率
@@ -231,7 +240,7 @@ def lr_for_simulations(simulations: int) -> float:
 @dataclass
 class GatekeeperConfig:
     """Gatekeeper 評估的超參數"""
-    eval_games: int = 200
+    eval_games: int = 400
     winrate_threshold: float = 0.55
     temperature: float = 0.1           # 評估時的採樣溫度
     simulations_per_decision: int = 768  # 評估時的 MCTS 模擬數
@@ -239,26 +248,41 @@ class GatekeeperConfig:
     keep_optimizer_on_reject: bool = False
     keep_replay_on_reject: bool = True
 
+    # ── Gate 評估模擬數與 self-play 的比值（解法一）────────
+    # 打破「gate 與 self-play 用相同模擬數」的對稱：讓 gate 評估使用低於
+    # self-play 的模擬數，使 candidate 能憑「更強的網路」勝過「較弱搜尋的
+    # guard」，先建立第一道通過門檻（避免 escalation 後兩邊同 sims、相對
+    # 強度不變而永遠打不贏的死結）。
+    #   gate_sims = max(level0_sims, int(current_sims / gate_simulation_ratio))
+    # ratio 越大 → gate 越寬鬆（模擬越少）。預設 2.0 = 用 self-play 的一半。
+    gate_simulation_ratio: float = 2.0
+
     # ── Escalation（連續失敗時進入下一階）──────────────────
     # 當 gate 連續失敗達 escalate_after_failures 次後，進入下一階。
-    # 「每一階」由 level_schedule 明確定義「模擬次數 + 學習率」，
-    # 因此升階時兩者一起切換（不採固定次數遞增）。
+    # 「每一階」由 level_schedule 明確定義「模擬次數 + 學習率 + 混合權重」，
+    # 因此升階時三者也一起切換（不採固定次數遞增）。
     # 一旦 gate 通過，連續失敗計數重置（階層不退）。
     escalate_enabled: bool = True
-    escalate_after_failures: int = 5        # 連續失敗幾次後升到下一階
+    escalate_after_failures: int = 8        # 連續失敗幾次後升到下一階
 
-    # ── 階級表：每一階直接設定「模擬次數 + 學習率」────────
-    # GateEscalator 沿著這個表逐階前進；升階時模擬次數與學習率「一併」套用。
-    # 每一項為 (simulations, learning_rate)。level 0 = 第一階（最底部），
-    # 最後一階為封頂（升到頂後維持在最後一階）。
+    # ── 階級表：每一階直接設定「模擬次數 + 學習率 + 混合權重」────
+    # GateEscalator 沿著這個表逐階前進；升階時模擬次數、學習率與
+    # value_q_weight「一併」套用。
+    # 每一項為 (simulations, learning_rate, value_q_weight)。
+    #   simulations     : 該階的 MCTS 模擬次數
+    #   learning_rate   : 該階的學習率
+    #   value_q_weight  : 該階的混合式 value target 權重
+    #                     value_target = (1-vq)*終局輸贏 + vq*MCTS根Q
+    #                     （可省略只給 2 元組，此時沿用全局 SELFPLAY_CFG.value_q_weight）
+    # level 0 = 第一階（最底部），最後一階為封頂（升到頂後維持在最後一階）。
     level_schedule: tuple = (
-        (128, 0.0008),
-        (256, 0.0006),
-        (384, 0.0004),
-        (512, 0.0003),
-        (768, 0.0002),
-        (1280, 0.0002),
-        (1600, 0.0001)
+        (64, 0.0008, 0.0),
+        (128, 0.0006, 0.0),
+        (256, 0.0005, 0.0),
+        (512, 0.0004, 0.1),
+        (896, 0.00025, 0.15),
+        (1280, 0.0001, 0.2),
+        (1600, 0.0001, 0.25)
     )
 
 
@@ -373,13 +397,21 @@ def validate_configs() -> None:
         raise ValueError("GATE_ESCALATE_AFTER_FAILURES must be >= 1")
     if GATE_CFG.level_schedule:
         for row in GATE_CFG.level_schedule:
-            if not isinstance(row, (tuple, list)) or len(row) != 2:
-                raise ValueError("GATE_LEVEL_SCHEDULE rows must be (simulations, lr) pairs")
-            sims, lr = row
+            if not isinstance(row, (tuple, list)) or len(row) not in (2, 3):
+                raise ValueError(
+                    "GATE_LEVEL_SCHEDULE rows must be (simulations, lr[, value_q_weight])"
+                )
+            sims, lr = row[0], row[1]
             if sims <= 0:
                 raise ValueError("GATE_LEVEL_SCHEDULE simulations must be >= 1")
             if lr <= 0:
                 raise ValueError("GATE_LEVEL_SCHEDULE learning rate must be > 0")
+            if len(row) == 3:
+                vq = row[2]
+                if not (0.0 <= vq <= 1.0):
+                    raise ValueError(
+                        "GATE_LEVEL_SCHEDULE value_q_weight must be in [0, 1]"
+                    )
     if not (0.0 < GATE_CFG.winrate_threshold < 1.0):
         raise ValueError("GATE_WINRATE_THRESHOLD must be in (0, 1)")
     if MCTS_CFG.heuristic_softmax_temperature <= 0:

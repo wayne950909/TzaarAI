@@ -141,9 +141,11 @@
         <div class="flex justify-between items-start">
             <div class="glass p-6 interactive">
                 <h1 class="text-4xl font-black text-amber-950 tracking-tighter italic">TZAAR</h1>
-                <div id="status-line" class="mt-2 text-xs font-black text-amber-900/70 uppercase tracking-widest">
+                                <div id="status-line" class="mt-2 text-xs font-black text-amber-900/70 uppercase tracking-widest">
                     等待開始...
                 </div>
+                <!-- 人機對戰：顯示模型評估的「對手（人類）視角價值」 -->
+                <div id="ai-value-display" class="hidden mt-2 text-sm font-black text-emerald-700"></div>
             </div>
             
                         <div class="flex gap-3 interactive items-center flex-wrap justify-end">
@@ -534,6 +536,8 @@
             state.whiteFirst = true;
             state.selected = null;
             state.over = false;
+            const vd = document.getElementById('ai-value-display');
+            if (vd) vd.classList.add('hidden');
             for(let r=0; r<9; r++) {
                 for(let c=0; c<9; c++) {
                     const val = RAW_LAYOUT[r][c];
@@ -1014,6 +1018,22 @@
             setTimeout(requestModelMove, 60);
         }
 
+                // 顯示模型評估的「對手（人類）視角價值」。
+        // value 範圍 -1（人類絕對劣勢）~ +1（人類絕對優勢）。
+        function updateAiValueDisplay(opponentValue) {
+            const el = document.getElementById('ai-value-display');
+            if (!el) return;
+            if (opponentValue === undefined || opponentValue === null) {
+                el.classList.add('hidden');
+                return;
+            }
+            const v = Number(opponentValue);
+            const pct = (Math.max(-1, Math.min(1, v)) * 100).toFixed(1);
+            const sign = v > 0 ? '＋' : (v < 0 ? '－' : '±');
+            el.innerHTML = `對手勝率估值 ${Math.abs(pct)}% <span class="opacity-60">(${sign}${Math.abs(v).toFixed(3)})</span>`;
+            el.classList.remove('hidden');
+        }
+
         async function requestModelMove() {
             try {
                 const payload = buildStrategyPayload();
@@ -1028,6 +1048,7 @@
                 });
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.error || '模型走子服務呼叫失敗');
+                updateAiValueDisplay(data.opponent_value);
                                 if (data.game_over) {
                     // 模型被判定無強制吃子 → 由前端判定終局
                     const noCap = getNoMandatoryCaptureResultAtTurnStart();

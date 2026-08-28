@@ -64,6 +64,7 @@ from training.train_step import train_on_samples
 from training.selfplay_engine import (
     build_phase_state_from_env as _build_phase_state_from_env,
     collect_selfplay_samples as _collect_selfplay_samples,
+    collect_vs_past_samples as _collect_vs_past_samples,
     log_runtime_mode as _log_runtime_mode,
     is_async_selfplay_ready,
 )
@@ -323,8 +324,9 @@ def run(title: str, start_level: Optional[int] = None) -> None:
     ----
     title       : 訓練任務名稱（用於檢查點/日誌命名）
     start_level : 從階級表的哪一階開始（0-based）。None = 預設從第 0 階開始。
-                  每階對應「模擬次數 + 學習率」，例如 GATE_CFG.level_schedule 的
-                  level 0 = (128, 8e-4)、level 1 = (256, 6e-4) 等。
+                  每階對應「模擬次數 + 學習率 + 混合權重」，例如
+                  GATE_CFG.level_schedule 的 level 0 = (128, 8e-4, 0.2)、
+                  level 1 = (256, 6e-4, 0.3) 等。
     """
     # ── 設定 ──────────────────────────────────────────────
     validate_constants()
@@ -429,17 +431,19 @@ def run(title: str, start_level: Optional[int] = None) -> None:
             f"| ratings={opponent_pool.ratings_summary()}"
         )
 
-    # ── Gate 階級表：每一階的「模擬次數 + 學習率」一起切換────────
-    # 每升一階（連續失敗累積達門檻），模擬次數與學習率會『一併』跳到下
-    # 一階對應的值；不再用固定 step 遞增模擬次數。
+    # ── Gate 階級表：每一階的「模擬次數 + 學習率 + 混合權重」一起切換──
+    # 每升一階（連續失敗累積達門檻），模擬次數、學習率與 value_q_weight
+    # 會『一併』跳到下一階對應的值；不再用固定 step 遞增模擬次數。
     # 若 escalate_enabled=False，只保留單一階（永遠用底數，不升級）。
     _level_schedule = (
         list(GATE_CFG.level_schedule) if GATE_CFG.level_schedule
-        else [(int(GATE_CFG.simulations_per_decision), float(OPTIMIZER_CFG.default_lr))]
+        else [(int(GATE_CFG.simulations_per_decision),
+               float(OPTIMIZER_CFG.default_lr),
+               float(SELFPLAY_CFG.value_q_weight))]
     )
     if not GATE_CFG.escalate_enabled:
-        first_sims, first_lr = _level_schedule[0]
-        _level_schedule = [(first_sims, first_lr)]
+        first_sims, first_lr, first_vq = _level_schedule[0]
+        _level_schedule = [(first_sims, first_lr, first_vq)]
     gate_escalator = GateEscalator(
         schedule=_level_schedule,
         escalator_after_failures=int(GATE_CFG.escalate_after_failures),
@@ -466,17 +470,32 @@ def run(title: str, start_level: Optional[int] = None) -> None:
         inference_temperature = float(SELFPLAY_CFG.temp_low)
 
         # ── 依目前 gate 階層同步模擬數 ────────────────────
-        # 升級後的模擬數同時套用於 self-play（產生對局）與 gate keeper。
-        # self-play 直接讀 MCTS_CFG.simulations，gate 讀 GATE_CFG.simulations_per_decision。
+        # 升級後的模擬數套用於 self-play 產生對局。
+        # gate keeper 則用「較低」的模擬數（解法一：打破對稱）。self-play
+        # 讀 MCTS_CFG.simulations，gate 讀 GATE_CFG.simulations_per_decision。
         current_sims = gate_escalator.current_simulations()
         MCTS_CFG.simulations = current_sims
-        GATE_CFG.simulations_per_decision = current_sims
+        # gate_sims = max(level0_sims, int(current_sims / gate_simulation_ratio))
+        # 讓 candidate 以「更強網路 + 較弱搜尋」勝過 guard，先建立第一道通過門檻。
+        _level0_sims = int(_level_schedule[0][0]) if _level_schedule else 1
+        _gate_sims = max(
+            _level0_sims,
+            int(current_sims / max(1.0, float(GATE_CFG.gate_simulation_ratio))),
+        )
+        GATE_CFG.simulations_per_decision = _gate_sims
 
         # ── 依目前階級套用「模擬次數 + 學習率」（一併切換）──
         # GateEscalator 每升一階，sims 與 lr 都由該階表格一併提供。
         current_lr = gate_escalator.current_learning_rate()
         for group in optimizer.param_groups:
             group["lr"] = current_lr
+
+        # ── 依目前階級套用「混合 value target 權重」────────
+        # value_q_weight 也隨階級表階梯式上升；selfplay_engine 在產生樣本時
+        # 直接讀取 SELFPLAY_CFG.value_q_weight，因此在 self-play 前覆寫即可。
+        current_vq = gate_escalator.current_value_q_weight()
+        SELFPLAY_CFG.value_q_weight = current_vq
+
 
 
         # ── Self‑play ────────────────────────────────────
@@ -515,6 +534,42 @@ def run(title: str, start_level: Optional[int] = None) -> None:
         )
         total_fresh_samples += n_new_samples
         nvtx.range_pop()  # selfplay
+
+        # ── 最新模型 vs 隨機近期歷史模型（資料多樣性）────────
+        # 除了自我對弈（games_per_update 局）之外，額外讓「最新模型
+        # （guard_policy 權重，目前位於 policy 中）」對上「從最近
+        # vs_past_recent_n 個歷史 guard 模型隨機選出的一個」，再產生
+        # vs_past_games 局的訓練樣本。同樣使用 searchManager。
+        # 若歷史模型不足（只有最新模型）則自動省略（回傳空）。
+        if getattr(SELFPLAY_CFG, "vs_past_enabled", False):
+            vs_t0 = time.perf_counter()
+            with torch.no_grad():
+                (
+                    vs_fresh_samples,
+                    vs_games_played,
+                    vs_n_new_samples,
+                    vs_opponent_idx,
+                ) = _collect_vs_past_samples(
+                    policy,
+                    guard_title=guard_title,
+                    device=device,
+                    env_cfg=env_cfg,
+                    update_idx=update_idx,
+                    search_manager=search_manager,
+                )
+            vs_elapsed = time.perf_counter() - vs_t0
+            if vs_n_new_samples > 0:
+                fresh_samples = fresh_samples + vs_fresh_samples
+                games_played += vs_games_played
+                n_new_samples += vs_n_new_samples
+                total_fresh_samples += vs_n_new_samples
+            print(
+                f"[vs-past] update {update_idx} done | "
+                f"opponent_idx={vs_opponent_idx} | "
+                f"games={vs_games_played} | "
+                f"time={vs_elapsed:.2f}s | "
+                f"samples={vs_n_new_samples}"
+            )
 
         # ── 訓練 ────────────────────────────────────────────
         # 資料來源可能是：
@@ -564,8 +619,9 @@ def run(title: str, start_level: Optional[int] = None) -> None:
             policy.eval()
             guard_policy.eval()
 
-        # ── 記錄本次用的模擬階層（供 log） ──────────
-            gate_sims = gate_escalator.current_simulations()
+                # ── 記錄本次用的模擬階層（供 log） ──────────
+            # gate_sims = 實際用於 gate 評估的模擬數（解法一：低於 self-play）
+            gate_sims = GATE_CFG.simulations_per_decision
             gate_level = gate_escalator.level
             gate_consecutive_failures = gate_escalator.consecutive_failures
 
@@ -653,7 +709,8 @@ def run(title: str, start_level: Optional[int] = None) -> None:
                     )
                     strongest_idx = opponent_pool.evaluate_topk(
                         k=int(ELO_CFG.pool_size),
-                        simulations=gate_escalator.current_simulations(),
+                        # 與 gate 評估使用相同的模擬次數（GATE_CFG.simulations_per_decision）
+                        simulations=int(GATE_CFG.simulations_per_decision),
                     )
                     if strongest_idx is not None:
                         replay_buffer, replay_write_idx = _rollback_to_guard(

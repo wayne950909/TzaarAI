@@ -47,15 +47,22 @@ def validate_constants() -> None:
         raise ValueError("GATE_ESCALATE_AFTER_FAILURES must be >= 1")
     if GATE_CFG.level_schedule:
         for row in GATE_CFG.level_schedule:
-            if not isinstance(row, (tuple, list)) or len(row) != 2:
+            if not isinstance(row, (tuple, list)) or len(row) not in (2, 3):
                 raise ValueError(
-                    "GATE_LEVEL_SCHEDULE rows must be (simulations, lr) pairs"
+                    "GATE_LEVEL_SCHEDULE rows must be "
+                    "(simulations, lr[, value_q_weight])"
                 )
-            sims, lr = row
+            sims, lr = row[0], row[1]
             if sims <= 0:
                 raise ValueError("GATE_LEVEL_SCHEDULE simulations must be >= 1")
             if lr <= 0:
                 raise ValueError("GATE_LEVEL_SCHEDULE learning rate must be > 0")
+            if len(row) == 3:
+                vq = row[2]
+                if not (0.0 <= vq <= 1.0):
+                    raise ValueError(
+                        "GATE_LEVEL_SCHEDULE value_q_weight must be in [0, 1]"
+                    )
     if not (0.0 < GATE_CFG.winrate_threshold < 1.0):
         raise ValueError("GATE_WINRATE_THRESHOLD must be in (0, 1)")
     if MCTS_CFG.heuristic_softmax_temperature <= 0:

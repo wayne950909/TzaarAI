@@ -47,32 +47,38 @@ class GateResult:
 class GateEscalator:
     """gate 連續失敗時的「階級表」升級機制。
 
-    每一階由 level_schedule 明確定義「(模擬次數, 學習率)」，GateEscalator
-    沿著這張表逐階前進；升階時模擬次數與學習率「一併」切換（不是固定
-    遞增次數）。
+    每一階由 level_schedule 明確定義「(模擬次數, 學習率, 混合權重)」，
+    GateEscalator 沿著這張表逐階前進；升階時模擬次數、學習率與混合權重
+    「一併」切換（不是固定遞增次數）。
 
     每一階必須「在該階內部」連續失敗達 ``escalate_after_failures`` 次才
     升級到下一階，而且一旦升級就「不會再退回」——即使之後 gate 通過，
     也只是重置當前的連續失敗計數，階層保持不變。
 
-    例如 schedule = [(128, 8e-4), (256, 6e-4), (384, 4e-4), (512, 3e-4)]：
+    例如
+    schedule = [(128, 8e-4, 0.2), (256, 6e-4, 0.3), (384, 4e-4, 0.4), (512, 3e-4, 0.5)]：
 
         level    0        1        2        3(top)
         sims     128      256      384      512
         lr       8e-4     6e-4     4e-4     3e-4
+        vq       0.2      0.3      0.4      0.5
 
-        0 階：連續失敗 4 次 → 升到 level 1（sims=256, lr=6e-4，計數歸零）
-        1 階：再連續失敗 4 次 → 升到 level 2（sims=384, lr=4e-4）
-        ... 升到最後一階後封頂，維持在該階的 sims / lr 不再上升。
+        0 階：連續失敗 4 次 → 升到 level 1（sims=256, lr=6e-4, vq=0.3，計數歸零）
+        1 階：再連續失敗 4 次 → 升到 level 2（sims=384, lr=4e-4, vq=0.4）
+        ... 升到最後一階後封頂，維持在該階的 sims / lr / vq 不再上升。
 
     用法（於訓練迴圈中常駐一個實例）：
 
         escalator = GateEscalator(schedule=[...], escalate_after_failures=4)
-        sims = escalator.current_simulations()          # 本次 self-play / gate 共用
-        lr   = escalator.current_learning_rate()         # 本次的學習率（與 sims 連動）
+        sims = escalator.current_simulations()           # 本次 self-play / gate 共用
+        lr   = escalator.current_learning_rate()          # 本次的學習率（與 sims 連動）
+        vq   = escalator.current_value_q_weight()         # 本次的混合權重（與 sims/lr 連動）
         escalator.record_success()  # gate 通過：重置連續失敗計數（不退回階層）
         escalator.record_failure()  # gate 失敗：累加，達到門檻即升階
     """
+
+    # 若某階只提供 2 元組 (simulations, learning_rate)，則沿用這個預設 vq。
+    _DEFAULT_VALUE_Q_WEIGHT = 0.2
 
     def __init__(
         self,
@@ -80,10 +86,13 @@ class GateEscalator:
         escalator_after_failures: int = 4,
         start_level: int = 0,
     ) -> None:
-        # schedule: 每一階 (simulations, learning_rate)，升序。最後一階封頂。
-        self._schedule = [
-            (int(sims), float(lr)) for sims, lr in schedule
-        ]
+        # schedule: 每一階 (simulations, learning_rate[, value_q_weight])，升序。
+        # 最後一階封頂。value_q_weight 可省略（2 元組），此時補上預設值。
+        self._schedule = []
+        for row in schedule:
+            sims, lr = row[0], row[1]
+            vq = row[2] if len(row) >= 3 else self._DEFAULT_VALUE_Q_WEIGHT
+            self._schedule.append((int(sims), float(lr), float(vq)))
         if not self._schedule:
             raise ValueError("GateEscalator schedule must not be empty")
         self.escalate_after_failures = max(1, int(escalator_after_failures))
@@ -108,13 +117,18 @@ class GateEscalator:
 
     def current_simulations(self) -> int:
         """依目前階層回傳應使用的模擬數（gate 與 self-play 共用）。"""
-        sims, _ = self._schedule[self._level]
+        sims, _, _ = self._schedule[self._level]
         return int(sims)
 
     def current_learning_rate(self) -> float:
         """依目前階層回傳應使用的學習率（與模擬次數連動）。"""
-        _, lr = self._schedule[self._level]
+        _, lr, _ = self._schedule[self._level]
         return float(lr)
+
+    def current_value_q_weight(self) -> float:
+        """依目前階層回傳應使用的混合 value target 權重（與 sims / lr 連動）。"""
+        _, _, vq = self._schedule[self._level]
+        return float(vq)
 
     def record_success(self) -> None:
         """gate 通過時呼叫：只重置當前連續失敗計數，階層不退。"""

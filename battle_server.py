@@ -442,6 +442,8 @@ def run_model_move(payload: Dict[str, Any]) -> Dict[str, Any]:
     {
         "move": "W,fromR,fromC,toR,toC" 或 "P"（第二步 pass），
         "step": 該步對應的步數（1 或 2），
+        "value": 模型（root 玩家）視角的 MCTS 價值（-1~1），
+        "opponent_value": 對手（人類）視角的價值，即 -value（-1~1）。
     }
     """
     name = payload.get("model")
@@ -476,10 +478,17 @@ def run_model_move(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if state.is_done():
         # 模型輪到無強制吃子：視為已結束，回傳特殊 PASS 訊號
-        return {"move": "P", "step": step, "game_over": True}
+        # 模型敗 → 對手（人類）視角價值為 +1.0（人類獲勝）。
+        return {
+            "move": "P",
+            "step": step,
+            "game_over": True,
+            "value": -1.0,
+            "opponent_value": 1.0,
+        }
 
     with torch.no_grad():
-        _, _, legal_mask, visits, _, _, _ = run_mcts(
+        _, _, legal_mask, visits, _, _, root_value = run_mcts(
             model,
             state,
             device,
@@ -489,7 +498,13 @@ def run_model_move(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     idx = _sample_action_from_visits(visits, legal_mask, (1e-6 if mode == "greedy" else 0.1))
     if idx == PASS_ACTION_IDX:
-        return {"move": "P", "step": step}
+        return {
+            "move": "P",
+            "step": step,
+            # root_value 為模型（root 玩家）視角；對手（人類）視角取其負值。
+            "value": float(root_value),
+            "opponent_value": float(-root_value),
+        }
 
     from core.action import decode_action_idx
     kind_name, _, src_idx, direction_idx = decode_action_idx(idx)
@@ -500,7 +515,13 @@ def run_model_move(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("model move 方向無目標")
     move_token = _move_to_token(kind_name, src, dst, color)
 
-    return {"move": move_token, "step": step}
+    return {
+        "move": move_token,
+        "step": step,
+        # root_value 為模型（root 玩家）視角；對手（人類）視角取其負值。
+        "value": float(root_value),
+        "opponent_value": float(-root_value),
+    }
 
 
 # ── HTTP Handler ─────────────────────────────────────────────────────
